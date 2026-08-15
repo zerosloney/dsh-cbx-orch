@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>CBX Orchestrator</title>
+<link rel="stylesheet" href="/style.css">
+</head><body>
+<div class="topbar"><h1>CBX Orchestrator</h1><span class="ws-pill"><span class="ws-name" id="ws-name">—</span><span class="ws-count" id="ws-count"></span></span></div>
+<div class="ws-list" id="ws-list" hidden></div>
+<div class="dist-bar" id="dist-bar" hidden></div>
+<div class="filter-bar" id="filter-bar" hidden><span id="filter-label"></span><button type="button" id="btn-clear-filter" class="job-action">清除筛选</button></div>
+<div class="cards" id="cards">
+  <div class="card" data-filter=""><div class="card-label">总任务</div><div class="card-value" id="c-total">—</div></div>
+  <div class="card" data-filter="running"><div class="card-label">运行中 / 并发</div><div class="card-value" id="c-running">—</div></div>
+  <div class="card" data-filter="queued"><div class="card-label">排队</div><div class="card-value" id="c-queued">—</div></div>
+  <div class="card" data-filter="awaiting_approval"><div class="card-label">待审批</div><div class="card-value" id="c-approval">—</div></div>
+  <div class="card" data-filter="failed"><div class="card-label">失败</div><div class="card-value" id="c-failed">—</div></div>
+  <div class="card" data-filter="needs_fix"><div class="card-label">返工</div><div class="card-value" id="c-needs-fix">—</div></div>
+  <div class="card" data-filter="done"><div class="card-label">完成</div><div class="card-value" id="c-done">—</div></div>
+  <div class="card" data-filter=""><div class="card-label">最后活动</div><div class="card-value" id="c-last">—</div></div>
+  <div class="card" data-filter=""><div class="card-label">健康</div><div class="card-value" id="c-health">—</div></div>
+</div>
+<div class="bar" id="bar"><button type="button" id="btn-pause" class="job-action">暂停队列</button><button type="button" id="btn-resume" class="job-action">恢复队列</button><span class="create"><input id="new-task" type="text" placeholder="输入任务描述后创建…" autocomplete="off"><button type="button" id="btn-create" class="job-action">创建任务</button></span></div>
+<table><thead><tr><th scope="col">Job</th><th scope="col">Status</th><th scope="col">Phase</th><th scope="col">Attempt</th><th scope="col">Review</th><th scope="col">Elapsed</th><th scope="col">Updated</th></tr></thead>
+<tbody id="jobs"></tbody></table>
+<div id="detail-panel"><h2 style="margin-top:0">任务详情</h2><div id="detail-body"><p class="hint">点击上方任务行查看详情</p></div></div>
+<h2>事件流</h2>
+<div id="stream"></div>
+<script src="/app.js"></script>
+</body></html>

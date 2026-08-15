@@ -1,0 +1,23 @@
+# dsh-cbx-orch bundle patch: inserts the cbx orchestrator plugins into any
+# profile that lists this package in `dsh.profile.bundles`. The core plugin
+# needs the harness core services (subprocess, tools, commands); the separate
+# web entry mounts the dashboard only where a web server exists.
+- insert:
+    - id: cbx-orch
+      name: 'dsh-cbx-orch'
+      config:
+        # Default executor: codebuddy / opencode / omp / cline / qwen
+        executor: codebuddy
+        # Run an independent review phase after tests pass.
+        review: true
+        # Run tasks in an isolated git worktree.
+        isolated: true
+    - id: cbx-orch-web
+      name: 'dsh-cbx-orch/web'
+      config:
+        web:
+          # Bearer token for data endpoints; omit for no auth.
+          token: ''
+          # Workspace allowlist for ?workspace= selection. Defaults to the
+          # invoking directory when empty.
+          workspaces: []

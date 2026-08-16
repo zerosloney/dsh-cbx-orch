@@ -1,14 +1,17 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { loadExecutorPlugin, type ExecutorRequest } from "./executor.js";
 
 async function main(): Promise<void> {
   const [executor, workspace, requestFile, resultFile] = process.argv.slice(2);
   if (!executor || !workspace || !requestFile || !resultFile)
     throw new Error("plugin host 缺少参数");
-  const request = JSON.parse(
-    await readFile(requestFile, "utf8"),
-  ) as ExecutorRequest;
+  // The request embeds the full prompt and may contain inline credentials.
+  // Remove it immediately after reading, before parsing/loading/running so
+  // host-side failures cannot leave the sensitive request behind.
+  const requestText = await readFile(requestFile, "utf8");
+  await unlink(requestFile);
+  const request = JSON.parse(requestText) as ExecutorRequest;
   const plugin = await loadExecutorPlugin(
     executor,
     workspace,

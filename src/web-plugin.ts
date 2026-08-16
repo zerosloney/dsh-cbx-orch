@@ -4,7 +4,8 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { registerCbxWebRoutes } from "./web.js";
-import { ensureScheduler, stopScheduler } from "./queue-api.js";
+import { acquireScheduler, type SchedulerHandle } from "./queue-api.js";
+import { WorkspacePolicy } from "./workspace-policy.js";
 
 /** Plugin config for the cbx web dashboard entry. */
 export interface WebConfig {
@@ -23,9 +24,11 @@ export interface WebConfig {
  * server bound to a non-loopback interface would otherwise expose every data
  * endpoint (and job control) to the LAN.
  */
-async function resolveWebToken(config: WebConfig): Promise<string | undefined> {
+async function resolveWebToken(
+  config: WebConfig,
+  workspace: string,
+): Promise<string | undefined> {
   if (config.web?.token) return config.web.token;
-  const workspace = path.resolve(config.web?.workspaces?.[0] ?? process.cwd());
   const cbxDir = path.join(workspace, ".cbx");
   const tokenFile = path.join(cbxDir, "web.token");
   try {
@@ -59,49 +62,103 @@ export default class CbxWeb extends Service {
 
   constructor(ctx: Context, config: WebConfig) {
     super(ctx, "cbxWeb");
-    // web 工作区列表与路由层同源；每个工作区也拉起常驻调度器（cwd 的由 core 插件负责）。
-    const workspaces = [...(config.web?.workspaces?.length
-      ? config.web.workspaces
-      : [process.cwd()])];
-    ctx.effect(() => {
-      for (const ws of workspaces) void ensureScheduler(ws);
-      return () => {
-        for (const ws of workspaces) void stopScheduler(ws);
-      };
-    }, "cbxWeb.scheduler");
+    const workspacePolicy = new WorkspacePolicy(config.web?.workspaces ?? []);
+    const ownedSchedulers = new Set<SchedulerHandle>();
+    const pendingAcquires = new Set<Promise<void>>();
+    const releaseOwned = async (): Promise<void> => {
+      const handles = [...ownedSchedulers];
+      ownedSchedulers.clear();
+      await Promise.all(handles.map((handle) => handle.release()));
+    };
+    const waitPendingAcquires = async (): Promise<void> => {
+      while (pendingAcquires.size > 0)
+        await Promise.allSettled([...pendingAcquires]);
+    };
+    const acquireOne = (workspace: string): Promise<void> => {
+      const pending = (async () => {
+        const handle = await acquireScheduler(workspace);
+        if (disposed) {
+          await handle.release();
+          return;
+        }
+        ownedSchedulers.add(handle);
+        await handle.ready;
+        if (disposed) {
+          ownedSchedulers.delete(handle);
+          await handle.release();
+        }
+      })();
+      pendingAcquires.add(pending);
+      void pending.then(
+        () => pendingAcquires.delete(pending),
+        () => pendingAcquires.delete(pending),
+      );
+      return pending;
+    };
     // token 解析是异步的：解析完成前插件可能已被卸载（HMR/关闭），此时不得再注册路由，
     // 否则路由/尾部 tailer/心跳定时器会挂在一个已 dispose 的 ctx 上泄漏。
     let disposed = false;
-    ctx.effect(() => () => {
+    ctx.effect(() => async () => {
       disposed = true;
+      await releaseOwned();
+      await waitPendingAcquires();
+      await releaseOwned();
     }, "cbxWeb.lifecycle");
-    void resolveWebToken(config)
-      .catch((error) => {
+    void (async () => {
+      let workspaces: readonly string[];
+      try {
+        // Canonicalize once and share the exact same policy with the route
+        // selector, token path, and scheduler startup.
+        workspaces = await workspacePolicy.listAllowedWorkspaces();
+      } catch (error) {
+        ctx.logger("cbx").error(
+          `cbx web 工作区策略解析失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+      if (disposed) return;
+      await Promise.all(workspaces.map((workspace) => acquireOne(workspace)));
+      if (disposed) return;
+
+      let token: string | undefined;
+      try {
+        token = await resolveWebToken(config, workspaces[0]);
+      } catch (error) {
         ctx.logger("cbx").error(
           `cbx web token 自动生成失败：${error instanceof Error ? error.message : String(error)}`,
         );
-        return config.web?.token;
-      })
-      .then((token) => {
-        if (disposed) return;
-        // fail-closed：解析不到任何 token 时绝不挂载无鉴权的数据端点——webServer 一旦
-        // 绑定非 loopback，等于把任务控制面（创建/取消/purge）裸奔到局域网。
-        if (!token) {
-          ctx.logger("cbx").error(
-            "cbx web 无法获得访问 token（.cbx 不可写且未配置 web.token），拒绝挂载仪表盘路由；请显式配置 web.token 或修复工作区写权限。",
-          );
-          return;
-        }
-        if (!config.web?.token) {
-          const workspace = path.resolve(config.web?.workspaces?.[0] ?? process.cwd());
-          ctx.logger("cbx").info(
-            `cbx web 未配置 token，已自动生成随机 token：${path.join(workspace, ".cbx", "web.token")}`,
-          );
-        }
-        registerCbxWebRoutes(ctx, {
-          workspaces: config.web?.workspaces,
-          token,
-        });
+      }
+      if (disposed) return;
+      // fail-closed：解析不到任何 token 时绝不挂载无鉴权的数据端点——webServer 一旦
+      // 绑定非 loopback，等于把任务控制面（创建/取消/purge）裸奔到局域网。
+      if (!token) {
+        ctx.logger("cbx").error(
+          "cbx web 无法获得访问 token（.cbx 不可写且未配置 web.token），拒绝挂载仪表盘路由；请显式配置 web.token 或修复工作区写权限。",
+        );
+        return;
+      }
+      if (!config.web?.token) {
+        ctx.logger("cbx").info(
+          `cbx web 未配置 token，已自动生成随机 token：${path.join(workspaces[0], ".cbx", "web.token")}`,
+        );
+      }
+      if (disposed) return;
+      await registerCbxWebRoutes(ctx, {
+        workspacePolicy,
+        token,
+        isDisposed: () => disposed,
       });
+    })().catch(async (error) => {
+      const wasDisposed = disposed;
+      disposed = true;
+      await releaseOwned();
+      await waitPendingAcquires();
+      await releaseOwned();
+      if (!wasDisposed) {
+        ctx.logger("cbx").error(
+          `cbx web 路由注册失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
   }
 }

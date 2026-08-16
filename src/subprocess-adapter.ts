@@ -2,7 +2,42 @@ import { appendFileSync, unlinkSync } from "node:fs";
 import type { SubprocessRuntime } from "@deepseek-ai/dsh-subprocess";
 import { jobContext, type ActiveProcessHandle } from "./job-runtime.js";
 import { writePidRecord } from "./pid-guard.js";
-import { MAX_CAPTURE_BYTES, type ProcessResult, type ProcessSpawn } from "./process-runner.js";
+import {
+  MAX_CAPTURE_BYTES,
+  ProcessTreeTerminationError,
+  type ProcessResult,
+  type ProcessSpawn,
+} from "./process-runner.js";
+
+const TREE_QUIESCE_TIMEOUT_MS = 7_000;
+
+async function waitForTreeExit(
+  handle: ReturnType<SubprocessRuntime["spawn"]>,
+): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TREE_QUIESCE_TIMEOUT_MS);
+  timer.unref();
+  try {
+    return await handle.waitForExit(controller.signal);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function terminateAndWait(
+  handle: ReturnType<SubprocessRuntime["spawn"]>,
+): Promise<{ stopped: boolean; error?: unknown }> {
+  let error: unknown;
+  try {
+    handle.terminate();
+  } catch (caught) {
+    error = caught;
+  }
+  const stopped = await waitForTreeExit(handle);
+  return error === undefined ? { stopped } : { stopped, error };
+}
 
 class BoundedOutput {
   private chunks: Buffer[] = [];
@@ -100,6 +135,7 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
     timeoutMs,
     logFile,
     pidFile,
+    callerSignal,
   ): Promise<ProcessResult> => {
     const argv = useShell ? shellArgv(command) : [command, ...args];
     // 先取 ALS 上下文：取消可能落在"标记检查之后、spawn 之前"的窗口里（上层还有
@@ -107,38 +143,109 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
     // catch 收口，避免执行器白跑整个 timeoutMs。
     const jobStore = jobContext.getStore();
     const jobSignal = jobStore?.controller.signal;
-    if (jobSignal?.aborted) {
-      throw new Error("cbx: 任务已取消，放弃拉起子进程");
-    }
+    const throwIfCallerOrJobAborted = (): void => {
+      callerSignal?.throwIfAborted();
+      jobSignal?.throwIfAborted();
+    };
+    throwIfCallerOrJobAborted();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const signals: AbortSignal[] = [];
+    if (callerSignal) signals.push(callerSignal);
+    if (jobSignal) signals.push(jobSignal);
+    signals.push(controller.signal);
+    const spawnSignal = AbortSignal.any(signals);
+    const timeoutTimer = setTimeout(() => controller.abort(), timeoutMs);
     const output = new BoundedOutput();
     let timedOut = false;
 
-    const handle = subprocess.spawn({
-      argv,
-      cwd,
-      stdio: {
-        stdin: "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-      },
-      graceMs: 2_000,
-      signal: controller.signal,
-      env: process.env,
-    });
-
-    if (pidFile && handle.pid > 0) {
-      writePidRecord(pidFile, handle.pid);
+    let handle: ReturnType<SubprocessRuntime["spawn"]>;
+    try {
+      handle = subprocess.spawn({
+        argv,
+        cwd,
+        stdio: {
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+        graceMs: 2_000,
+        signal: spawnSignal,
+        env: process.env,
+      });
+    } catch (error) {
+      clearTimeout(timeoutTimer);
+      throwIfCallerOrJobAborted();
+      throw error;
     }
+
     const active: ActiveProcessHandle = {
       pid: handle.pid,
       terminate: () => handle.terminate(),
     };
     if (jobStore) jobStore.handles.add(active);
+    let preserveTracking = false;
+    let pidWritten = false;
+    try {
+      throwIfCallerOrJobAborted();
+      if (pidFile && handle.pid > 0) {
+        writePidRecord(pidFile, handle.pid);
+        pidWritten = true;
+      }
+    } catch (error) {
+      clearTimeout(timeoutTimer);
+      const callerOrJobAborted = callerSignal?.aborted || jobSignal?.aborted;
+      if (callerOrJobAborted) {
+        const termination = await terminateAndWait(handle);
+        if (!termination.stopped) {
+          preserveTracking = true;
+          if (pidFile && handle.pid > 0 && !pidWritten) {
+            try {
+              writePidRecord(pidFile, handle.pid);
+              pidWritten = true;
+            } catch {
+              /* retain the diagnostic error below */
+            }
+          }
+          throw new ProcessTreeTerminationError(
+            handle.pid,
+            callerSignal?.aborted ? callerSignal.reason : jobSignal?.reason,
+            termination.error,
+          );
+        }
+        if (jobStore) jobStore.handles.delete(active);
+        if (pidFile) {
+          try {
+            unlinkSync(pidFile);
+          } catch {
+            /* never written or already removed */
+          }
+        }
+        throw callerSignal?.aborted ? callerSignal.reason : jobSignal?.reason;
+      }
+      const termination = await terminateAndWait(handle);
+      if (!termination.stopped) {
+        preserveTracking = true;
+        throw new ProcessTreeTerminationError(handle.pid, error, termination.error);
+      }
+      if (jobStore) jobStore.handles.delete(active);
+      if (pidFile) {
+        try {
+          unlinkSync(pidFile);
+        } catch {
+          /* never written or already removed */
+        }
+      }
+      throw error;
+    }
     // 取消落在 spawn 与句柄注册之间：abortRunningJob 遍历句柄集时还看不到本句柄，
     // 注册后立刻按已取消信号补一次树级终止。
-    if (jobSignal?.aborted) handle.terminate();
+    if (spawnSignal.aborted) {
+      try {
+        handle.terminate();
+      } catch {
+        /* the signal remains authoritative */
+      }
+    }
 
     // 落盘日志经流式脱敏（跨 chunk 边界保留 16 字节重叠）后再写 logFile，
     // 防止执行器输出回显的凭据原样持久化；内存 output 保持原样。
@@ -181,12 +288,13 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
     // 无法让 done settle（不可中断 IO / 句柄泄漏），job 会永久挂起——且事件循环
     // 空闲、心跳持续刷新，连队列回收路径都不会触发。到点后再次 terminate 并以
     // 合成超时结果解除本调用阻塞；卡死子进程仍留在句柄集里由取消路径兜底。
+    let hardTimerHandle: ReturnType<typeof setTimeout> | undefined;
     const hardTimer = new Promise<"hard">((resolve) => {
-      const timer = setTimeout(
+      hardTimerHandle = setTimeout(
         () => resolve("hard"),
         timeoutMs + 2_000 + 5_000,
       );
-      timer.unref();
+      hardTimerHandle.unref();
     });
     try {
       const settled = await Promise.race([
@@ -195,31 +303,56 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
       ]);
       if (settled === "hard") {
         hardDeadlineHit = true;
-        handle.terminate();
+        const termination = await terminateAndWait(handle);
+        if (!termination.stopped) {
+          preserveTracking = true;
+          throw new ProcessTreeTerminationError(
+            handle.pid,
+            controller.signal.reason,
+            termination.error,
+          );
+        }
       } else {
         outcome = settled.value;
-      }
-    } catch (error) {
-      clearTimeout(timer);
-      if (jobStore) jobStore.handles.delete(active);
-      // pidFile 只在 handle.pid > 0 时写过：spawn 失败路径上 unlink 的 ENOENT
-      // 会顶替原始错误，丢掉真正的诊断信息。
-      if (pidFile) {
-        try {
-          unlinkSync(pidFile);
-        } catch {
-          /* never written */
+        if (controller.signal.aborted) {
+          const termination = await terminateAndWait(handle);
+          if (!termination.stopped) {
+            preserveTracking = true;
+            throw new ProcessTreeTerminationError(
+              handle.pid,
+              controller.signal.reason,
+              termination.error,
+            );
+          }
         }
+      }
+      throwIfCallerOrJobAborted();
+    } catch (error) {
+      const callerOrJobAborted = callerSignal?.aborted || jobSignal?.aborted;
+      if (callerOrJobAborted) {
+        const termination = await terminateAndWait(handle);
+        if (!termination.stopped) {
+          preserveTracking = true;
+          throw new ProcessTreeTerminationError(
+            handle.pid,
+            callerSignal?.aborted ? callerSignal.reason : jobSignal?.reason,
+            termination.error,
+          );
+        }
+        throw callerSignal?.aborted ? callerSignal.reason : jobSignal?.reason;
       }
       throw error;
     } finally {
-      clearTimeout(timer);
-      if (jobStore) jobStore.handles.delete(active);
-      if (pidFile) {
-        try {
-          unlinkSync(pidFile);
-        } catch {
-          /* already removed */
+      clearTimeout(timeoutTimer);
+      if (hardTimerHandle !== undefined) clearTimeout(hardTimerHandle);
+      if (!preserveTracking) {
+        if (jobStore) jobStore.handles.delete(active);
+        if (pidFile) {
+          try {
+            unlinkSync(pidFile);
+          } catch {
+            /* already removed */
+          }
         }
       }
     }

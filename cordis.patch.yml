@@ -12,12 +12,22 @@
         review: true
         # Run tasks in an isolated git worktree.
         isolated: true
+        # Workspace allowlist for cbx tools. Empty/missing means only the
+        # canonical process.cwd(); explicit paths authorize exact workspaces.
+        # WorkspacePolicy realpath-canonicalizes entries (case-folding Windows
+        # paths) and rejects unauthorized, missing, or non-directory targets.
+        workspaces: []
     - id: cbx-orch-web
       name: 'dsh-cbx-orch/web'
       config:
         web:
-          # Bearer token for data endpoints; omit for no auth.
+          # Bearer token for data endpoints. Empty/missing reuses a non-empty
+          # token from the first workspace's .cbx/web.token, or generates one
+          # there with mode 0600. No unauthenticated mode; resolution failure
+          # leaves the web routes unmounted (fail-closed).
           token: ''
-          # Workspace allowlist for ?workspace= selection. Defaults to the
-          # invoking directory when empty.
+          # Separate Web allowlist for ?workspace= selection. Uses the same
+          # WorkspacePolicy canonicalization and rejects unauthorized, missing,
+          # or non-directory targets; it is not automatically shared with the
+          # core cbx-orch workspaces setting.
           workspaces: []

@@ -60,6 +60,7 @@ export type ProcessSpawn = (
   timeoutMs: number,
   logFile?: string,
   pidFile?: string,
+  signal?: AbortSignal,
 ) => Promise<ProcessResult>;
 
 let provider: ProcessSpawn | undefined;
@@ -104,12 +105,17 @@ export async function captureAsync(
   args: string[],
   cwd: string,
   timeout = 30_000,
+  signal?: AbortSignal,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+  signal?.throwIfAborted();
   const result = await runProcess(
     args[0],
     args.slice(1),
     cwd,
     timeout,
+    undefined,
+    undefined,
+    signal,
   );
   return { code: result.code, stdout: result.output, stderr: "" };
 }
@@ -194,6 +200,33 @@ export async function terminateTree(
   return waitUntilStopped(pid, forceMs);
 }
 
+/** Cancellation/timeout could not prove that the whole process tree stopped. */
+export class ProcessTreeTerminationError extends Error {
+  constructor(
+    public readonly pid: number,
+    public readonly cancellationReason: unknown,
+    public readonly terminationError?: unknown,
+  ) {
+    super(`cbx: unable to confirm process tree ${pid} stopped`, {
+      cause: cancellationReason,
+    });
+    this.name = "ProcessTreeTerminationError";
+  }
+}
+
+/** Retry the seam's bounded terminate ladder before declaring a survivor. */
+export async function terminateTreeWithRetry(pid: number): Promise<boolean> {
+  const attempts: readonly [number, number][] = [
+    [2_000, 1_000],
+    [1_000, 1_000],
+    [1_000, 1_000],
+  ];
+  for (const [gracefulMs, forceMs] of attempts) {
+    if (await terminateTree(pid, gracefulMs, forceMs)) return true;
+  }
+  return false;
+}
+
 /** 共享子进程执行核心（原生 child_process 回退实现）。 */
 function runChildRaw(
   useShell: boolean,
@@ -203,8 +236,11 @@ function runChildRaw(
   timeoutMs: number,
   logFile?: string,
   pidFile?: string,
+  signal?: AbortSignal,
 ): Promise<ProcessResult> {
+  if (signal?.aborted) return Promise.reject(signal.reason);
   return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
     const child = useShell
       ? spawn(command, {
           cwd,
@@ -220,10 +256,94 @@ function runChildRaw(
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
-    if (pidFile && child.pid) writePidRecord(pidFile, child.pid);
     const output = new BoundedOutput();
     let timedOut = false;
     let settled = false;
+    let aborting = false;
+    let abortReason: unknown;
+    let cleaned = false;
+    let preservePidFile = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    let resolveChildExit!: () => void;
+    let childExited = false;
+    const childExit = new Promise<void>((resolve) => {
+      resolveChildExit = resolve;
+    });
+    const markChildExit = () => {
+      if (childExited) return;
+      childExited = true;
+      resolveChildExit();
+    };
+    const removePidFile = () => {
+      if (pidFile) {
+        try {
+          unlinkSync(pidFile);
+        } catch {
+          /* removed */
+        }
+      }
+    };
+    const stopCancellationSources = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      if (signal && abortListener) {
+        signal.removeEventListener("abort", abortListener);
+      }
+    };
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      stopCancellationSources();
+      if (!preservePidFile) removePidFile();
+    };
+    const cancel = () => {
+      if (settled || aborting) return;
+      aborting = true;
+      abortReason = signal?.reason;
+      stopCancellationSources();
+      void finishCancellation();
+    };
+    const finishCancellation = async (): Promise<void> => {
+      let treeStopped = true;
+      let terminationError: unknown;
+      try {
+        if (child.pid) {
+          killTree(child.pid, "SIGKILL", child);
+          treeStopped = await terminateTreeWithRetry(child.pid);
+        }
+      } catch (error) {
+        treeStopped = false;
+        terminationError = error;
+      }
+      try {
+        if (!treeStopped && !childExited) {
+          let waitTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              childExit,
+              new Promise<void>((resolve) => {
+                waitTimer = setTimeout(resolve, 1_000);
+              }),
+            ]);
+          } finally {
+            if (waitTimer !== undefined) clearTimeout(waitTimer);
+          }
+        }
+      } finally {
+        preservePidFile = !treeStopped;
+        cleanup();
+        settled = true;
+        reject(
+          treeStopped
+            ? abortReason
+            : new ProcessTreeTerminationError(
+                child.pid ?? -1,
+                abortReason,
+                terminationError,
+              ),
+        );
+      }
+    };
     // 磁盘日志硬上限（与 seam 适配器一致）：raw 回退路径同样不能让 agent.log/test.log 无界增长。
     const MAX_LOG_FILE_BYTES = 32 * 1024 * 1024;
     let logBytes = 0;
@@ -250,35 +370,26 @@ function runChildRaw(
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
+      if (settled) return;
       timedOut = true;
       if (child.pid) killTree(child.pid, "SIGKILL", child);
     }, timeoutMs);
     child.on("error", (error) => {
+      markChildExit();
+      if (aborting) return;
       if (!settled) {
         settled = true;
-        clearTimeout(timer);
-        if (pidFile) {
-          try {
-            unlinkSync(pidFile);
-          } catch {
-            /* removed */
-          }
-        }
+        cleanup();
         reject(error);
       }
     });
     child.on("close", (code) => {
+      markChildExit();
+      if (aborting) return;
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      if (pidFile) {
-        try {
-          unlinkSync(pidFile);
-        } catch {
-          /* removed */
-        }
-      }
+      cleanup();
       resolve({
         code: code ?? -1,
         timedOut,
@@ -286,6 +397,24 @@ function runChildRaw(
         ...(output.truncated ? { outputTruncated: true } : {}),
       });
     });
+    if (signal) {
+      abortListener = cancel;
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) cancel();
+    }
+    if (!settled && !aborting && pidFile && child.pid) {
+      try {
+        writePidRecord(pidFile, child.pid);
+      } catch (error) {
+        settled = true;
+        cleanup();
+        try {
+          if (child.pid) killTree(child.pid, "SIGKILL", child);
+        } finally {
+          reject(error);
+        }
+      }
+    }
   });
 }
 
@@ -297,9 +426,11 @@ function runChild(
   timeoutMs: number,
   logFile?: string,
   pidFile?: string,
+  signal?: AbortSignal,
 ): Promise<ProcessResult> {
-  if (provider) return provider(useShell, command, args, cwd, timeoutMs, logFile, pidFile);
-  return runChildRaw(useShell, command, args, cwd, timeoutMs, logFile, pidFile);
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  if (provider) return provider(useShell, command, args, cwd, timeoutMs, logFile, pidFile, signal);
+  return runChildRaw(useShell, command, args, cwd, timeoutMs, logFile, pidFile, signal);
 }
 
 export function runProcess(
@@ -309,8 +440,9 @@ export function runProcess(
   timeoutMs: number,
   logFile?: string,
   pidFile?: string,
+  signal?: AbortSignal,
 ): Promise<ProcessResult> {
-  return runChild(false, command, args, cwd, timeoutMs, logFile, pidFile);
+  return runChild(false, command, args, cwd, timeoutMs, logFile, pidFile, signal);
 }
 
 export function runShell(
@@ -319,6 +451,7 @@ export function runShell(
   timeoutMs: number,
   logFile?: string,
   pidFile?: string,
+  signal?: AbortSignal,
 ): Promise<ProcessResult> {
-  return runChild(true, command, [], cwd, timeoutMs, logFile, pidFile);
+  return runChild(true, command, [], cwd, timeoutMs, logFile, pidFile, signal);
 }

@@ -6,7 +6,8 @@ import { closeDatabaseConnections } from "./storage.js";
 import { disposeObservability } from "./observability.js";
 import { registerCbxTools, type CbxDefaults } from "./tools.js";
 import { registerCbxCommands } from "./commands.js";
-import { ensureScheduler, stopScheduler } from "./queue-api.js";
+import { acquireScheduler, type SchedulerHandle } from "./queue-api.js";
+import { WorkspacePolicy } from "./workspace-policy.js";
 
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -23,6 +24,8 @@ export interface Config {
   review?: boolean;
   /** Run tasks in an isolated git worktree. */
   isolated?: boolean;
+  /** Explicitly authorized workspace directories; an empty list means cwd only. */
+  workspaces?: string[];
 }
 
 /**
@@ -34,17 +37,20 @@ export default class CbxOrchestrator extends Service {
   static inject = ["subprocess", "tools", "commands"];
 
   static Config: z<Config> = z.object({
-    executor: z.string(),
-    review: z.boolean(),
-    isolated: z.boolean(),
+    executor: z.string().default("codebuddy"),
+    review: z.boolean().default(true),
+    isolated: z.boolean().default(true),
+    workspaces: z.array(z.string()).default([]),
   });
 
   constructor(ctx: Context, config: Config) {
     super(ctx, "cbx");
+    const workspacePolicy = new WorkspacePolicy(config.workspaces ?? []);
     const defaults: CbxDefaults = {
       executor: config.executor,
       review: config.review,
       isolated: config.isolated,
+      workspacePolicy,
     };
     // Route all executor/test/git child processes through the harness
     // subprocess seam (tree-scoped termination, cancel integration).
@@ -52,18 +58,101 @@ export default class CbxOrchestrator extends Service {
     const disposeProvider = setProcessSpawnProvider(createSubprocessProvider(ctx.subprocess));
     registerCbxTools(ctx, defaults);
     registerCbxCommands({ ctx, defaults });
+    let disposeSchedulers: (() => Promise<void>) | undefined;
+    // Register provider teardown before the scheduler effect. Cordis unloads
+    // effects in reverse registration order; the explicit await below also
+    // protects hosts that unload sibling effects concurrently.
+    ctx.effect(() => async () => {
+      try {
+        await disposeSchedulers?.();
+      } finally {
+        try {
+          disposeProvider();
+        } finally {
+          try {
+            await closeDatabaseConnections();
+          } finally {
+            disposeObservability();
+          }
+        }
+      }
+    }, "cbx.provider");
     // 常驻调度器：30s 定时 dispatch（含死 worker 回收），启动即 tick 一次——
     // 崩溃重启后无需等下一次入队就能续跑遗留任务（README"可恢复续跑"承诺的落地）。
     ctx.effect(() => {
-      void ensureScheduler(process.cwd());
-      return () => {
-        void stopScheduler(process.cwd());
+      let disposed = false;
+      const ownedSchedulers = new Set<SchedulerHandle>();
+      const pendingAcquires = new Set<Promise<void>>();
+      const releaseOwned = async (): Promise<void> => {
+        const handles = [...ownedSchedulers];
+        ownedSchedulers.clear();
+        await Promise.all(handles.map((handle) => handle.release()));
+      };
+      const waitPendingAcquires = async (): Promise<void> => {
+        while (pendingAcquires.size > 0)
+          await Promise.allSettled([...pendingAcquires]);
+      };
+      let cleanupTask: Promise<void> | undefined;
+      const cleanup = (): Promise<void> => {
+        if (cleanupTask) return cleanupTask;
+        disposed = true;
+        cleanupTask = (async () => {
+          await releaseOwned();
+          await waitPendingAcquires();
+          await releaseOwned();
+        })();
+        return cleanupTask;
+      };
+      disposeSchedulers = cleanup;
+      const acquireOne = (workspace: string): Promise<void> => {
+        const pending = (async () => {
+          const handle = await acquireScheduler(workspace);
+          if (disposed) {
+            await handle.release();
+            return;
+          }
+          ownedSchedulers.add(handle);
+          await handle.ready;
+          if (disposed) {
+            ownedSchedulers.delete(handle);
+            await handle.release();
+          }
+        })();
+        pendingAcquires.add(pending);
+        void pending.then(
+          () => pendingAcquires.delete(pending),
+          () => pendingAcquires.delete(pending),
+        );
+        return pending;
+      };
+      void (async () => {
+        let workspaces: readonly string[];
+        try {
+          workspaces = await workspacePolicy.listAllowedWorkspaces();
+        } catch (error) {
+          ctx.logger("cbx").error(
+            `cbx 核心工作区策略解析失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+          return;
+        }
+        if (disposed) return;
+        await Promise.all(workspaces.map((workspace) => acquireOne(workspace)));
+      })().catch(async (error) => {
+        const wasDisposed = disposed;
+        await cleanup();
+        if (!wasDisposed) {
+          ctx.logger("cbx").error(
+            `cbx 核心调度器启动失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      });
+      return async () => {
+        try {
+          await cleanup();
+        } finally {
+          if (disposeSchedulers === cleanup) disposeSchedulers = undefined;
+        }
       };
     }, "cbx.scheduler");
-    ctx.effect(() => () => {
-      disposeProvider();
-      void closeDatabaseConnections();
-      void disposeObservability();
-    }, "cbx.provider");
   }
 }

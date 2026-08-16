@@ -1,10 +1,8 @@
-import path from "node:path";
 import { defineTool, type JsonValue } from "@deepseek-ai/dsh-tools";
 import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 import type { Context } from "@deepseek-ai/cordis";
 import { approveJob } from "./approval.js";
 import {
-  discoverWorkspaces,
   listArtifacts,
   listJobs,
   readArtifact,
@@ -22,12 +20,15 @@ import {
 import { runReviewGate } from "./review-gate.js";
 import { readAgentLogIncremental } from "./ui.js";
 import { forgetJobKeepWorktree, loadConfig, loadState, mergeConfig, purgeJob } from "./state.js";
+import { WorkspacePolicy } from "./workspace-policy.js";
 
 /** Plugin-level defaults that seed jobs when the tool call omits the field. */
 export interface CbxDefaults {
   executor?: string;
   review?: boolean;
   isolated?: boolean;
+  /** Reuse a host-owned policy when one is supplied; otherwise only cwd is allowed. */
+  workspacePolicy?: WorkspacePolicy;
 }
 
 function jsonContent(value: unknown): ContentBlock[] {
@@ -72,13 +73,11 @@ function clampJson(value: unknown): unknown {
   return value;
 }
 
-/** Resolve the target workspace: explicit arg wins, else the invoking directory. */
-function workspaceOf(input: string | undefined): string {
-  return path.resolve(input ?? process.cwd());
-}
-
 export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
   const tools = ctx.tools;
+  const workspacePolicy = defaults.workspacePolicy ?? new WorkspacePolicy();
+  const workspaceOf = (input: string | undefined): Promise<string> =>
+    workspacePolicy.resolveWorkspace(input);
 
   tools.register(defineTool({
     name: "cbx_run",
@@ -104,7 +103,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      const ws = workspaceOf(args.workspace);
+      const ws = await workspaceOf(args.workspace);
       const config = await loadConfig(ws);
       const merged = mergeConfig(config, {
         testCommand: args.test,
@@ -158,7 +157,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(clampJson(await loadState(workspaceOf(args.workspace), args.job_id)));
+      return toJson(clampJson(await loadState(await workspaceOf(args.workspace), args.job_id)));
     },
   }));
 
@@ -170,7 +169,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await listJobs(workspaceOf(args.workspace)));
+      return toJson(await listJobs(await workspaceOf(args.workspace)));
     },
   }));
 
@@ -182,7 +181,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await listQueue(workspaceOf(args.workspace)));
+      return toJson(await listQueue(await workspaceOf(args.workspace)));
     },
   }));
 
@@ -194,7 +193,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await pauseQueue(workspaceOf(args.workspace)));
+      return toJson(await pauseQueue(await workspaceOf(args.workspace)));
     },
   }));
 
@@ -206,7 +205,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await resumeQueue(workspaceOf(args.workspace)));
+      return toJson(await resumeQueue(await workspaceOf(args.workspace)));
     },
   }));
 
@@ -218,7 +217,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await dispatchQueue(workspaceOf(args.workspace)));
+      return toJson(await dispatchQueue(await workspaceOf(args.workspace)));
     },
   }));
 
@@ -235,7 +234,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     output: jsonOutput(),
     async execute(args) {
       await startBackground(
-        workspaceOf(args.workspace),
+        await workspaceOf(args.workspace),
         args.job_id,
         args.message ?? "",
         0,
@@ -256,7 +255,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(clampJson(await cancelJob(workspaceOf(args.workspace), args.job_id)));
+      return toJson(clampJson(await cancelJob(await workspaceOf(args.workspace), args.job_id)));
     },
   }));
   tools.register(defineTool({
@@ -270,7 +269,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     output: jsonOutput(),
     async execute(args) {
       return toJson(await retryQueueJob(
-        workspaceOf(args.workspace),
+        await workspaceOf(args.workspace),
         args.job_id,
         args.priority === undefined ? 0 : Number(args.priority),
       ));
@@ -287,7 +286,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     output: jsonOutput(),
     async execute(args) {
       // before_run 审批通过即原子重入队（approval 内完成 + 立即 dispatch），无需再补启动。
-      const state = await approveJob(workspaceOf(args.workspace), args.job_id);
+      const state = await approveJob(await workspaceOf(args.workspace), args.job_id);
       return toJson(clampJson(state));
     },
   }));
@@ -301,7 +300,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
     async execute(args) {
-      return clampText(await readArtifact(workspaceOf(args.workspace), args.job_id, "result.json"));
+      return clampText(await readArtifact(await workspaceOf(args.workspace), args.job_id, "result.json"));
     },
   }));
 
@@ -315,7 +314,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
     async execute(args) {
-      return clampText(await readArtifact(workspaceOf(args.workspace), args.job_id, args.artifact));
+      return clampText(await readArtifact(await workspaceOf(args.workspace), args.job_id, args.artifact));
     },
   }));
 
@@ -328,7 +327,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await listArtifacts(workspaceOf(args.workspace), args.job_id));
+      return toJson(await listArtifacts(await workspaceOf(args.workspace), args.job_id));
     },
   }));
 
@@ -343,7 +342,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     output: jsonOutput(),
     async execute(args) {
       return toJson(await readAgentLogIncremental(
-        workspaceOf(args.workspace),
+        await workspaceOf(args.workspace),
         args.job_id,
         args.since === undefined ? 0 : Number(args.since),
       ));
@@ -359,7 +358,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await health(workspaceOf(args.workspace), { prune: args.prune === true }));
+      return toJson(await health(await workspaceOf(args.workspace), { prune: args.prune === true }));
     },
   }));
 
@@ -373,7 +372,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      const ws = workspaceOf(args.workspace);
+      const ws = await workspaceOf(args.workspace);
       if (args.purge === true) {
         return toJson(await purgeJob(ws, args.job_id, "tool:purge"));
       }
@@ -383,13 +382,15 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
 
   tools.register(defineTool({
     name: "cbx_list_workspaces",
-    description: "Scan a root directory for subdirectories containing a .cbx/ store and list their jobs.",
+    description: "List jobs in an explicitly authorized workspace; does not discover child directories.",
     parameters: {
-      root: { type: "string", required: true, description: "Directory to scan one level deep." },
+      root: { type: "string", required: true, description: "Authorized workspace to list." },
     },
     output: jsonOutput(),
     async execute(args) {
-      const roots = await discoverWorkspaces(args.root);
+      const root = await workspaceOf(args.root);
+      const roots = (await workspacePolicy.listAllowedWorkspaces())
+        .filter((workspace) => workspace === root);
       const jobs = [];
       for (const ws of roots) {
         jobs.push({ workspace: ws, jobs: await listJobs(ws) });
@@ -407,10 +408,15 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       review_rules: { type: "string", description: "Review focus instructions." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await runReviewGate(workspaceOf(args.workspace), {
+    async execute(args, exec) {
+      const signal = exec?.signal;
+      signal?.throwIfAborted();
+      const workspace = await workspaceOf(args.workspace);
+      signal?.throwIfAborted();
+      return toJson(await runReviewGate(workspace, {
         executor: args.executor,
         reviewRules: args.review_rules,
+        signal,
       }));
     },
   }));

@@ -6,6 +6,7 @@ import { listJobs, readArtifact } from "./artifacts.js";
 import { loadConfig, loadState, mergeConfig } from "./state.js";
 import type { CbxDefaults } from "./tools.js";
 import type { CommandResult } from "@deepseek-ai/dsh-commands";
+import { WorkspacePolicy } from "./workspace-policy.js";
 
 /** Registration entry shared by the interactive command layer. */
 interface CbxCommandContext {
@@ -21,13 +22,12 @@ function err(text: string): CommandResult {
   return { kind: "error", text };
 }
 
-function workspace(): string {
-  return process.cwd();
-}
-
 export function registerCbxCommands(service: CbxCommandContext): void {
   const commands = service.ctx.commands;
   const defaults = service.defaults;
+  const workspacePolicy = defaults.workspacePolicy ?? new WorkspacePolicy();
+  const resolveWorkspace = (): Promise<string> =>
+    workspacePolicy.resolveWorkspace(process.cwd());
 
   commands.register({
     name: "cbx-run",
@@ -36,13 +36,13 @@ export function registerCbxCommands(service: CbxCommandContext): void {
     async handler(invocation) {
       const task = invocation.rawInput.trim();
       if (!task) return err("Usage: /cbx-run <task>");
-      const ws = workspace();
-      const config = await loadConfig(ws);
-      const merged = mergeConfig(config, {
-        review: defaults.review,
-        isolated: defaults.isolated,
-      });
       try {
+        const ws = await resolveWorkspace();
+        const config = await loadConfig(ws);
+        const merged = mergeConfig(config, {
+          review: defaults.review,
+          isolated: defaults.isolated,
+        });
         const created = await createJob({
           workspace: ws,
           task,
@@ -81,7 +81,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-status <job_id>");
       try {
-        const state = await loadState(workspace(), jobId);
+        const state = await loadState(await resolveWorkspace(), jobId);
         return ok(`[${jobId}] ${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.stage ? ` / stage ${state.stage}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
@@ -98,7 +98,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       if (!jobId) return err("Usage: /cbx-continue <job_id> [message]");
       const message = rest.join(" ");
       try {
-        await startBackground(workspace(), jobId, message, 0);
+        await startBackground(await resolveWorkspace(), jobId, message, 0);
         return ok(`job ${jobId} re-queued for continuation.`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
@@ -114,7 +114,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-cancel <job_id>");
       try {
-        const state = await cancelJob(workspace(), jobId);
+        const state = await cancelJob(await resolveWorkspace(), jobId);
         return ok(`[${jobId}] ${state.status}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
@@ -127,7 +127,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
     description: "List cbx jobs in the current workspace.",
     async handler() {
       try {
-        const jobs = await listJobs(workspace());
+        const jobs = await listJobs(await resolveWorkspace());
         if (jobs.length === 0) return ok("no cbx jobs in this workspace.");
         const lines = jobs.map((job) =>
           `[${job.jobId}] ${job.status}${job.phase ? ` / ${job.phase}` : ""}${job.createdAt ? ` created ${job.createdAt}` : ""}`,
@@ -146,9 +146,10 @@ export function registerCbxCommands(service: CbxCommandContext): void {
     async handler(invocation) {
       const action = invocation.rawInput.trim();
       try {
-        if (action === "pause") return ok(JSON.stringify(await pauseQueue(workspace())));
-        if (action === "resume") return ok(JSON.stringify(await resumeQueue(workspace())));
-        if (action === "") return ok(JSON.stringify(await listQueue(workspace())));
+        const ws = await resolveWorkspace();
+        if (action === "pause") return ok(JSON.stringify(await pauseQueue(ws)));
+        if (action === "resume") return ok(JSON.stringify(await resumeQueue(ws)));
+        if (action === "") return ok(JSON.stringify(await listQueue(ws)));
         // 拼写错误不再静默降级为"查看队列"，显式报错避免误导。
         return err(`未知操作：${action}（支持 pause / resume，空参数查看队列）。`);
       } catch (error) {
@@ -165,7 +166,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-result <job_id>");
       try {
-        return ok(await readArtifact(workspace(), jobId, "result.json"));
+        return ok(await readArtifact(await resolveWorkspace(), jobId, "result.json"));
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }

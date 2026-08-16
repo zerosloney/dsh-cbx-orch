@@ -74,7 +74,7 @@ dsh --profile web
 | `cbx_result` / `cbx_artifact` / `cbx_artifacts` / `cbx_logs` | 读 result.json / 任意产物 / 产物列表 / agent.log 增量 |
 | `cbx_health` | 队列深度、状态计数、失败/重试、死信（不含任务正文）。**默认只读**；`prune: true` 时才应用保留期清理 |
 | `cbx_clean` | forget/purge 任务（含 worktree 清理） |
-| `cbx_list_workspaces` | 扫描根目录下含 `.cbx/` 的工作区 |
+| `cbx_list_workspaces` | 列出已授权的工作区（不扫描任意 root 或子目录） |
 | `cbx_review_gate` | 对未提交改动跑独立审查 |
 
 > 工具参数使用 **snake_case**（如 `timeout_ms` / `max_retries` / `max_turns`）；`.cbx.json` 配置键与 Web/命令层使用 **camelCase**（`timeoutMs` / `maxRetries` / `maxTurns`）。二者仅命名风格不同，语义一一对应。
@@ -91,11 +91,12 @@ dsh --profile web
 
 - `GET /cbx/` — 仪表盘 HTML（带 `default-src 'self'; frame-ancestors 'none'` CSP）
 - `GET /cbx/events` — SSE 实时事件流（Last-Event-ID 回放，单连接回放上限 1000 条；服务端连接数上限 16，慢客户端背压超限会被断开）
-- `GET /cbx/api/workspaces|jobs|queue|healthz|metrics`
+- `GET /cbx/api/workspaces|jobs|queue|metrics`
+- `GET /cbx/healthz`
 - `GET /cbx/api/jobs/<id>[/artifacts|/artifact/<name>|/timeline|/executor|/agent.log]`
 - `POST /cbx/api/jobs`（创建）、`/cbx/api/jobs/<id>/approve|cancel|retry|continue|forget|purge`、`/cbx/api/queue/pause|resume`
 
-数据端点鉴权用 `Authorization: Bearer <token>` 或 HttpOnly cookie `cbx_token`（HTTPS 下自动追加 `Secure`；**不接受 URL query token**——会泄漏进浏览器历史与代理日志）。首页、`/healthz` 与登录端点 `POST /cbx/auth`（body `{"token": "..."}`，验证通过才下发 cookie，每 IP 每分钟限 10 次、成功登录即清零计数）开放。`/healthz` 与 `/api/metrics` 均为只读（不触发保留期清理）。
+数据端点鉴权用 `Authorization: Bearer <token>` 或 HttpOnly cookie `cbx_token`（HTTPS 下自动追加 `Secure`；**不接受 URL query token**——会泄漏进浏览器历史与代理日志）。首页、静态资源 `/cbx/style.css` 与 `/cbx/app.js`、`/cbx/healthz` 以及登录端点 `POST /cbx/auth`（body `{"token": "..."}`，验证通过才下发 cookie，每 IP 每分钟限 10 次、成功登录即清零计数）开放；其余数据端点（包括 `/cbx/api/metrics`）需要鉴权。`/cbx/healthz` 与 `/cbx/api/metrics` 均为只读（不触发保留期清理）。
 
 ## 配置
 
@@ -109,13 +110,18 @@ dsh --profile web
         executor: codebuddy   # codebuddy / opencode / omp / cline / qwen / 插件路径
         review: true          # 测试通过后跑独立审查
         isolated: true        # git worktree 隔离执行
+        workspaces: []        # cbx 工具工作区白名单；空/缺省仅允许 canonical cwd
     - id: cbx-orch-web
       name: 'dsh-cbx-orch/web'
       config:
         web:
-          token: ''           # 数据端点 Bearer token；空 = 自动生成随机 token（落盘 .cbx/web.token，重启复用）
+          token: ''           # 非空 = 使用配置值；空/缺省 = 读取或生成 <首个工作区>/.cbx/web.token（生成时 0600），无免鉴权模式
           workspaces: []      # ?workspace= 白名单；空 = 当前目录
 ```
+
+core 的 `workspaces` 是 `cbx_*` 工具的工作区白名单：空或缺省时只允许经 canonical 化后的当前目录；显式列表只授权其中精确的 workspace。路径通过 `realpath` canonicalize（Windows 下折叠路径大小写），越权、缺失路径或非目录都会拒绝。`cbx_list_workspaces` 只列出该白名单中的 workspace，不再扫描任意 root 或子目录。
+
+Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlist，但使用相同的 `WorkspacePolicy` 语义（canonicalization、越权/不存在/非目录拒绝）。core 的 `workspaces` 与 Web 的 `web.workspaces` 是两个独立配置，不会自动共享配置值。
 
 ### 工作区配置（`.cbx.json`，与 cbx-orch 相同）
 
@@ -147,7 +153,7 @@ dsh --profile web
 - **测试命令防线**：黑名单在匹配前先归一化（剥引号/反斜杠/`${var}`/`%var%`），拦截 `r\m`、`r""m` 一类拼接绕过；覆盖 `rm -rf`/`del /s`/`find -exec`/`git clean`/`truncate`/`dd`/`shred`/首 token `eval`/PowerShell 全部 `-EncodedCommand` 缩写；创建时与**执行时各验一次**（context.json 是执行器可写文件）。仍属软防线——非隔离任务请运行在受控环境，敏感场景建议 `isolated: true`。
 - **进程终止安全**：跨进程 kill 前按 pid 归属校验（见「行为语义」）；Windows 树杀始终走 `taskkill /T /F`（不用会漏掉孙进程的 `child.kill`）；abort 后设硬死线，杀不死的子进程不再让任务永久挂起。
 - **路径安全**：jobId 全链路校验（字符集白名单 + 拒绝 `..`/Windows 设备名/尾点段），目录删除与 context 写入共用同一道门；未跟踪符号链接不被跟随。
-- **Web 鉴权**：`web.token` 为空时自动生成随机 token 并以 `0600` 权限写入主工作区 `.cbx/web.token`（重启复用，启动日志打印路径）；**token 无法解析时拒绝挂载路由（fail-closed）**，绝不退化成无鉴权面。浏览器端首次请求数据端点收到 401，页面弹出 token 输入框，经 `POST /cbx/auth` 换取 HttpOnly cookie（SameSite=Strict，HTTPS 下加 Secure；token 不出现在页面源码或 URL）。`/healthz` 与 `/api/metrics` 开放且只读（不触发保留期清理，防匿名 DoS 放大）。仪表盘带 CSP；SSE 有连接数与背压上限。
+- **Web 鉴权**：`web.token` 非空时直接使用配置值；为空或缺省时，插件先从首个配置工作区（未配置时为当前目录）的 `.cbx/web.token` 读取非空值，文件不存在或为空则生成随机 token，并以 `0600` 权限写入该文件，后续未配置显式 token 的启动会复用它。未配置显式 token 时启动日志只打印 token 文件路径，不打印 token 值；浏览器提示从该文件或日志路径取得 token。**token 无法解析时拒绝挂载 Web 路由（fail-closed）**，绝不退化成无鉴权面。浏览器端首次请求数据端点收到 401，页面弹出 token 输入框，经 `POST /cbx/auth` 换取 HttpOnly cookie（SameSite=Strict，HTTPS 下加 Secure；token 不出现在页面源码或 URL）。`/healthz` 与 `/api/metrics` 均为只读，但只有 `/healthz` 公开，`/api/metrics` 仍需鉴权（均不触发保留期清理）。仪表盘带 CSP；SSE 有连接数与背压上限。
 - **review stop-gate**：审查执行异常/超时/非零退出/无法解析 VERDICT 时默认 **fail-closed 拦截**（门禁的意义就是拦住行为异常的审查代理）；基础设施错误（如配置读取失败）仍放行以维持 hook 契约。需要旧行为配置 `reviewGate.failOpen: true`。
 - **执行器插件**：`executor` 指向工作区内的插件路径时，默认仅告警不强制白名单；生产环境请配置 `plugins.enforce=true` 与 `allowPaths`/`allowSha256`（路径/哈希白名单校验后才加载）。
 

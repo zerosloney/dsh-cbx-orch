@@ -509,56 +509,103 @@ export async function replayEvents(
 }
 
 /** 轮询 workspace 级 .cbx/events.ndjson 增量，解析完整行后回调。 */
+export type EventTailerGuard = () => void | Promise<void>;
+
+export interface EventTailerOptions {
+  /** Runs before each poll; rejection stops the tailer fail-closed. */
+  guard?: EventTailerGuard;
+  /** Called after a guard rejection, without exposing the workspace path. */
+  onGuardFailure?: (error: unknown) => void | Promise<void>;
+}
+
 export function startEventTailer(
   workspace: string,
   onEvent: (event: Record<string, unknown>) => void,
+  guardOrOptions?: EventTailerGuard | EventTailerOptions,
 ): () => void {
   const eventsFile = path.join(workspace, ".cbx", "events.ndjson");
+  const guard = typeof guardOrOptions === "function"
+    ? guardOrOptions
+    : guardOrOptions?.guard;
+  const onGuardFailure = typeof guardOrOptions === "function"
+    ? undefined
+    : guardOrOptions?.onGuardFailure;
   let size = -1;
   let buffer = "";
+  let stopped = false;
+  let running = false;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const stop = (): void => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== undefined) clearInterval(timer);
+  };
   // intentional-simple: 500ms 文件大小轮询。Windows 下 fs.watch 不可靠；事件量低，开销可忽略。
   // 首次 stat 前文件不存在时设 size=0：文件首次创建后读到全部已有事件，不丢首批。
   const poll = async (): Promise<void> => {
+    if (stopped || running) return;
+    running = true;
     try {
-      const s = await stat(eventsFile);
-      if (size < 0) {
-        size = s.size;
-        return;
-      }
-      if (s.size === size) return;
-      if (s.size < size) {
-        size = s.size;
-        buffer = "";
-        return;
-      }
-      const fd = await open(eventsFile, "r");
       try {
-        const buf = Buffer.alloc(s.size - size);
-        await fd.read(buf, 0, buf.length, size);
-        buffer += buf.toString("utf8");
-        size = s.size;
-        let idx: number;
-        while ((idx = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, idx).trim();
-          buffer = buffer.slice(idx + 1);
-          if (line) {
-            try {
-              onEvent(JSON.parse(line));
-            } catch {
-              /* partial/corrupt line */
+        await guard?.();
+      } catch (error) {
+        stop();
+        try {
+          if (onGuardFailure) await onGuardFailure(error);
+          else console.warn("cbx: event tailer stopped after workspace identity validation failed");
+        } catch {
+          // Guard failure handling must never create an unhandled rejection.
+          console.warn("cbx: event tailer stopped after workspace identity validation failed");
+        }
+        return;
+      }
+      if (stopped) return;
+      try {
+        const s = await stat(eventsFile);
+        if (stopped) return;
+        if (size < 0) {
+          size = s.size;
+          return;
+        }
+        if (s.size === size) return;
+        if (s.size < size) {
+          size = s.size;
+          buffer = "";
+          return;
+        }
+        const fd = await open(eventsFile, "r");
+        try {
+          const buf = Buffer.alloc(s.size - size);
+          await fd.read(buf, 0, buf.length, size);
+          buffer += buf.toString("utf8");
+          size = s.size;
+          let idx: number;
+          while ((idx = buffer.indexOf("\n")) >= 0) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (line) {
+              try {
+                onEvent(JSON.parse(line));
+              } catch {
+                /* partial/corrupt line */
+              }
             }
           }
+        } finally {
+          await fd.close();
         }
-      } finally {
-        await fd.close();
+      } catch (error) {
+        // 文件不存在时初始化基线为 0，避免文件首次创建后把已有内容当历史跳过。
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT" && size < 0)
+          size = 0;
       }
-    } catch (error) {
-      // 文件不存在时初始化基线为 0，避免文件首次创建后把已有内容当历史跳过。
-      if ((error as NodeJS.ErrnoException)?.code === "ENOENT" && size < 0)
-        size = 0;
+    } finally {
+      running = false;
     }
   };
-  const timer = setInterval(poll, 500);
+  timer = setInterval(() => {
+    void poll();
+  }, 500);
   timer.unref();
-  return () => clearInterval(timer);
+  return stop;
 }

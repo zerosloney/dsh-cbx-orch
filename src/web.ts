@@ -41,6 +41,7 @@ import {
   readJsonBody,
 } from "./http-util.js";
 import { constantTimeEqual } from "./storage.js";
+import { WorkspacePolicy } from "./workspace-policy.js";
 
 /** Mount point for the cbx dashboard on the harness web server. */
 export const CBX_MOUNT = "/cbx";
@@ -98,33 +99,23 @@ function errorStatus(error: unknown): number {
   return 500;
 }
 
-/** 路径等价比较：resolve+normalize，win32 再折叠大小写——配置里的相对路径、
- *  正反斜杠混写、大小写变体都应命中白名单，而不是静默失配回退默认工作区。 */
-function samePath(a: string, b: string): boolean {
-  const na = path.normalize(path.resolve(a));
-  const nb = path.normalize(path.resolve(b));
-  return process.platform === "win32"
-    ? na.toLowerCase() === nb.toLowerCase()
-    : na === nb;
-}
-
 /**
  * Register the cbx dashboard (HTML + REST + SSE) under {@link CBX_MOUNT} on the
- * harness web server. Workspaces default to the invoking directory; the
- * plugin config's `web.workspaces` allowlist plus `?workspace=` override picks
- * among them.
+ * harness web server. Workspaces are canonicalized by the shared policy; the
+ * workspace query override must exactly select one of them.
  */
-export function registerCbxWebRoutes(ctx: Context, options: {
-  workspaces?: string[];
+export async function registerCbxWebRoutes(ctx: Context, options: {
+  workspacePolicy?: WorkspacePolicy;
+  workspaces?: readonly string[];
   token?: string;
-}): void {
-  // 归一化 + 去重：重复/异构拼写的配置项会产生重复的 tailer、重复的 /api/workspaces
-  // 行和重复的 SSE 广播。
-  const workspaces = [...new Set(
-    (options.workspaces && options.workspaces.length > 0
-      ? options.workspaces
-      : [process.cwd()]).map((ws) => path.resolve(ws)),
-  )];
+  isDisposed?: () => boolean;
+}): Promise<void> {
+  const workspacePolicy = options.workspacePolicy
+    ?? new WorkspacePolicy(options.workspaces ?? []);
+  // The policy performs realpath canonicalization, exact-match authorization,
+  // and deduplication before any tailer or route is started.
+  const workspaces = [...await workspacePolicy.listAllowedWorkspaces()];
+  if (options.isDisposed?.()) return;
   const token = options.token;
   const clients = new Set<SseClient>();
   const authLimiter = new AuthRateLimiter();
@@ -162,21 +153,57 @@ export function registerCbxWebRoutes(ctx: Context, options: {
     }
   };
 
+  const closeSseClients = (): void => {
+    for (const client of clients) {
+      clients.delete(client);
+      try {
+        client.res.destroy();
+      } catch {
+        /* socket already closed */
+      }
+    }
+  };
+
   const stopTailers: Array<() => void> = [];
   workspaces.forEach((ws, wsIndex) => {
+    const guard = async (): Promise<void> => {
+      const current = await workspacePolicy.resolveWorkspace(ws);
+      if (current !== ws) throw new Error("workspace identity changed");
+    };
     stopTailers.push(startEventTailer(ws, (event) =>
-      broadcast(wsIndex, { ...event, workspace: ws })));
+      broadcast(wsIndex, { ...event, workspace: ws }), {
+        guard,
+        onGuardFailure: () => {
+          // Aggregate SSE subscriptions receive every workspace, so a single
+          // invalid identity invalidates all existing clients.
+          closeSseClients();
+          ctx.logger("cbx").warn(
+            "cbx web event tailer stopped after workspace identity validation failed",
+          );
+        },
+      }));
   });
 
-  const resolveWorkspace = (url: URL): string => {
+  const resolveWorkspace = async (url: URL): Promise<string> => {
     const requested = url.searchParams.get("workspace");
-    if (requested) {
-      const resolved = path.resolve(decodeURIComponent(requested));
-      // 命中白名单时返回白名单里的规范拼写，避免同一工作区出现两种路径形态。
-      const canonical = workspaces.find((ws) => samePath(ws, resolved));
-      if (canonical) return canonical;
+    if (requested !== null) {
+      if (!requested) throw new HttpError(400, "workspace 参数必须是非空路径。");
+      // Invalid, missing, non-directory, and unauthorized paths all surface as
+      // E_INVALID_WORKSPACE and are mapped to a client error by errorStatus.
+      return workspacePolicy.resolveWorkspace(requested);
     }
-    return workspaces[0] ?? process.cwd();
+    // Re-resolve the cached first entry on every default request. This keeps a
+    // renamed workspace from silently following a newly installed symlink or
+    // junction to an unauthorized directory.
+    if (!workspaces[0]) throw new HttpError(400, "没有可用的授权工作区。");
+    return workspacePolicy.resolveWorkspace(workspaces[0]);
+  };
+
+  const resolveAggregateWorkspaces = async (): Promise<readonly string[]> => {
+    // Aggregate endpoints retain their multi-workspace behavior, but each
+    // cached path must still be re-canonicalized before it is read.
+    return Promise.all(workspaces.map((workspace) =>
+      workspacePolicy.resolveWorkspace(workspace)));
   };
 
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -272,6 +299,11 @@ export function registerCbxWebRoutes(ctx: Context, options: {
         return;
       }
       if (pathname === "/events") {
+        if (url.searchParams.has("workspace")) {
+          json(res, { error: "聚合 events 端点不接受 workspace 参数。" }, 400);
+          return;
+        }
+        const currentWorkspaces = await resolveAggregateWorkspaces();
         if (clients.size >= MAX_SSE_CLIENTS) {
           json(res, { error: "SSE 连接数已达上限，请关闭其他面板后重试。" }, 503);
           return;
@@ -285,7 +317,7 @@ export function registerCbxWebRoutes(ctx: Context, options: {
         const lastEventIdRaw = (Array.isArray(lastEventIdHeader)
           ? lastEventIdHeader[0]
           : lastEventIdHeader) ?? url.searchParams.get("last_event_id") ?? undefined;
-        const cursors = parseCursors(lastEventIdRaw, workspaces.length);
+        const cursors = parseCursors(lastEventIdRaw, currentWorkspaces.length);
         const client: SseClient = {
           res,
           pending: [],
@@ -293,9 +325,9 @@ export function registerCbxWebRoutes(ctx: Context, options: {
           bufferedBytes: 0,
         };
         clients.add(client);
-        for (let wsIndex = 0; wsIndex < workspaces.length; wsIndex += 1) {
+        for (let wsIndex = 0; wsIndex < currentWorkspaces.length; wsIndex += 1) {
           try {
-            await replayEvents(workspaces[wsIndex], client, wsIndex, cursors[wsIndex]);
+            await replayEvents(currentWorkspaces[wsIndex], client, wsIndex, cursors[wsIndex]);
           } catch {
             /* 客户端在回放期间断开 */
           }
@@ -309,22 +341,27 @@ export function registerCbxWebRoutes(ctx: Context, options: {
         writeSse(client, `data: ${JSON.stringify({
           at: new Date().toISOString(),
           type: "connected",
-          workspaces,
+          workspaces: currentWorkspaces,
         })}\n\n`);
         req.on("close", () => clients.delete(client));
         return;
       }
       if (pathname === "/api/workspaces") {
-        const summaries = await Promise.all(workspaces.map((ws) =>
+        if (url.searchParams.has("workspace")) {
+          json(res, { error: "聚合 workspaces 端点不接受 workspace 参数。" }, 400);
+          return;
+        }
+        const currentWorkspaces = await resolveAggregateWorkspaces();
+        const summaries = await Promise.all(currentWorkspaces.map((ws) =>
           summarizeWorkspace(ws).catch((error) => ({
             path: ws,
             name: path.basename(ws) || ws,
             error: error instanceof Error ? error.message : String(error),
           }))));
-        json(res, { workspaces: summaries, default: workspaces[0] });
+        json(res, { workspaces: summaries, default: currentWorkspaces[0] });
         return;
       }
-      const ws = resolveWorkspace(url);
+      const ws = await resolveWorkspace(url);
       if (pathname === "/api/jobs" && req.method === "GET") {
         json(res, await listJobs(ws));
         return;

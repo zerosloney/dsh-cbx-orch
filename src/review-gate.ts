@@ -23,9 +23,11 @@ const DEFAULT_MAX_TURNS = 50;
  * 放行以维持 hook 的"不逃逸非零退出码"契约。需要旧行为时配置
  * reviewGate.failOpen: true。
  */
-export async function runReviewGate(workspaceInput: string, options: { executor?: string; reviewRules?: string; timeoutMs?: number; maxTurns?: number; permissionMode?: string; failOpen?: boolean } = {}): Promise<ReviewGateResult> {
+export async function runReviewGate(workspaceInput: string, options: { executor?: string; reviewRules?: string; timeoutMs?: number; maxTurns?: number; permissionMode?: string; failOpen?: boolean; signal?: AbortSignal } = {}): Promise<ReviewGateResult> {
+  options.signal?.throwIfAborted();
   const workspace = path.resolve(workspaceInput);
   const config = await loadConfig(workspace);
+  options.signal?.throwIfAborted();
   const executor = options.executor ?? config.executor ?? "codebuddy";
   const reviewRules = options.reviewRules ?? config.reviewRules;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -34,6 +36,7 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   const failOpen = options.failOpen ?? config.reviewGate?.failOpen === true;
 
   const snapshot = await snapshotDiff(workspace);
+  options.signal?.throwIfAborted();
   if (!snapshot.status.trim() && !snapshot.complete.trim()) {
     return { pass: true, reason: "无未提交改动，跳过 review", review: "", verdict: "SKIP" };
   }
@@ -41,6 +44,7 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   // mkdtemp 临时目录不会被 OS 自动回收（Windows 尤甚），跑完即删；清理失败不掩盖审查结果。
   const directory = await mkdtemp(path.join(os.tmpdir(), "cbx-review-gate-"));
   try {
+    options.signal?.throwIfAborted();
     return await runReviewGateIn(directory, {
       workspace,
       executor,
@@ -50,6 +54,7 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
       timeoutMs,
       snapshot,
       failOpen,
+      signal: options.signal,
     });
   } finally {
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
@@ -67,6 +72,7 @@ async function runReviewGateIn(
     timeoutMs: number;
     snapshot: DiffSnapshot;
     failOpen: boolean;
+    signal?: AbortSignal;
   },
 ): Promise<ReviewGateResult> {
   const {
@@ -78,22 +84,29 @@ async function runReviewGateIn(
     timeoutMs,
     snapshot,
     failOpen,
+    signal,
   } = params;
   const patchFile = path.join(directory, "complete.patch");
   const statusFile = path.join(directory, "git-status.txt");
   const untrackedFile = path.join(directory, "untracked-files.txt");
   const reviewFile = path.join(directory, "review.md");
+  signal?.throwIfAborted();
   await writeFile(patchFile, snapshot.complete, "utf8");
+  signal?.throwIfAborted();
   await writeFile(statusFile, snapshot.status, "utf8");
+  signal?.throwIfAborted();
   await writeFile(untrackedFile, snapshot.untracked, "utf8");
+  signal?.throwIfAborted();
 
   const extra = `审查以下材料：\n- ${patchFile}\n- ${statusFile}\n- ${untrackedFile}\n\n不要修改代码。将结果写入 ${reviewFile}。第一行必须是 VERDICT: PASS 或 VERDICT: FAIL。按严重程度列出问题、文件和行号。\n\n审查规则：\n${reviewRules ?? "关注正确性、回归风险、安全性、测试覆盖和改动范围。"}`;
   const prompt = `你是独立审查代理。\n\n当前阶段：stop-gate review\n\n${extra}\n\n持久化要求：\n- 将审查结果写入 ${reviewFile}。\n- 报告必须包含 VERDICT 与问题清单。\n- 不要把关键信息只放在聊天输出中。\n`;
 
   let result: ProcessResult;
   try {
-    result = await invokeExecutor(executor, workspace, directory, workspace, prompt, permissionMode, maxTurns, timeoutMs);
+    result = await invokeExecutor(executor, workspace, directory, workspace, prompt, permissionMode, maxTurns, timeoutMs, undefined, signal);
+    signal?.throwIfAborted();
   } catch (error) {
+    signal?.throwIfAborted();
     const reason = `审查执行异常：${error instanceof Error ? error.message : String(error)}`;
     if (failOpen) return { pass: true, reason: `${reason}（failOpen 放行）`, review: "", verdict: "ERROR" };
     return { pass: false, reason: `${reason}（fail-closed 拦截；确认审查执行器可用或配置 reviewGate.failOpen）`, review: "", verdict: "ERROR" };
@@ -103,6 +116,7 @@ async function runReviewGateIn(
   // stop-gate 路径此前没有 stage 路径的"审查后 diff 比对"（stage-runner 的
   // reviewerModifiedWorktree 守卫），这里补齐：快照出现任何漂移即 fail-closed。
   const after = await snapshotDiff(workspace);
+  signal?.throwIfAborted();
   if (after.complete !== snapshot.complete || after.status !== snapshot.status || after.untracked !== snapshot.untracked) {
     return { pass: false, reason: "审查代理修改了主工作区（已拦截，fail-closed）", review: after.status, verdict: "MUTATED" };
   }
@@ -117,7 +131,15 @@ async function runReviewGateIn(
   }
 
   let review = "";
-  try { review = await readFile(reviewFile, "utf8"); } catch { review = result.output; }
+  try {
+    signal?.throwIfAborted();
+    review = await readFile(reviewFile, "utf8");
+    signal?.throwIfAborted();
+  } catch (error) {
+    signal?.throwIfAborted();
+    review = result.output;
+  }
+  signal?.throwIfAborted();
   const firstLine = review.replace(/^\uFEFF/, "").split(/\r?\n/, 1)[0].trim();
   const pass = /^VERDICT\s*:\s*PASS$/i.test(firstLine);
   const fail = /^VERDICT\s*:\s*FAIL$/i.test(firstLine);

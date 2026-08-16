@@ -30,6 +30,7 @@ export interface QueueRuntime {
 }
 
 export interface QueueService { done: Promise<void>; stop(): Promise<void>; }
+export type WorkspaceIdentityGuard = () => Promise<void>;
 
 async function loadQueue(workspace: string): Promise<QueueFile> {
   const queue = await loadPersistedQueue<QueueFile>(workspace, { maxConcurrent: 2, paused: false, entries: [], updatedAt: now() });
@@ -179,38 +180,92 @@ export async function dispatchQueue(runtime: QueueRuntime, workspaceInput: strin
 }
 
 /** Keeps a single dispatcher alive; startup dispatch also reclaims workers left by a prior crash. */
-export async function serveQueue(runtime: QueueRuntime, workspaceInput: string, intervalMs = 30_000): Promise<QueueService> {
+export async function serveQueue(
+  runtime: QueueRuntime,
+  workspaceInput: string,
+  intervalMs = 30_000,
+  workspaceIdentityGuard?: WorkspaceIdentityGuard,
+): Promise<QueueService> {
   if (!Number.isInteger(intervalMs) || intervalMs < 50) throw new Error("serve intervalMs 必须是不小于 50ms 的整数。");
   let stopping = false;
   let resolveDone!: () => void;
   const done = new Promise<void>(resolve => { resolveDone = resolve; });
   const lease = await acquireServiceLease(workspaceInput, "queue-serve", SERVICE_LEASE_TTL_MS);
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let leaseTimer: ReturnType<typeof setInterval> | undefined;
   let inFlight: Promise<void> | undefined;
+  let shutdownPromise: Promise<void> | undefined;
+  let leaseReleased = false;
+  const clearTimers = (): void => {
+    if (timer !== undefined) clearInterval(timer);
+    if (leaseTimer !== undefined) clearInterval(leaseTimer);
+  };
+  const releaseLease = async (): Promise<void> => {
+    if (leaseReleased) return;
+    leaseReleased = true;
+    try {
+      await lease.release();
+    } catch (error) {
+      console.error(`cbx: 调度器租约释放失败：${error instanceof Error ? error.message : error}`);
+    }
+  };
+  const shutdown = (currentFlight?: Promise<void>): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    stopping = true;
+    clearTimers();
+    const flight = inFlight;
+    shutdownPromise = (async () => {
+      // Guard failure calls shutdown from inside its own tick. Waiting for that
+      // promise would deadlock; external stop still waits for a real dispatch.
+      if (flight && flight !== currentFlight) await flight;
+      await releaseLease();
+      resolveDone();
+    })().catch(error => {
+      console.error(`cbx: 调度器停止失败：${error instanceof Error ? error.message : error}`);
+      resolveDone();
+    });
+    return shutdownPromise;
+  };
   const tick = (): Promise<void> => {
     if (stopping || inFlight) return inFlight ?? Promise.resolve();
-    inFlight = dispatchQueue(runtime, workspaceInput)
-      .then(() => undefined)
-      .catch(error => console.error(`cbx: 调度器执行失败：${error instanceof Error ? error.message : error}`))
-      .finally(() => { inFlight = undefined; });
-    return inFlight;
+    let flight!: Promise<void>;
+    flight = (async () => {
+      if (workspaceIdentityGuard) {
+        try {
+          await workspaceIdentityGuard();
+        } catch (error) {
+          console.error(`cbx: 工作区身份校验失败，停止调度器：${error instanceof Error ? error.message : error}`);
+          await shutdown(flight);
+          return;
+        }
+      }
+      if (stopping) return;
+      try {
+        await dispatchQueue(runtime, workspaceInput);
+      } catch (error) {
+        console.error(`cbx: 调度器执行失败：${error instanceof Error ? error.message : error}`);
+      }
+    })().finally(() => {
+      if (inFlight === flight) inFlight = undefined;
+    });
+    inFlight = flight;
+    return flight;
   };
   await tick();
-  const timer = setInterval(() => { void tick(); }, intervalMs);
+  if (stopping) return { done, async stop(): Promise<void> { await shutdown(); } };
+  timer = setInterval(() => { void tick(); }, intervalMs);
   // unref：调度器不应独立撑住进程退出（租约定时器同样 unref）；宿主进程自身的
   // 存活由 dsh 主循环保证。旧实例若因 HMR 未清理而残留，进程也能正常退出。
   timer.unref();
-  const leaseTimer = setInterval(() => {
-    void lease.renew().then(owned => {
+  leaseTimer = setInterval(() => {
+    void lease.renew().then(async owned => {
       if (owned || stopping) return;
-      stopping = true;
-      clearInterval(timer);
-      clearInterval(leaseTimer);
       console.error("cbx: serve 租约已丢失，停止调度以避免双主。");
-      resolveDone();
+      await shutdown();
     }).catch(error => console.error(`cbx: serve 租约续期失败：${error instanceof Error ? error.message : error}`));
   }, Math.floor(SERVICE_LEASE_TTL_MS / 3));
   leaseTimer.unref();
-  return { done, async stop(): Promise<void> { stopping = true; clearInterval(timer); clearInterval(leaseTimer); await inFlight; await lease.release(); resolveDone(); } };
+  return { done, async stop(): Promise<void> { await shutdown(); } };
 }
 
 export async function enqueueJob(runtime: QueueRuntime, workspaceInput: string, jobId: string, extra = "", priority = 0): Promise<QueueEntry> {

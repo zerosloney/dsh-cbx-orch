@@ -73,12 +73,14 @@ git add -A 2>/dev/null; git commit -qm "smoke init" 2>/dev/null
 check "工作区是干净 git 仓库" bash -c "[ -z \"\$(git status --porcelain --untracked-files=all -- . ':(exclude).cbx' ':(exclude).cbx/**')\" ]"
 
 echo "== 2. 启动 dsh =="
+echo "dsh: $(command -v dsh || echo '未安装!') $(dsh --version 2>/dev/null || true)"
 (dsh --profile cbx --port "$PORT" > "$LOG" 2>&1 &)
 for i in $(seq 1 30); do
   curl -s -o /dev/null -m 1 "$BASE/cbx/" && break
   sleep 1
 done
 check "服务启动 /cbx/ 200" curl -s -o /dev/null -m 2 "$BASE/cbx/"
+curl -s -o /dev/null -m 2 "$BASE/cbx/" || { echo "--- dsh 启动日志 ---"; cat "$LOG"; }
 
 echo "== 3. 静态面 =="
 check "/cbx → 301 到 /cbx/" bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' \"$BASE/cbx\")\" = 301 ]"
@@ -172,4 +174,9 @@ check "合体启动日志无错误" bash -c "! grep -qiE 'error|unhandled|reject
 
 echo ""
 echo "结果: $PASS 通过 / $FAIL 失败"
-[ "$FAIL" = 0 ] && echo "E2E 全部通过" || { echo "存在失败，请查看 $LOG"; exit 1; }
+if [ "$FAIL" != 0 ]; then
+  echo "--- dsh 主日志($LOG) ---"; cat "$LOG" 2>/dev/null
+  echo "--- 合体日志($LOG_ALL) ---"; cat "$LOG_ALL" 2>/dev/null
+  exit 1
+fi
+echo "E2E 全部通过"

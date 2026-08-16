@@ -30,8 +30,12 @@ trap cleanup EXIT
 
 echo "== 1. 构建并打包 =="
 for p in "$CBX" "$RALPH" "$GRAPH"; do
+  if [ ! -d "$p" ]; then
+    echo "FAIL  依赖兄弟仓库缺失：$p（CI 需三仓库并列 checkout，见 ci.yml）"
+    exit 1
+  fi
   (cd "$p" && npm run build >/dev/null 2>&1 && npm pack --pack-destination "$WORK" >/dev/null 2>&1) \
-    || { echo "FAIL  $(basename "$p") 构建/打包失败"; exit 1; }
+    || { echo "FAIL  $(basename "$p") 构建/打包失败（$p）"; exit 1; }
 done
 CBX_TGZ="$WORK/dsh-cbx-orch-0.1.0.tgz"
 RALPH_TGZ="$WORK/dsh-ralph-loop-0.1.0.tgz"
@@ -98,6 +102,7 @@ fi
 check "better-sqlite3 native binding 存在" test -e "$PROFILE_DIR/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
 
 echo "== 4. 从 tarball 安装产物启动 =="
+echo "dsh: $(command -v dsh || echo '未安装!') $(dsh --version 2>/dev/null || true)"
 (cd "$WS" && dsh --profile cbx-pack --port "$PORT" > "$LOG" 2>&1 &)
 for i in $(seq 1 30); do
   curl -s -o /dev/null -m 1 "http://127.0.0.1:$PORT/cbx/" >/dev/null 2>&1 && break
@@ -109,7 +114,10 @@ check "tarball 安装的插件启动 /cbx/ 200" curl -s -o /dev/null -m 2 "http:
 # native 模块在消费者环境可用，这一步才算真的验证了分发路径。
 check "SQLite native binding 可用（healthz 指标）" bash -c "curl -s -m 5 \"http://127.0.0.1:$PORT/cbx/healthz\" | grep -q queueDepth"
 check "启动日志无错误" bash -c "! grep -qiE 'error|unhandled|rejection|exception' \"$LOG\""
+if curl -s -o /dev/null -m 2 "http://127.0.0.1:$PORT/cbx/"; then :; else
+  echo "--- dsh 启动日志 ---"; cat "$LOG"
+fi
 
 echo ""
 echo "结果: $PASS 通过 / $FAIL 失败"
-[ "$FAIL" = 0 ] && echo "PACK 冒烟全部通过" || { echo "存在失败，请查看 $LOG"; exit 1; }
+[ "$FAIL" = 0 ] && echo "PACK 冒烟全部通过" || { echo "--- 完整日志($LOG) ---"; cat "$LOG" 2>/dev/null; exit 1; }

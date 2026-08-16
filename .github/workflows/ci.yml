@@ -20,17 +20,31 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm test
 
-  # 无执行器 CLI 的 runner 上跑加载面冒烟（跳过任务生命周期一节）
+  # 无执行器 CLI 的 runner 上跑加载面冒烟（跳过任务生命周期一节）。
+  # 脚本依赖三插件并列布局（smoke/e2e.sh 第 7 节与 pack.sh 引用兄弟目录），
+  # 因此三个仓库 checkout 到 workspace 下的并列子目录。
   e2e-load:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: dsh-cbx-orch
+      - uses: actions/checkout@v4
+        with:
+          repository: zerosloney/dsh-ralph-loop
+          path: dsh-ralph-loop
+      - uses: actions/checkout@v4
+        with:
+          repository: zerosloney/dsh-state-graph
+          path: dsh-state-graph
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm install --no-audit --no-fund
+        working-directory: dsh-cbx-orch
       - run: npm install -g @deepseek-ai/dsh --no-audit --no-fund
       - run: bash smoke/e2e.sh
+        working-directory: dsh-cbx-orch
         env:
           CBX_SMOKE_SKIP_JOB: "1"
 
@@ -39,9 +53,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: dsh-cbx-orch
+      - uses: actions/checkout@v4
+        with:
+          repository: zerosloney/dsh-ralph-loop
+          path: dsh-ralph-loop
+      - uses: actions/checkout@v4
+        with:
+          repository: zerosloney/dsh-state-graph
+          path: dsh-state-graph
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm install --no-audit --no-fund
+        working-directory: dsh-cbx-orch
       - run: npm install -g @deepseek-ai/dsh --no-audit --no-fund
       - run: bash smoke/pack.sh
+        working-directory: dsh-cbx-orch

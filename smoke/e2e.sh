@@ -70,8 +70,7 @@ EOF
 fi
 (cd "$PROFILE_DIR" && npm install --no-audit --no-fund 2>&1 | tail -1)
 check "profile 依赖就绪" test -e "$PROFILE_DIR/node_modules/dsh-cbx-orch"
-check "冒烟工作区存在" test -e "$SMOKE_WS"
-mkdir -p "$SMOKE_WS"
+mkdir -p "$SMOKE_WS" || { echo "FAIL  无法创建冒烟工作区 $SMOKE_WS"; exit 1; }
 cd "$SMOKE_WS" || exit 2
 if [ ! -d .git ]; then
   git init -q && git config user.email smoke@t && git config user.name smoke

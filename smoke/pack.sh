@@ -34,8 +34,14 @@ for p in "$CBX" "$RALPH" "$GRAPH"; do
     echo "FAIL  依赖兄弟仓库缺失：$p（CI 需三仓库并列 checkout，见 ci.yml）"
     exit 1
   fi
-  (cd "$p" && npm run build >/dev/null 2>&1 && npm pack --pack-destination "$WORK" >/dev/null 2>&1) \
-    || { echo "FAIL  $(basename "$p") 构建/打包失败（$p）"; exit 1; }
+  # 新 checkout 无 lib/（gitignored）：先 install+build 再 pack
+  if [ ! -e "$p/lib/index.js" ]; then
+    echo "      $(basename "$p") 未构建，install+build"
+    (cd "$p" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1) \
+      || { echo "FAIL  $(basename "$p") 构建失败（$p）"; exit 1; }
+  fi
+  (cd "$p" && npm pack --pack-destination "$WORK" >/dev/null 2>&1) \
+    || { echo "FAIL  $(basename "$p") 打包失败（$p）"; exit 1; }
 done
 CBX_TGZ="$WORK/dsh-cbx-orch-0.1.0.tgz"
 RALPH_TGZ="$WORK/dsh-ralph-loop-0.1.0.tgz"

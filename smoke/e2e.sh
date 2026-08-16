@@ -22,6 +22,14 @@ check() { # name condition...
   local name="$1"; shift
   if "$@"; then echo "PASS  $name"; PASS=$((PASS+1)); else echo "FAIL  $name"; FAIL=$((FAIL+1)); fi
 }
+# 插件源目录缺 lib/（gitignored、新 checkout）时先 install+build——
+# profile 的 file: 目录引用需要构建产物存在。
+ensure_built() {
+  [ -e "$1/lib/index.js" ] && return 0
+  echo "      $(basename "$1") 未构建，install+build"
+  (cd "$1" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1) \
+    && [ -e "$1/lib/index.js" ]
+}
 cleanup() {
   local pid
   for p in "$PORT" "$((PORT + 1))"; do
@@ -33,6 +41,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== 1. 前置检查（profile 不存在则自动创建，CI 可直接跑） =="
+ensure_built "$PLUGIN_DIR" || { echo "FAIL  插件构建失败"; exit 1; }
 if [ ! -f "$PROFILE_DIR/package.json" ]; then
   mkdir -p "$PROFILE_DIR"
   cat > "$PROFILE_DIR/package.json" <<EOF
@@ -133,6 +142,8 @@ echo "== 7. 三插件合体加载（cbx + ralph + state-graph 同场） =="
 ALL3_PROFILE="$PROFILE_DIR-all"
 RALPH_DIR="$(dirname "$PLUGIN_DIR")/dsh-ralph-loop"
 GRAPH_DIR="$(dirname "$PLUGIN_DIR")/dsh-state-graph"
+ensure_built "$RALPH_DIR" || echo "WARN  ralph 未构建，跳过其构建检查"
+ensure_built "$GRAPH_DIR" || echo "WARN  state-graph 未构建，跳过其构建检查"
 # npm 的 file: 依赖在 Windows 上必须用盘符路径（POSIX /d/... 会被解析成 /c/d/... 悬空链接）
 CBX_WIN="$(cygpath -m "$PLUGIN_DIR" 2>/dev/null || echo "$PLUGIN_DIR")"
 RALPH_WIN="$(cygpath -m "$RALPH_DIR" 2>/dev/null || echo "$RALPH_DIR")"

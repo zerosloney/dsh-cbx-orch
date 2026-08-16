@@ -25,5 +25,5 @@ test("注册表按 workspace::jobId 复合键：同名任务跨工作区互不�
   unregisterRunningJob("ws-b", "same-job");
   assert.equal(getRunningJob("ws-b", "same-job"), undefined);
   assert.equal(abortRunningJob("ws-b", "same-job"), false);
-  assert.equal(getRunningJob("D:/ws-a", "same-job"), wsA);
+  assert.equal(getRunningJob("ws-a/", "same-job"), wsA);
 });

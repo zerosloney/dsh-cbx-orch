@@ -1,15 +1,17 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   claimPendingDelivery,
   completeDelivery,
   enqueueDelivery,
+  insertEvent,
   loadRuntimeConfig,
   nextEventSeq,
   nextPendingDeliveryAt,
   recordDeliveryFailure,
   redactSensitive,
+  redactText,
   rescheduleDelivery,
   type PendingDelivery,
   type RuntimeConfig,
@@ -72,6 +74,58 @@ function id(bytes = 16): string {
 async function config(workspace: string): Promise<ObservabilityConfig> {
   return loadRuntimeConfig(workspace) as Promise<ObservabilityConfig>;
 }
+
+/** 配置短缓存：publishEvent/finishSpan 等高频路径不再每条事件读一遍 .cbx.json。
+ *  代价是配置变更（如 webhook 地址）最多 5s 后生效——对通知投递可接受。 */
+const configCache = new Map<string, { at: number; value: ObservabilityConfig }>();
+const CONFIG_CACHE_TTL_MS = 5_000;
+
+async function cachedConfig(workspace: string): Promise<ObservabilityConfig> {
+  const key = path.resolve(workspace);
+  const hit = configCache.get(key);
+  if (hit && Date.now() - hit.at < CONFIG_CACHE_TTL_MS) return hit.value;
+  const value = await config(workspace);
+  configCache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+/** 死信记录里的 endpoint 剥掉 userinfo（https://user:pass@hook → https://hook）：
+ *  带凭据的 webhook URL 不应永久躺在 delivery_failures 表与 ndjson 里。 */
+function redactEndpointUrl(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    if (url.username || url.password) {
+      url.username = "";
+      url.password = "";
+      return url.toString();
+    }
+  } catch {
+    /* 非 URL 形态，原样保留 */
+  }
+  return endpoint;
+}
+/** 工作区级 ndjson（events/telemetry）轮转阈值：滚动单代 .1。SSE 回放与 tailer
+ *  只读主文件，轮转保证每次连接的回放读取量有界；tailer 对"文件变小"已有基线重置逻辑。 */
+const WORKSPACE_LOG_ROTATE_BYTES = 10 * 1024 * 1024;
+
+async function rotateIfLarge(file: string): Promise<void> {
+  try {
+    if ((await stat(file)).size <= WORKSPACE_LOG_ROTATE_BYTES) return;
+  } catch {
+    return; /* 文件尚不存在 */
+  }
+  try {
+    await unlink(`${file}.1`);
+  } catch {
+    /* 无历史代 */
+  }
+  try {
+    await rename(file, `${file}.1`);
+  } catch {
+    /* 轮转失败（Windows 锁）则退化为继续追加 */
+  }
+}
+
 async function append(
   workspace: string,
   file: string,
@@ -79,11 +133,9 @@ async function append(
 ): Promise<void> {
   const directory = path.join(workspace, ".cbx");
   await mkdir(directory, { recursive: true });
-  await appendFile(
-    path.join(directory, file),
-    JSON.stringify(value, null, 0) + "\n",
-    "utf8",
-  );
+  const target = path.join(directory, file);
+  await rotateIfLarge(target);
+  await appendFile(target, JSON.stringify(value, null, 0) + "\n", "utf8");
 }
 
 function deliveryOptions(config: DeliveryConfig): Required<DeliveryConfig> {
@@ -121,6 +173,17 @@ const scheduledDrains = new Map<
   string,
   { timer: ReturnType<typeof setTimeout>; due: number }
 >();
+
+/**
+ * 插件卸载（HMR/关闭）时清空本模块实例排定的 drain 定时器。不清的话，旧实例的
+ * 定时器仍会触发 flushDeliveries 并撞向已被 closeDatabaseConnections 关闭的连接，
+ * 每次重载都泄漏一组定时器与报差错。outbox 行本身持久化在 SQLite，新实例的
+ * 下一次事件投递会重新认领，不会丢通知。
+ */
+export function disposeObservability(): void {
+  for (const { timer } of scheduledDrains.values()) clearTimeout(timer);
+  scheduledDrains.clear();
+}
 
 function scheduleDeliveryDrain(workspace: string, delayMs = 0): void {
   const due = Date.now() + Math.max(0, delayMs);
@@ -185,7 +248,7 @@ export function flushDeliveries(
               type: "delivery.failed",
               at: isoNow(),
               channel: delivery.channel,
-              endpoint: delivery.endpoint,
+              endpoint: redactEndpointUrl(delivery.endpoint),
               attempts,
               error: message,
               body: delivery.body,
@@ -218,6 +281,9 @@ export function flushDeliveries(
         }
       }
     }
+    // 恰好投满 limit 条时循环因计数退出，剩余行无人触发下一轮——立即补排一次
+    // drain，否则它们要等到下一个事件发布才被认领。
+    if (processed >= limit) scheduleDeliveryDrain(workspace);
     return processed;
   })();
   drainTasks.set(workspace, task);
@@ -241,12 +307,19 @@ export async function publishEvent(
       // eventChains 仅串行化本进程内的发布顺序（保证 NDJSON 追加因果），跨进程唯一性由 SQLite 行锁保证。
       const seq = await nextEventSeq(workspace);
       const event = { id: id(12), seq, type, at: isoNow(), workspace, payload };
-      const current = await config(workspace);
+      const current = await cachedConfig(workspace);
       const redacted = redactSensitive(
         event,
         current.governance?.redactFields,
       ) as typeof event;
       await append(workspace, "events.ndjson", redacted);
+      // SQLite 镜像（SSE 回放/查询源）：与 ndjson 同序写入（本进程内由 eventChains
+      // 串行化，seq 已在 nextEventSeq 分配）。镜像失败只落日志，不阻塞事件发布。
+      await insertEvent(workspace, seq, type, redacted).catch((error) =>
+        console.error(
+          `cbx: 事件 SQLite 镜像写入失败：${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
       const notifications = current.notifications;
       const webhook = notifications?.webhook;
       if (webhook && notifications) {
@@ -270,6 +343,22 @@ export async function publishEvent(
     if (eventChains.get(workspace) === currentTask)
       eventChains.delete(workspace);
   }
+}
+
+/** 深度字符串形状脱敏：redactSensitive 只按键名脱敏，普通键下内嵌的凭据形状
+ *  （"note": "… Bearer xxx …"）由 redactText 的全文正则兜底（fields 传空即只跑
+ *  形状匹配）。 */
+function redactStringsDeep(value: unknown): unknown {
+  if (typeof value === "string") return redactText(value);
+  if (Array.isArray(value)) return value.map(redactStringsDeep);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        redactStringsDeep(item),
+      ]),
+    );
+  return value;
 }
 
 export interface SpanHandle {
@@ -299,6 +388,7 @@ export async function finishSpan(
   attributes: Record<string, string | number | boolean> = {},
 ): Promise<void> {
   const endedAt = Date.now();
+  const current = await cachedConfig(workspace);
   const spanRecord = {
     traceId: span.traceId,
     spanId: span.spanId,
@@ -309,12 +399,17 @@ export async function finishSpan(
     status,
     attributes: { ...span.attributes, ...attributes },
   };
-  await append(workspace, "telemetry.ndjson", spanRecord);
-  const current = await config(workspace);
+  // span 属性可能携带命令行/错误文本（含回显的凭据），与事件流同边界脱敏后再
+  // 落 telemetry.ndjson 与 OTLP outbox：先按键名（redactSensitive），再对字符串
+  // 值做凭据形状兜底（普通键下内嵌的 sk-/Bearer/私钥等）。
+  const redactedRecord = redactStringsDeep(
+    redactSensitive(spanRecord, current.governance?.redactFields),
+  ) as typeof spanRecord;
+  await append(workspace, "telemetry.ndjson", redactedRecord);
   if (!current.telemetry?.enabled || !current.telemetry.endpoint) return;
   const startNs = String(span.startedAt * 1_000_000);
   const endNs = String(endedAt * 1_000_000);
-  const attributesList = Object.entries(spanRecord.attributes).map(
+  const attributesList = Object.entries(redactedRecord.attributes).map(
     ([key, value]) => ({
       key,
       value:

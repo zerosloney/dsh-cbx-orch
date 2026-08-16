@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install --no-audit --no-fund
+      - run: npm test
+
+  # 无执行器 CLI 的 runner 上跑加载面冒烟（跳过任务生命周期一节）
+  e2e-load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm install -g @deepseek-ai/dsh --no-audit --no-fund
+      - run: bash smoke/e2e.sh
+        env:
+          CBX_SMOKE_SKIP_JOB: "1"
+
+  # 发布物冒烟：npm pack → tarball 安装 → 真实加载（含 better-sqlite3 门控兜底）
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm install -g @deepseek-ai/dsh --no-audit --no-fund
+      - run: bash smoke/pack.sh

@@ -82,7 +82,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       if (!jobId) return err("Usage: /cbx-status <job_id>");
       try {
         const state = await loadState(workspace(), jobId);
-        return ok(`[${jobId}] ${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.currentStage ? ` / stage ${state.currentStage}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}`);
+        return ok(`[${jobId}] ${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.stage ? ` / stage ${state.stage}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }
@@ -130,7 +130,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
         const jobs = await listJobs(workspace());
         if (jobs.length === 0) return ok("no cbx jobs in this workspace.");
         const lines = jobs.map((job) =>
-          `[${job.jobId}] ${job.status}${job.phase ? ` / ${job.phase}` : ""}${job.startedAt ? ` started ${job.startedAt}` : ""}`,
+          `[${job.jobId}] ${job.status}${job.phase ? ` / ${job.phase}` : ""}${job.createdAt ? ` created ${job.createdAt}` : ""}`,
         );
         return ok(lines.join("\n"));
       } catch (error) {
@@ -148,7 +148,9 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       try {
         if (action === "pause") return ok(JSON.stringify(await pauseQueue(workspace())));
         if (action === "resume") return ok(JSON.stringify(await resumeQueue(workspace())));
-        return ok(JSON.stringify(await listQueue(workspace())));
+        if (action === "") return ok(JSON.stringify(await listQueue(workspace())));
+        // 拼写错误不再静默降级为"查看队列"，显式报错避免误导。
+        return err(`未知操作：${action}（支持 pause / resume，空参数查看队列）。`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }

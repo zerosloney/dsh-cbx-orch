@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import path from "node:path";
 import { publishEvent } from "./observability.js";
@@ -8,11 +8,14 @@ import {
   forgetPersistedJob,
   prunePersistedData,
   savePersistedState,
+  savePersistedStateCas,
   savePersistedStateAndFinishQueue,
   savePersistedStateAndResolveApprovalQueue,
+  saveApprovalRequeue,
   setMetadata,
   saveJson,
   now,
+  redactText,
   withQueueLock,
   type RuntimeConfig,
 } from "./storage.js";
@@ -21,6 +24,13 @@ import { CbxError } from "./errors.js";
 import { cleanupWorktree } from "./worktree.js";
 import { normalizeAdaptiveOptions } from "./adaptive-manager.js";
 import type { JobState, CbxConfig, Json } from "./types.js";
+
+/** job 级事件流轮转阈值：超过即滚动到 events.ndjson.1（单代保留）。timeline/回放只读
+ *  主文件，轮转保证读取与 SSE 回放的内存开销有界；.1 代供人工排查历史。 */
+const JOB_EVENTS_ROTATE_BYTES = 10 * 1024 * 1024;
+
+/** 事件流写入失败只告警一次：持续刷屏会淹没真正的日志，但首次失败必须留痕。 */
+let logJobEventWriteWarned = false;
 
 /** 把降级路径的失败原因落到 job 事件流，避免裸吞导致排障无据。 */
 export function logJobEvent(
@@ -31,17 +41,39 @@ export function logJobEvent(
 ): void {
   try {
     const file = path.join(jobDir(workspace, jobId), "events.ndjson");
+    // 轮转：长任务（或反复 retry 的任务）的事件流无界增长会拖慢 timeline 构建与
+    // 读取；超过阈值滚动一代。rename 失败（Windows 文件锁）时退化为继续追加。
+    try {
+      if (statSync(file).size > JOB_EVENTS_ROTATE_BYTES) {
+        try {
+          unlinkSync(`${file}.1`);
+        } catch {
+          /* 无历史代 */
+        }
+        renameSync(file, `${file}.1`);
+      }
+    } catch {
+      /* 文件尚不存在或轮转失败：不影响本次追加 */
+    }
     // fsync 保证审计事件在系统级崩溃（断电）后仍可恢复：appendFileSync 仅落 OS page cache，
     // 进程崩溃安全但系统崩溃可能丢尾部。事件流是 job 审计的唯一来源（无 SQLite 副本），值得 fsync。
+    // 写入边界统一脱敏（内置凭据形状）：事件 detail 可能携带执行器输出/错误文本，
+    // 其中回显的内联凭据不得持久落盘（agent.log/test.log 同此约束）。
     const fd = openSync(file, "a");
     try {
-      writeSync(fd, JSON.stringify({ event, jobId, ...detail, at: now() }) + "\n");
+      writeSync(fd, redactText(JSON.stringify({ event, jobId, ...detail, at: now() })) + "\n");
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
-  } catch {
-    /* events file itself unreachable — nothing more we can do */
+    logJobEventWriteWarned = false;
+  } catch (error) {
+    if (!logJobEventWriteWarned) {
+      logJobEventWriteWarned = true;
+      console.error(
+        `cbx: 事件流写入失败（后续同类失败静默）：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 }
 
@@ -277,25 +309,70 @@ export function mergeConfig(
   };
 }
 
+/**
+ * state.json 是人类可读镜像，权威存储是 SQLite：镜像写失败（Windows AV 锁住
+ * rename 等）只落审计事件降级，不能让已提交的 SQLite 状态向上抛错——那会让调用
+ * 方误判写入失败并重试，且两库从此永久分歧、无从对账。
+ */
+async function mirrorStateFile(
+  workspace: string,
+  jobId: string,
+  state: JobState,
+): Promise<void> {
+  try {
+    await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state);
+  } catch (error) {
+    logJobEvent(workspace, jobId, "state_mirror_write_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 export async function writeState(
   workspace: string,
   jobId: string,
   updates: Json,
   queueEntryId?: string,
 ): Promise<JobState> {
-  const state = await loadState(workspace, jobId);
-  const previousStatus = state.status;
-  Object.assign(state, updates, { updatedAt: now() });
   // 终态双写与调度器整 blob 写回共用队列锁：否则两者并发时 worker 的终态会被调度器的旧快照覆盖。
-  if (queueEntryId)
+  if (queueEntryId) {
+    const state = await loadState(workspace, jobId);
+    const previousStatus = state.status;
+    Object.assign(state, updates, { updatedAt: now() });
     await withQueueLock(
       workspace,
       () =>
         savePersistedStateAndFinishQueue(workspace, jobId, state, queueEntryId),
       { retries: 120 },
     );
-  else await savePersistedState(workspace, jobId, state);
-  await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state);
+    await mirrorStateFile(workspace, jobId, state);
+    await publishStateEvent(workspace, jobId, previousStatus, state);
+    return state;
+  }
+  // 非终态写不走队列锁，与调度器/其他写者并发：按 CAS 重读重放，不再整 blob
+  // 盲覆盖回退对方快照（重试 5 次后仍冲突则退化为直接写，避免饿死）。
+  for (let attempt = 0; ; attempt += 1) {
+    const base = await loadState(workspace, jobId);
+    const previousStatus = base.status;
+    const expected = { ...base };
+    Object.assign(base, updates, { updatedAt: now() });
+    if (
+      attempt >= 5 ||
+      (await savePersistedStateCas(workspace, jobId, expected, base))
+    ) {
+      await mirrorStateFile(workspace, jobId, base);
+      await publishStateEvent(workspace, jobId, previousStatus, base);
+      return base;
+    }
+  }
+}
+
+async function publishStateEvent(
+  workspace: string,
+  jobId: string,
+  previousStatus: string,
+  state: JobState,
+): Promise<void> {
   try {
     await publishEvent(workspace, "job.state_changed", {
       jobId,
@@ -307,7 +384,6 @@ export async function writeState(
   } catch {
     /* event delivery must not mask the durable state change */
   }
-  return state;
 }
 
 /**
@@ -325,28 +401,39 @@ export async function bumpInvocationCount(
   role: "stage" | "review" | "manager" | "gate",
   stageIndex?: number,
 ): Promise<void> {
-  const state = await loadState(workspace, jobId);
-  const current =
-    typeof state.executorInvocations === "number" &&
-    Number.isInteger(state.executorInvocations)
-      ? state.executorInvocations
-      : 0;
-  const updates: Json = { executorInvocations: current + 1 };
-  if (role === "stage" && Number.isInteger(stageIndex)) {
-    const key = String(stageIndex);
-    const existing = (state.stageInvocations as
-      | Record<string, number>
-      | undefined) ?? {};
-    updates.stageInvocations = {
-      ...existing,
-      [key]: (Number(existing[key]) || 0) + 1,
-    };
+  // 仅在实际执行中计数（见下方状态守卫）；无锁读改写按 CAS 收敛，
+  // 不再整 blob 盲覆盖（那会把并发终态"复活"成 running 或回退他人快照）。
+  for (let attempt = 0; ; attempt += 1) {
+    const base = await loadState(workspace, jobId);
+    if (base.status !== "running") return;
+    const expected = { ...base };
+    const current =
+      typeof base.executorInvocations === "number" &&
+      Number.isInteger(base.executorInvocations)
+        ? base.executorInvocations
+        : 0;
+    const updates: Json = { executorInvocations: current + 1 };
+    if (role === "stage" && Number.isInteger(stageIndex)) {
+      const key = String(stageIndex);
+      const existing = (base.stageInvocations as
+        | Record<string, number>
+        | undefined) ?? {};
+      updates.stageInvocations = {
+        ...existing,
+        [key]: (Number(existing[key]) || 0) + 1,
+      };
+    }
+    // 不走 writeState（会发布 job.state_changed 事件，污染事件流）。
+    // 直接同步 SQLite + state.json 文件，保留 updatedAt。
+    Object.assign(base, updates, { updatedAt: now() });
+    if (
+      attempt >= 5 ||
+      (await savePersistedStateCas(workspace, jobId, expected, base))
+    ) {
+      await mirrorStateFile(workspace, jobId, base);
+      return;
+    }
   }
-  // 不走 writeState（会发布 job.state_changed 事件，污染事件流）。
-  // 直接同步 SQLite + state.json 文件，保留 updatedAt。
-  Object.assign(state, updates, { updatedAt: now() });
-  await savePersistedState(workspace, jobId, state);
-  await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state);
 }
 
 /** 任务创建时记录 configuredMaxTurns；Stage 独立覆盖时由 stage-runner 在 stage 启动时写。 */
@@ -355,11 +442,19 @@ export async function recordConfiguredMaxTurns(
   jobId: string,
   maxTurns: number,
 ): Promise<void> {
-  const state = await loadState(workspace, jobId);
-  if (state.configuredMaxTurns === maxTurns) return;
-  Object.assign(state, { configuredMaxTurns: maxTurns, updatedAt: now() });
-  await savePersistedState(workspace, jobId, state);
-  await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state);
+  for (let attempt = 0; ; attempt += 1) {
+    const base = await loadState(workspace, jobId);
+    if (base.configuredMaxTurns === maxTurns) return;
+    const expected = { ...base };
+    Object.assign(base, { configuredMaxTurns: maxTurns, updatedAt: now() });
+    if (
+      attempt >= 5 ||
+      (await savePersistedStateCas(workspace, jobId, expected, base))
+    ) {
+      await mirrorStateFile(workspace, jobId, base);
+      return;
+    }
+  }
 }
 
 export async function writeApprovalState(
@@ -383,7 +478,40 @@ export async function writeApprovalState(
       ),
     { retries: 120 },
   );
-  await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state);
+  await mirrorStateFile(workspace, jobId, state);
+  try {
+    await publishEvent(workspace, "job.state_changed", {
+      jobId,
+      previousStatus,
+      status: state.status,
+      phase: state.phase,
+      attempt: state.attempt,
+    });
+  } catch {
+    /* durable approval transition must not depend on delivery */
+  }
+  return state;
+}
+
+/**
+ * before_run 审批通过的重入队写入：state 回 queued 与队列条目重新激活同事务
+ * （saveApprovalRequeue），取代"writeApprovalState(done) + 调用方补 startBackground"
+ * 的两段式——后者两步之间崩溃会留下永不调度的 queued 任务。
+ */
+export async function writeApprovalRequeueState(
+  workspace: string,
+  jobId: string,
+  updates: Json,
+): Promise<JobState> {
+  const state = await loadState(workspace, jobId);
+  const previousStatus = state.status;
+  Object.assign(state, updates, { updatedAt: now() });
+  await withQueueLock(
+    workspace,
+    () => saveApprovalRequeue(workspace, jobId, state),
+    { retries: 120 },
+  );
+  await mirrorStateFile(workspace, jobId, state);
   try {
     await publishEvent(workspace, "job.state_changed", {
       jobId,

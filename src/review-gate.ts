@@ -1,9 +1,8 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { invokeExecutor, loadConfig } from "./core.js";
-import { snapshotDiff } from "./git-ops.js";
+import { snapshotDiff, type DiffSnapshot } from "./git-ops.js";
 import type { ProcessResult } from "./process-runner.js";
 
 export interface ReviewGateResult {
@@ -18,9 +17,13 @@ const DEFAULT_MAX_TURNS = 50;
 
 /**
  * 对主工作区未提交改动跑一次独立 review。不创建 job/worktree。
- * 复用 invokeExecutor + snapshotDiff。fail-open：执行异常时 pass:true（不阻塞主会话）。
+ * 复用 invokeExecutor + snapshotDiff。审查层面的失败（执行异常/超时/非零退出/
+ * 无法解析 VERDICT）默认 fail-closed 拦截——门禁存在的意义恰是拦住行为异常的
+ * 审查代理；基础设施层错误（配置读取失败等，见 stopReviewGateHook）仍 fail-open
+ * 放行以维持 hook 的"不逃逸非零退出码"契约。需要旧行为时配置
+ * reviewGate.failOpen: true。
  */
-export async function runReviewGate(workspaceInput: string, options: { executor?: string; reviewRules?: string; timeoutMs?: number; maxTurns?: number; permissionMode?: string } = {}): Promise<ReviewGateResult> {
+export async function runReviewGate(workspaceInput: string, options: { executor?: string; reviewRules?: string; timeoutMs?: number; maxTurns?: number; permissionMode?: string; failOpen?: boolean } = {}): Promise<ReviewGateResult> {
   const workspace = path.resolve(workspaceInput);
   const config = await loadConfig(workspace);
   const executor = options.executor ?? config.executor ?? "codebuddy";
@@ -28,14 +31,54 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
   const permissionMode = options.permissionMode ?? config.permissionMode ?? "default";
+  const failOpen = options.failOpen ?? config.reviewGate?.failOpen === true;
 
   const snapshot = await snapshotDiff(workspace);
   if (!snapshot.status.trim() && !snapshot.complete.trim()) {
     return { pass: true, reason: "无未提交改动，跳过 review", review: "", verdict: "SKIP" };
   }
 
-  // intentional-simple: 临时目录承载 review 产物，跑完即由 OS 清理。不需要 jobDir 持久化。
+  // mkdtemp 临时目录不会被 OS 自动回收（Windows 尤甚），跑完即删；清理失败不掩盖审查结果。
   const directory = await mkdtemp(path.join(os.tmpdir(), "cbx-review-gate-"));
+  try {
+    return await runReviewGateIn(directory, {
+      workspace,
+      executor,
+      reviewRules,
+      permissionMode,
+      maxTurns,
+      timeoutMs,
+      snapshot,
+      failOpen,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function runReviewGateIn(
+  directory: string,
+  params: {
+    workspace: string;
+    executor: string;
+    reviewRules?: string;
+    permissionMode: string;
+    maxTurns: number;
+    timeoutMs: number;
+    snapshot: DiffSnapshot;
+    failOpen: boolean;
+  },
+): Promise<ReviewGateResult> {
+  const {
+    workspace,
+    executor,
+    reviewRules,
+    permissionMode,
+    maxTurns,
+    timeoutMs,
+    snapshot,
+    failOpen,
+  } = params;
   const patchFile = path.join(directory, "complete.patch");
   const statusFile = path.join(directory, "git-status.txt");
   const untrackedFile = path.join(directory, "untracked-files.txt");
@@ -51,11 +94,27 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   try {
     result = await invokeExecutor(executor, workspace, directory, workspace, prompt, permissionMode, maxTurns, timeoutMs);
   } catch (error) {
-    return { pass: true, reason: `审查执行异常（fail-open 放行）：${error instanceof Error ? error.message : String(error)}`, review: "", verdict: "ERROR" };
+    const reason = `审查执行异常：${error instanceof Error ? error.message : String(error)}`;
+    if (failOpen) return { pass: true, reason: `${reason}（failOpen 放行）`, review: "", verdict: "ERROR" };
+    return { pass: false, reason: `${reason}（fail-closed 拦截；确认审查执行器可用或配置 reviewGate.failOpen）`, review: "", verdict: "ERROR" };
   }
 
-  if (result.timedOut) return { pass: true, reason: `审查超时（${timeoutMs}ms），fail-open 放行；可手动跑 cbx review-gate 复核`, review: "", verdict: "TIMEOUT" };
-  if (result.code !== 0) return { pass: true, reason: `审查代理退出码 ${result.code}，fail-open 放行；可手动跑 cbx review-gate 复核`, review: "", verdict: "ERROR" };
+  // 变更回检：审查代理以主工作区为 cwd，被 prompt 注入时可能直接删改主工作区。
+  // stop-gate 路径此前没有 stage 路径的"审查后 diff 比对"（stage-runner 的
+  // reviewerModifiedWorktree 守卫），这里补齐：快照出现任何漂移即 fail-closed。
+  const after = await snapshotDiff(workspace);
+  if (after.complete !== snapshot.complete || after.status !== snapshot.status || after.untracked !== snapshot.untracked) {
+    return { pass: false, reason: "审查代理修改了主工作区（已拦截，fail-closed）", review: after.status, verdict: "MUTATED" };
+  }
+
+  if (result.timedOut) {
+    if (failOpen) return { pass: true, reason: `审查超时（${timeoutMs}ms），failOpen 放行；可手动跑 cbx review-gate 复核`, review: "", verdict: "TIMEOUT" };
+    return { pass: false, reason: `审查超时（${timeoutMs}ms），fail-closed 拦截；可手动跑 cbx review-gate 复核`, review: "", verdict: "TIMEOUT" };
+  }
+  if (result.code !== 0) {
+    if (failOpen) return { pass: true, reason: `审查代理退出码 ${result.code}，failOpen 放行；可手动跑 cbx review-gate 复核`, review: "", verdict: "ERROR" };
+    return { pass: false, reason: `审查代理退出码 ${result.code}，fail-closed 拦截；确认审查执行器可用或配置 reviewGate.failOpen`, review: "", verdict: "ERROR" };
+  }
 
   let review = "";
   try { review = await readFile(reviewFile, "utf8"); } catch { review = result.output; }
@@ -64,7 +123,8 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   const fail = /^VERDICT\s*:\s*FAIL$/i.test(firstLine);
   if (pass) return { pass: true, reason: "审查通过", review, verdict: "PASS" };
   if (fail) return { pass: false, reason: `审查发现问题：\n${review}`, review, verdict: "FAIL" };
-  return { pass: true, reason: `审查输出无法解析 VERDICT（fail-open 放行）；首行：${firstLine || "<空>"}`, review, verdict: "UNKNOWN" };
+  if (failOpen) return { pass: true, reason: `审查输出无法解析 VERDICT（failOpen 放行）；首行：${firstLine || "<空>"}`, review, verdict: "UNKNOWN" };
+  return { pass: false, reason: `审查输出无法解析 VERDICT（fail-closed 拦截）；首行：${firstLine || "<空>"}`, review, verdict: "UNKNOWN" };
 }
 
 export function gateEnabled(enabled: unknown): boolean { return enabled === true; }

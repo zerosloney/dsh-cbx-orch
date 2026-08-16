@@ -12,6 +12,7 @@ import {
   pruneAfterTerminal,
   writeState,
   writeApprovalState,
+  writeApprovalRequeueState,
   jobDir,
 } from "./state.js";
 import { contextRedactor } from "./artifacts.js";
@@ -29,6 +30,7 @@ import {
 } from "./evidence.js";
 import { snapshotDiff, commitWorktree } from "./git-ops.js";
 import { cleanupWorktree } from "./worktree.js";
+import { dispatchQueue } from "./queue-api.js";
 import type { JobState, Json } from "./types.js";
 
 async function approveJobLocked(
@@ -37,8 +39,14 @@ async function approveJobLocked(
 ): Promise<JobState> {
   const workspace = path.resolve(workspaceInput);
   const state = await loadState(workspace, jobId);
+  // 审批与取消不共享 run.lock（取消走 abortRunningJob 而非持锁），入口先核一次
+  // 取消标记与状态；写盘前还有二次核验（见各 writeApprovalState 前）。
+  if (state.status === "cancelled")
+    throw new Error(`任务已取消，不能批准：${jobId}`);
   if (state.status !== "awaiting_approval")
     throw new Error(`任务当前不需要批准：${jobId}`);
+  if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
+    throw new Error(`任务已取消，不能批准：${jobId}`);
   const gate = state.humanGate
     ? parseHumanGate(state.humanGate)
     : state.phase === "before_run"
@@ -53,7 +61,12 @@ async function approveJobLocked(
   const config = await loadConfig(workspace);
   const redact = contextRedactor(config.governance);
   if (state.phase === "before_run" && gate.reason === "before_run") {
-    return writeApprovalState(
+    // 写盘前再核取消标记：避免把已取消任务写回 queued 造成状态撕裂（队列条目已被取消）。
+    if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
+      throw new Error(`任务已取消，不能批准：${jobId}`);
+    // 原子重入队：状态回 queued 与 awaiting_approval 队列条目重新激活同事务落盘，
+    // 不再依赖调用方补 startBackground（两段式中间崩溃 = 永不调度的 queued 任务）。
+    const requeued = await writeApprovalRequeueState(
       workspace,
       jobId,
       {
@@ -63,8 +76,10 @@ async function approveJobLocked(
         approvalRequired: false,
         humanGate: resolveHumanGate(gate, "approved", redact),
       },
-      "done",
     );
+    // 立即触发一次调度，新 entry 不必等 30s 调度心跳。
+    await dispatchQueue(workspace).catch(() => undefined);
+    return requeued;
   }
   if (state.phase !== "before_complete" || gate.reason !== "completion")
     throw new Error("审批状态与 Human Gate 不一致。");
@@ -123,6 +138,10 @@ async function approveJobLocked(
     humanGate: resolveHumanGate(gate, "approved", redact),
     error: null,
   };
+  // 提交前核取消：原实现 commit 之后才复查，窗口内取消的任务会留下已提交的
+  // commit（autoBranch 分支存活，与用户"取消"意图相反）。落盘前还有最后一道复验。
+  if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
+    throw new Error(`任务已取消，不能批准：${jobId}`);
   if (context.autoCommit) {
     // 到达此处必然已通过证据门（snapshotMatches 为 true ⇒ workdir 存在）。
     // 显式守卫代替 `workdir!`：若未来门管线改动破坏了这一不变量，这里给出可诊断的错误而非静默的 undefined 传参。
@@ -131,7 +150,7 @@ async function approveJobLocked(
     }
     try {
       updates.gitCommit =
-        commitWorktree(workdir, context.commitMessage) ?? null;
+        (await commitWorktree(workdir, context.commitMessage)) ?? null;
     } catch (error) {
       const failed = await writeApprovalState(
         workspace,
@@ -156,6 +175,9 @@ async function approveJobLocked(
       return failed;
     }
   }
+  // 完成态写盘前最后一次取消核验（竞态窗口最小化；窗口内取消先落盘则 cancelled 获胜）。
+  if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
+    throw new Error(`任务已取消，不能批准：${jobId}`);
   await writeApprovalState(workspace, jobId, updates, "done");
   if (!context.keepWorktree) {
     try {

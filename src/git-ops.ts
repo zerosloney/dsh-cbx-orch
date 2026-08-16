@@ -1,59 +1,118 @@
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rmdir, stat } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rm, rmdir, stat } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { atomicWriteFile, loadJson, now, saveJson } from "./storage.js";
-import { capture } from "./process-runner.js";
+import { captureAsync } from "./process-runner.js";
 
 const CODE_PATHS = [".", ":(exclude).cbx", ":(exclude).cbx/**"];
 
-export function gitRoot(workspace: string): string | undefined {
-  const result = capture(["git", "rev-parse", "--show-toplevel"], workspace);
+/** 全异步 git 调用：不再用 spawnSync 阻塞事件循环（长阻塞会让心跳陈旧、
+ *  调度器误判僵尸、SSE 抖动）。captureAsync 的输出是 stdout+stderr 合并。 */
+export async function gitRoot(workspace: string): Promise<string | undefined> {
+  const result = await captureAsync(["git", "rev-parse", "--show-toplevel"], workspace);
   return result.code === 0 && result.stdout.trim() ? path.resolve(result.stdout.trim()) : undefined;
 }
 
 export interface GitBaseline { root: string; commit?: string; branch?: string; dirty: boolean; status: string; }
 
-export function snapshotGitBaseline(workspace: string): GitBaseline | undefined {
-  const root = gitRoot(workspace);
+export async function snapshotGitBaseline(workspace: string): Promise<GitBaseline | undefined> {
+  const root = await gitRoot(workspace);
   if (!root) return undefined;
-  const commit = capture(["git", "rev-parse", "HEAD"], root);
-  const branch = capture(["git", "branch", "--show-current"], root);
-  const status = capture(["git", "status", "--porcelain", "--untracked-files=all", "--", ...CODE_PATHS], root);
+  const commit = await captureAsync(["git", "rev-parse", "HEAD"], root);
+  const branch = await captureAsync(["git", "branch", "--show-current"], root);
+  const status = await captureAsync(["git", "status", "--porcelain", "--untracked-files=all", "--", ...CODE_PATHS], root);
+  // git status 失败（仓库损坏/权限/并发操作）不能静默当作"干净仓库"：fail-safe 为
+  // dirty，并把合并输出并入 status 文本，让基线漂移检测与任务流程显式看到异常，
+  // 而非漏判未提交/未跟踪改动。
+  const statusOk = status.code === 0;
   return {
     root,
     commit: commit.code === 0 ? commit.stdout.trim() : undefined,
     branch: branch.code === 0 && branch.stdout.trim() ? branch.stdout.trim() : undefined,
-    dirty: Boolean(status.stdout.trim()),
-    status: status.stdout,
+    dirty: !statusOk || Boolean(status.stdout.trim()),
+    status: statusOk ? status.stdout : status.stdout,
   };
 }
 
-export function gitDirtyFingerprint(workspace: string): string | undefined {
-  const root = gitRoot(workspace);
+export async function gitDirtyFingerprint(workspace: string): Promise<string | undefined> {
+  const root = await gitRoot(workspace);
   if (!root) return undefined;
-  const status = capture(["git", "status", "--porcelain", "--untracked-files=all", "--", ...CODE_PATHS], root);
-  const tracked = trackedDiff(root);
-  const paths = capture(["git", "ls-files", "--others", "--exclude-standard", "-z", "--", ...CODE_PATHS], root).stdout.split("\0").filter(Boolean).sort();
+  const status = await captureAsync(["git", "status", "--porcelain", "--untracked-files=all", "--", ...CODE_PATHS], root);
+  const tracked = await trackedDiff(root);
+  const paths = (await captureAsync(["git", "ls-files", "--others", "--exclude-standard", "-z", "--", ...CODE_PATHS], root)).stdout.split("\0").filter(Boolean).sort();
   const hash = createHash("sha256").update(status.stdout).update("\0").update(tracked);
-  for (const relative of paths) {
-    const blob = capture(["git", "hash-object", "--no-filters", "--", relative], root);
-    hash.update("\0").update(relative).update("\0").update(blob.code === 0 ? blob.stdout.trim() : `ERROR:${blob.stderr.trim()}`);
+  if (paths.length > 0) {
+    // 批量 hash：单进程 --stdin-paths 一次 hash 全部未跟踪文件，替代逐文件 spawn
+    // （大仓库 O(n) 子进程启动慢，可拖到数十秒）。需要 stdin，保留同步 spawn。
+    const batched = spawnSync(
+      "git",
+      ["hash-object", "--stdin-paths", "--no-filters"],
+      {
+        cwd: root,
+        input: paths.join("\n") + "\n",
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+      },
+    );
+    const blobs = (batched.stdout ?? "").split("\n").filter(Boolean);
+    for (let i = 0; i < paths.length; i++) {
+      // 输出与输入路径一一对应；数量不匹配（个别文件并发消失）时对该文件回退单进程。
+      const relative = paths[i];
+      const blob =
+        i < blobs.length
+          ? blobs[i]
+          : (
+              await captureAsync(
+                ["git", "hash-object", "--no-filters", "--", relative],
+                root,
+              )
+            ).stdout.trim();
+      hash.update("\0").update(relative).update("\0").update(blob);
+    }
   }
   return hash.digest("hex");
 }
 
+/**
+ * v2 脏指纹：仅 git status + 已跟踪文件 diff，不含未跟踪文件内容。v1 把未跟踪
+ * 内容也纳入哈希——工作区里随手放一个 scratch 文件、或别的任务在同一工作区留下
+ * 产物，都会让非隔离任务误判"脏漂移"而 blocked。未跟踪内容由快照/diff 流程单独
+ * 审计，不参与漂移判定。旧 job（context 无 dirtyFingerprintVersion）仍按 v1 比对，
+ * 显式 refreshBaseline 时升级到 v2。
+ */
+export async function gitDirtyFingerprintTracked(workspace: string): Promise<string | undefined> {
+  const root = await gitRoot(workspace);
+  if (!root) return undefined;
+  const status = await captureAsync(["git", "status", "--porcelain", "--untracked-files=no", "--", ...CODE_PATHS], root);
+  const tracked = await trackedDiff(root);
+  return createHash("sha256").update(status.stdout).update("\0").update(tracked).digest("hex");
+}
+
 export async function prepareWorktree(workspace: string, directory: string, jobId: string, isolated: boolean, autoBranch = false, baseCommit = "HEAD"): Promise<string> {
   if (!isolated) return workspace;
-  const root = gitRoot(workspace);
+  const root = await gitRoot(workspace);
   if (!root) throw new Error("--isolated 要求工作区位于 Git 仓库中。");
   const target = path.join(path.dirname(root), `.${path.basename(root)}.cbx-worktrees`, jobId);
   await mkdir(path.dirname(target), { recursive: true });
   const branch = `cbx/${jobId}`;
-  const branchExists = capture(["git", "show-ref", "--verify", `refs/heads/${branch}`], root).code === 0;
+  const branchExists = (await captureAsync(["git", "show-ref", "--verify", `refs/heads/${branch}`], root)).code === 0;
   const args = autoBranch && branchExists ? ["git", "worktree", "add", target, branch] : autoBranch ? ["git", "worktree", "add", "-b", branch, target, baseCommit] : ["git", "worktree", "add", "--detach", target, baseCommit];
-  const result = capture(args, root);
-  if (result.code !== 0) throw new Error(`创建 Git worktree 失败：\n${result.stderr.trim()}`);
+  let result = await captureAsync(args, root);
+  if (result.code !== 0) {
+    // 自愈：上次运行在 worktree add 与 worktree.json 落盘之间崩溃会留下孤儿目录，
+    // 使本 job 每次重跑都撞同一个"目录已存在"错误。prune 清掉陈旧元数据后强制
+    // 移除目标目录再重试一次；仍失败才抛错（此时是真正的 git 故障）。
+    await captureAsync(["git", "worktree", "prune"], root);
+    if (existsSync(target)) {
+      await captureAsync(["git", "worktree", "remove", "--force", target], root);
+      if (existsSync(target))
+        await rm(target, { recursive: true, force: true }).catch(() => undefined);
+    }
+    result = await captureAsync(args, root);
+    if (result.code !== 0) throw new Error(`创建 Git worktree 失败：\n${result.stdout.trim()}`);
+  }
   await saveJson(path.join(directory, "worktree.json"), { path: target, branch: autoBranch ? branch : undefined, baseCommit, createdAt: now() });
   return target;
 }
@@ -63,11 +122,17 @@ export async function cleanupRecordedWorktree(workspace: string, directory: stri
   if (!existsSync(file)) return false;
   const record = await loadJson<{ path: string }>(file);
   const target = path.resolve(record.path);
-  const root = gitRoot(workspace);
+  const root = await gitRoot(workspace);
   const expectedParent = root ? path.resolve(path.dirname(root), `.${path.basename(root)}.cbx-worktrees`) : "";
   if (!root || path.dirname(target) !== expectedParent) throw new Error("拒绝清理不属于本编排器的 worktree 路径。");
-  const result = capture(["git", "worktree", "remove", "--force", target], root);
-  if (result.code !== 0 && existsSync(target)) throw new Error(`清理 worktree 失败：\n${result.stderr.trim()}`);
+  // Windows 瞬态句柄重试：被终止的子进程可能仍持有 worktree 目录句柄（cwd 未释放），
+  // 首次 remove 会 "failed to delete"——退避重试 3 次覆盖该窗口，减少 cleanup_failed 噪音。
+  let result = await captureAsync(["git", "worktree", "remove", "--force", target], root);
+  for (let attempt = 0; result.code !== 0 && existsSync(target) && attempt < 3; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+    result = await captureAsync(["git", "worktree", "remove", "--force", target], root);
+  }
+  if (result.code !== 0 && existsSync(target)) throw new Error(`清理 worktree 失败：\n${result.stdout.trim()}`);
   // 容器目录 .<repo>.cbx-worktrees/ 跨 job 复用；删完 job 子目录后若已空，一并清理避免孤儿。
   // 并发安全：readdir 非空（其他 job 在用）则跳过；rmdir 仅删空目录，不会误伤。
   if (expectedParent && existsSync(expectedParent)) {
@@ -80,13 +145,30 @@ export async function cleanupRecordedWorktree(workspace: string, directory: stri
   return true;
 }
 
-function trackedDiff(workdir: string): string {
-  const againstHead = capture(["git", "diff", "--binary", "HEAD", "--", ...CODE_PATHS], workdir);
+async function trackedDiff(workdir: string): Promise<string> {
+  const againstHead = await captureAsync(["git", "diff", "--binary", "HEAD", "--", ...CODE_PATHS], workdir);
   if (againstHead.code === 0) return againstHead.stdout;
   // Unborn repositories do not have HEAD yet.
-  const staged = capture(["git", "diff", "--binary", "--cached", "--", ...CODE_PATHS], workdir);
-  const unstaged = capture(["git", "diff", "--binary", "--", ...CODE_PATHS], workdir);
-  return staged.stdout + unstaged.stdout + (staged.code || unstaged.code ? staged.stderr + unstaged.stderr : "");
+  const staged = await captureAsync(["git", "diff", "--binary", "--cached", "--", ...CODE_PATHS], workdir);
+  const unstaged = await captureAsync(["git", "diff", "--binary", "--", ...CODE_PATHS], workdir);
+  return staged.stdout + unstaged.stdout + (staged.code || unstaged.code ? staged.stdout + unstaged.stdout : "");
+}
+
+/** 相对路径是否"穿过"符号链接/junction：任一祖先目录或文件本身是链接即真。
+ *  POSIX 上 git 把 symlink 当条目列出（lstat 即可判）；Windows 的 junction 被
+ *  git 当真实目录遍历、列出的是链接内部文件——只有沿祖先逐级 lstat 才能发现。 */
+async function resolvesThroughSymlink(rootDir: string, relative: string): Promise<boolean> {
+  const parts = relative.split(/[\\/]/).filter(Boolean);
+  let current = rootDir;
+  for (const part of parts) {
+    current = path.join(current, part);
+    try {
+      if ((await lstat(current)).isSymbolicLink()) return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 async function untrackedSections(workdir: string, paths: string[]): Promise<{ listing: string; patches: string }> {
@@ -97,7 +179,15 @@ async function untrackedSections(workdir: string, paths: string[]): Promise<{ li
     const file = path.resolve(workdir, relative);
     if (!file.startsWith(root)) continue;
     try {
-      const info = await stat(file);
+      // 符号链接/junction 不跟随：readFile/stat 会解析到链接目标，把工作区之外
+      // 的文件内容（可能非常大，或属于其他项目/系统路径）吸进 complete.patch/
+      // 审计材料。按链接本身记录即可满足 diff 审阅。
+      if (await resolvesThroughSymlink(workdir, relative)) {
+        listing.push(`## ${relative}\n[符号链接，未跟随]\n`);
+        patches.push(`diff --git a/${relative} b/${relative}\n[符号链接，未跟随]\n`);
+        continue;
+      }
+      const info = await lstat(file);
       if (!info.isFile()) continue;
       if (info.size > 200_000) {
         listing.push(`## ${relative}\n[跳过超过 200KB 的文件]\n`);
@@ -120,13 +210,13 @@ async function untrackedSections(workdir: string, paths: string[]): Promise<{ li
 export interface DiffSnapshot { status: string; tracked: string; untracked: string; complete: string; }
 
 export async function snapshotDiff(workdir: string): Promise<DiffSnapshot> {
-  const statusResult = capture(["git", "status", "--short", "--untracked-files=all", "--", ...CODE_PATHS], workdir);
-  const tracked = trackedDiff(workdir);
-  const pathsResult = capture(["git", "ls-files", "--others", "--exclude-standard", "-z", "--", ...CODE_PATHS], workdir);
+  const statusResult = await captureAsync(["git", "status", "--short", "--untracked-files=all", "--", ...CODE_PATHS], workdir);
+  const tracked = await trackedDiff(workdir);
+  const pathsResult = await captureAsync(["git", "ls-files", "--others", "--exclude-standard", "-z", "--", ...CODE_PATHS], workdir);
   const paths = pathsResult.stdout.split("\0").filter(Boolean).sort();
   const untracked = await untrackedSections(workdir, paths);
   return {
-    status: statusResult.stdout + (statusResult.code === 0 ? "" : statusResult.stderr),
+    status: statusResult.stdout + (statusResult.code === 0 ? "" : statusResult.stdout),
     tracked,
     untracked: untracked.listing,
     complete: [tracked, untracked.patches].filter(Boolean).join("\n"),
@@ -144,15 +234,15 @@ export async function collectDiff(directory: string, workdir: string): Promise<D
   return snapshot;
 }
 
-export function commitWorktree(workdir: string, message: string): string | undefined {
-  const status = capture(["git", "status", "--porcelain", "--", ...CODE_PATHS], workdir);
-  if (status.code !== 0) throw new Error(`读取 Git 状态失败：${status.stderr.trim()}`);
+export async function commitWorktree(workdir: string, message: string): Promise<string | undefined> {
+  const status = await captureAsync(["git", "status", "--porcelain", "--", ...CODE_PATHS], workdir);
+  if (status.code !== 0) throw new Error(`读取 Git 状态失败：${status.stdout.trim()}`);
   if (!status.stdout.trim()) return undefined;
-  const add = capture(["git", "add", "-A", "--", ...CODE_PATHS], workdir);
-  if (add.code !== 0) throw new Error(`git add 失败：${add.stderr.trim()}`);
-  const commit = capture(["git", "commit", "-m", message], workdir);
-  if (commit.code !== 0) throw new Error(`git commit 失败：${commit.stderr.trim()}`);
-  const hash = capture(["git", "rev-parse", "HEAD"], workdir);
-  if (hash.code !== 0) throw new Error(`读取提交哈希失败：${hash.stderr.trim()}`);
+  const add = await captureAsync(["git", "add", "-A", "--", ...CODE_PATHS], workdir);
+  if (add.code !== 0) throw new Error(`git add 失败：${add.stdout.trim()}`);
+  const commit = await captureAsync(["git", "commit", "-m", message], workdir);
+  if (commit.code !== 0) throw new Error(`git commit 失败：${commit.stdout.trim()}`);
+  const hash = await captureAsync(["git", "rev-parse", "HEAD"], workdir);
+  if (hash.code !== 0) throw new Error(`读取提交哈希失败：${hash.stdout.trim()}`);
   return hash.stdout.trim();
 }

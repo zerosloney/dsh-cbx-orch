@@ -2,8 +2,11 @@ import { Context, Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { setProcessSpawnProvider } from "./process-runner.js";
 import { createSubprocessProvider } from "./subprocess-adapter.js";
+import { closeDatabaseConnections } from "./storage.js";
+import { disposeObservability } from "./observability.js";
 import { registerCbxTools, type CbxDefaults } from "./tools.js";
 import { registerCbxCommands } from "./commands.js";
+import { ensureScheduler, stopScheduler } from "./queue-api.js";
 
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -45,11 +48,22 @@ export default class CbxOrchestrator extends Service {
     };
     // Route all executor/test/git child processes through the harness
     // subprocess seam (tree-scoped termination, cancel integration).
-    setProcessSpawnProvider(createSubprocessProvider(ctx.subprocess));
+    // disposer 带属主校验：HMR 下旧实例卸载只会撤掉自己的 provider。
+    const disposeProvider = setProcessSpawnProvider(createSubprocessProvider(ctx.subprocess));
     registerCbxTools(ctx, defaults);
     registerCbxCommands({ ctx, defaults });
+    // 常驻调度器：30s 定时 dispatch（含死 worker 回收），启动即 tick 一次——
+    // 崩溃重启后无需等下一次入队就能续跑遗留任务（README"可恢复续跑"承诺的落地）。
+    ctx.effect(() => {
+      void ensureScheduler(process.cwd());
+      return () => {
+        void stopScheduler(process.cwd());
+      };
+    }, "cbx.scheduler");
     ctx.effect(() => () => {
-      setProcessSpawnProvider(undefined);
+      disposeProvider();
+      void closeDatabaseConnections();
+      void disposeObservability();
     }, "cbx.provider");
   }
 }

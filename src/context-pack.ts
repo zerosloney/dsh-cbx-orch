@@ -118,6 +118,16 @@ export interface ContextBudget {
   auditor: number;
 }
 
+/** 边界感知截断：在 limit 内最后一个空白处切断并追加省略号，避免切断词/JSON 片段。
+ *  截断点若落在代理对（emoji/扩展 CJK）中间，退一格到完整码点，防止落盘出 U+FFFD 乱码。 */
+export function truncateText(text: string, limit: number, ellipsis = "…"): string {
+  if (text.length <= limit) return text;
+  const head = text.slice(0, Math.max(0, limit - ellipsis.length));
+  const safeHead = /[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head;
+  const cut = safeHead.lastIndexOf(" ");
+  return (cut > 0 ? safeHead.slice(0, cut) : safeHead) + ellipsis;
+}
+
 /** 启发式 token 估算：ASCII ≈ chars/4，CJK（中日韩）≈ chars/1.5。精度 ±20%，仅用于预算裁剪决策，不用于计费。 */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
@@ -433,11 +443,18 @@ function applyBudget<T extends CommonContextPack>(pack: T, budget: number): T {
   if (estimatePackTokens(pack) <= budget) return pack;
   let working = { ...pack };
   let truncated = false;
-  // 阶段 1：裁剪 taskContract 低优先字段。
+  // 阶段 1：裁剪 taskContract 低优先字段。估算回调对"整包替换候选契约后的 token"
+  // 计量——只量契约片段会把 current/recentFailure 等其余部分排除在外，裁剪不足。
   const [contract, contractTrimmed] = trimContract(
     working.taskContract,
     budget,
-    (pack) => estimateTokens(JSON.stringify(pack)),
+    (candidate) =>
+      estimateTokens(
+        JSON.stringify({
+          ...working,
+          taskContract: (candidate as { taskContract: TaskContractProjection }).taskContract,
+        }),
+      ),
   );
   if (contractTrimmed) {
     working.taskContract = contract;
@@ -451,12 +468,20 @@ function applyBudget<T extends CommonContextPack>(pack: T, budget: number): T {
     working.recentFailure = { ...working.recentFailure, retryReason: null };
     truncated = true;
   }
-  // 阶段 3：收缩 userInstructions。
+  // 阶段 3：收缩 userInstructions。指数收缩到整包进入预算为止（下限 200 字符），
+  // 取代固定切 1000——整包计量下固定值大概率仍超预算。
   if (estimatePackTokens(working) > budget && working.userInstructions) {
-    working.userInstructions = working.userInstructions.slice(
-      0,
-      BUDGET_USER_INSTRUCTIONS_FALLBACK_CHARS,
-    );
+    let limit = working.userInstructions.length;
+    while (
+      limit > 200 &&
+      estimatePackTokens({
+        ...working,
+        userInstructions: working.userInstructions.slice(0, limit),
+      }) > budget
+    ) {
+      limit = Math.floor(limit / 2);
+    }
+    working.userInstructions = working.userInstructions.slice(0, limit);
     truncated = true;
   }
   // 阶段 4：仍超预算说明不可裁的核心字段（goal/acceptanceCriteria/stages/current）撑爆预算，标记溢出。
@@ -540,7 +565,7 @@ export async function createExecutorContextPack(
   const stage = {
     name: input.redact(input.stage.name).slice(0, 120),
     executor: input.redact(input.stage.executor).slice(0, 120),
-    task: input.redact(input.stage.task).slice(0, 1_000),
+    task: truncateText(input.redact(input.stage.task), 1_000),
   };
   const base = await common("executor", input);
   const budget = input.budget?.executor ?? DEFAULT_TOKEN_BUDGET.executor;
@@ -568,7 +593,7 @@ export async function createAuditorContextPack(
   const stage = {
     name: input.redact(input.stage.name).slice(0, 120),
     executor: input.redact(input.stage.executor).slice(0, 120),
-    task: input.redact(input.stage.task).slice(0, 1_000),
+    task: truncateText(input.redact(input.stage.task), 1_000),
   };
   const criteria = input.criteria.slice(0, 100).map((item) => ({
     id: input.redact(item.id).slice(0, 200),

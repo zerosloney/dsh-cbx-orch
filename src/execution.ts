@@ -32,6 +32,7 @@ import {
 } from "./stage-runner.js";
 import { contextRedactor, contextArtifacts } from "./artifacts.js";
 import { prepareWorktree, snapshotDiff, commitWorktree } from "./git-ops.js";
+import { tryMigrateDirtyFingerprintV2 } from "./baseline.js";
 import { assertExecutionPolicy } from "./validation.js";
 import {
   createHumanGate,
@@ -46,6 +47,7 @@ import {
   parsePendingCompletion,
   worktreeSha256,
   structuredAuditRequested,
+  reviewEffectivelyRequired,
   type PendingCompletion,
 } from "./evidence.js";
 import {
@@ -57,7 +59,7 @@ import {
 } from "./progress.js";
 import type { NextAction } from "./adaptive-manager.js";
 import { resolveExecutor } from "./executors/builtin.js";
-import { dispatchQueue, finishQueueEntry } from "./queue-api.js";
+import { cancelJobState, dispatchQueue, finishQueueEntry } from "./queue-api.js";
 import { cleanupWorktree } from "./worktree.js";
 import { APP_VERSION } from "./version.js";
 import type { JobState, Json, TaskStage, StageReport } from "./types.js";
@@ -124,6 +126,14 @@ async function executeJobLocked(
   const directory = jobDir(workspace, jobId);
   const initial = await loadState(workspace, jobId);
   const context = await loadJobContext(directory);
+  // context schema 懒迁移（v1→v2 脏指纹等）：在漂移评估与审批门之前执行，
+  // 迁移失败不阻断执行（带守卫，见 baseline.ts）。
+  await tryMigrateDirtyFingerprintV2(workspace, jobId, directory, context)
+    .catch((error) =>
+      logJobEvent(workspace, jobId, "context_schema_migrate_failed", {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
   // intentional-simple: 旧 job 跨版本续跑时新增字段走可选校验与 ?? 兜底，不硬阻断；schema 损坏才拒绝。
   // 新功能字段（如 dependencyGuard）从 .cbx.json 同步到已持久化 context，避免旧任务遗漏。
   const runtimeConfig = await loadConfig(workspace);
@@ -169,7 +179,7 @@ async function executeJobLocked(
       queueEntryId,
     );
   }
-  const drift = evaluateBaselineDrift(context, workspace);
+  const drift = await evaluateBaselineDrift(context, workspace);
   if (context.isolated && context.baseDirty) {
     const state = await writeState(
       workspace,
@@ -251,6 +261,12 @@ async function executeJobLocked(
   const cancelMarker = path.join(directory, "cancel.requested");
 
   const finish = async (updates: Json): Promise<JobState> => {
+    // 完成收口前核取消：证据哈希/审批/提交可耗时数秒，窗口内用户取消的 done 会
+    // 与 cancelJob 的覆写交错（state=done 而 entry=cancelled 的撕裂）。有标记的
+    // done 一律改走取消收口，保持 state 与 entry 一致。
+    if (String(updates.status ?? "") === "done" && existsSync(cancelMarker)) {
+      return finishCancelled();
+    }
     const currentState = await loadState(workspace, jobId);
     let finalUpdates = { ...updates };
     if (structuredAuditRequested(context)) {
@@ -274,10 +290,15 @@ async function executeJobLocked(
       };
       if (finalUpdates.status === "done") {
         const candidateState = { ...currentState, ...finalUpdates };
-        const requiredEvidence = ["complete.patch", "test.log", "review.md"];
+        // 与 completionEvidenceValid 同口径：全部 stage skipReview 时不再把
+        // review.md / VERDICT: PASS 当作完成前提（否则 skipReview 任务永远过不了门）。
+        const reviewRequired = reviewEffectivelyRequired(context);
+        const requiredEvidence = reviewRequired
+          ? ["complete.patch", "test.log", "review.md"]
+          : ["complete.patch", "test.log"];
         const verified =
           candidateState.testExitCode === 0 &&
-          candidateState.reviewVerdict === "PASS" &&
+          (!reviewRequired || candidateState.reviewVerdict === "PASS") &&
           auditAllowsCompletion(
             audit,
             verifiedProgress,
@@ -357,7 +378,7 @@ async function executeJobLocked(
     }
     if (finalUpdates.status === "done" && context.autoCommit) {
       try {
-        const commitHash = commitWorktree(workdir, context.commitMessage);
+        const commitHash = await commitWorktree(workdir, context.commitMessage);
         if (commitHash) finalUpdates.gitCommit = commitHash;
       } catch (error) {
         finalUpdates = {
@@ -633,8 +654,11 @@ async function executeJobLocked(
         await writeResult(workspace, jobId, finalState);
         return finalState;
       }
+      // attemptExtra 是"本 stage 重试修复指令"，不跨 stage/轮次传播——泄漏进下一
+      // stage 的 prompt 会让执行器去修上一个阶段的问题。stage 内重试仍在 runStage
+      // 自身的循环内生效。
       attempt = outcome.attempt;
-      attemptExtra = outcome.attemptExtra;
+      attemptExtra = "";
       const handbackFile = path.join(directory, "handback.md");
       if (existsSync(handbackFile)) {
         const safeName = stage.name.replace(/[^A-Za-z0-9._-]+/g, "-");
@@ -684,7 +708,13 @@ async function executeJobLocked(
       reviewExecutor: context.reviewExecutor,
     },
   ];
-  const stageReports: StageReport[] = [];
+  // 崩溃续跑恢复：worker 崩溃时 state.status 仍是 running，队列回收重入后跳过
+  // 已完成的 stage（报告已持久化）。显式 retry/continue 的入口状态是 failed 等
+  // 终态，不在此列——它们语义上就是全量重跑。
+  const resumingCrashedChain = initial.status === "running";
+  const stageReports: StageReport[] = resumingCrashedChain && Array.isArray(initial.stages)
+    ? (initial.stages as StageReport[])
+    : [];
 
   // 分组调度：按依赖拓扑层执行（groupStagesByDependency），保证依赖 stage 先完成并产出 handback。
   // stageIndex 映射回原始 stages 数组，使 handback 文件名（stage-<index>-<name>-handback.md）与依赖查找一致。
@@ -698,6 +728,16 @@ async function executeJobLocked(
   const executedNames = new Set<string>();
   for (const stage of executionOrder) {
     const stageIndex = nameToIndex.get(stage.name) ?? 0;
+    // 崩溃续跑：该 stage 上次已跑完（非终态才会留下报告），直接跳过，避免整链从
+    // stage 0 重放烧预算、且重跑失败会继承已持久化的重试计数直接终败。
+    if (resumingCrashedChain && stageReports.some((report) => report.name === stage.name)) {
+      executedNames.add(stage.name);
+      logJobEvent(workspace, jobId, "stage_resumed_skip", {
+        stage: stage.name,
+        index: stageIndex,
+      });
+      continue;
+    }
     const stageExecutor = stage.executor;
     const stageLabel = resolveExecutor(stageExecutor)?.label ?? "编码代理";
     executedNames.add(stage.name);
@@ -805,6 +845,8 @@ async function executeJobLocked(
     stageReports.push(outcome.report);
     attempt = outcome.attempt;
     attemptExtra = outcome.attemptExtra;
+    // 每个 stage 完成后持久化报告：崩溃续跑据此跳过已完成 stage（见上方恢复逻辑）。
+    await writeState(workspace, jobId, { stages: stageReports });
     // 失败传播标记：review FAIL 或非零退出记入 failedStageNames，后继 stage 会跳过。
     if (
       outcome.report.reviewVerdict === "FAIL" ||
@@ -923,23 +965,30 @@ export async function executeJob(
     extraRounds,
   );
   if (continuation.blocked) return continuation.blocked;
-  const span = startSpan("cbx.job", { jobId });
   const lock = path.join(jobDir(workspace, jobId), "run.lock");
   return withFileLock(
     lock,
     async () => {
+      // span 在锁内开启：E_LOCK_BUSY 直接抛出时不进入本回调，锁外开的 span 永远
+      // 不会被 finish（遥测里只留半条记录）。
+      const span = startSpan("cbx.job", { jobId });
       try {
         // 排队中/前台被取消的任务不得启动：保留取消标记并返回终态。
+        // 有标记而状态未及落定（cancelJob 中途宿主崩溃 / 僵尸接管）时按取消收口，
+        // 不能带着标记进 executeJobLocked——握手等不检查标记的路径会把执行器
+        // 完整跑满一个超时。已是终态（如 retry 崩溃残留）原样返回。
         // 重新执行必须走 continue/retry（入队时清除取消标记）。
         const marker = path.join(jobDir(workspace, jobId), "cancel.requested");
         if (existsSync(marker)) {
           const current = await loadState(workspace, jobId);
-          if (current.status === "cancelled") {
-            if (queueEntryId) await finishQueueEntry(workspace, queueEntryId);
-            await writeResult(workspace, jobId, current);
-            await pruneAfterTerminal(workspace);
-            return current;
-          }
+          const settled = ["cancelled", "done", "failed", "review_failed", "needs_fix"].includes(current.status);
+          const cancelled = settled
+            ? current
+            : await cancelJobState(workspace, jobId, { status: "cancelled", phase: "cancelled", cancelledAt: now() });
+          if (queueEntryId) await finishQueueEntry(workspace, queueEntryId);
+          await writeResult(workspace, jobId, cancelled);
+          await pruneAfterTerminal(workspace);
+          return cancelled;
         }
         const result = await executeJobLocked(
           workspace,

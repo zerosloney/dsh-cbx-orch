@@ -262,11 +262,13 @@ export async function runStage(params: {
   if (context.dependencyGuard) {
     for (const file of DEP_FILES) {
       const fullPath = path.join(workdir, file);
-      if (existsSync(fullPath)) {
-        depBaseline[file] = createHash("sha256")
-          .update(await readFile(fullPath))
-          .digest("hex");
-      }
+      // 缺失记 "absent"：执行器"新建"依赖文件（原实现不设防）与"修改"同责——
+      // 静默引入新依赖正是该守卫要拦的行为。
+      depBaseline[file] = existsSync(fullPath)
+        ? createHash("sha256")
+            .update(await readFile(fullPath))
+            .digest("hex")
+        : "absent";
     }
   }
 
@@ -341,6 +343,7 @@ export async function runStage(params: {
       stage,
       attempt,
     });
+    if (existsSync(cancelMarker)) return await cancelOutcome(-1, null);
     let agent: ProcessResult;
     try {
       agent = await invokeExecutor(
@@ -361,6 +364,10 @@ export async function runStage(params: {
       );
     } catch (error) {
       lastError = String(error);
+      // 取消竞态防御：cancelJob 先 abort 再写标记，被终止的执行器在此抛错；
+      // 若先走 retry 写回，会把 cancelled 覆写成 retrying（进程恰好此时崩溃则永久卡住）。
+      // 与循环顶同语义：检测到取消即按取消收口。
+      if (existsSync(cancelMarker)) return await cancelOutcome(-1, null);
       if (executionUsed < executionRetries) {
         await useExecutionRetry();
         await writeState(workspace, jobId, {
@@ -385,19 +392,28 @@ export async function runStage(params: {
       let depChanged = false;
       const changedDepFiles: string[] = [];
       for (const file of DEP_FILES) {
+        const baselineState = depBaseline[file];
+        if (baselineState === undefined) continue;
         const fullPath = path.join(workdir, file);
-        if (existsSync(fullPath) && depBaseline[file]) {
+        if (baselineState === "absent") {
+          if (existsSync(fullPath)) {
+            depChanged = true;
+            changedDepFiles.push(`${file}（新增）`);
+          }
+          continue;
+        }
+        if (existsSync(fullPath)) {
           const currentHash = createHash("sha256")
             .update(await readFile(fullPath))
             .digest("hex");
-          if (currentHash !== depBaseline[file]) {
+          if (currentHash !== baselineState) {
             depChanged = true;
             changedDepFiles.push(file);
           }
         }
       }
       if (depChanged) {
-        lastError = `依赖守卫：未经授权修改了依赖文件：${changedDepFiles.join(", ")}。`;
+        lastError = `依赖守卫：未经授权修改或新增了依赖文件：${changedDepFiles.join(", ")}。`;
         if (fixUsed < fixRetries) {
           await useFixRetry();
           attemptExtra = `请恢复 ${changedDepFiles.join("、")} 至任务开始前的状态，或通过 --no-dependency-guard 禁用依赖守卫。`;
@@ -548,6 +564,7 @@ export async function runStage(params: {
         "关注正确性、回归风险、安全性、测试覆盖和改动范围。",
       criteria: definitions,
     });
+    if (existsSync(cancelMarker)) return await cancelOutcome(0, 0);
     try {
       reviewAgent = await invokeExecutor(
         reviewExecutor,
@@ -567,6 +584,8 @@ export async function runStage(params: {
       );
     } catch (error) {
       lastError = String(error);
+      // 同执行器 catch：取消优先于 review 重试写回（见上方注释）。
+      if (existsSync(cancelMarker)) return await cancelOutcome(0, 0);
       if (fixUsed < fixRetries) {
         await useFixRetry();
         await writeState(workspace, jobId, {

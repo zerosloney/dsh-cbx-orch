@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import path from "node:path";
 
 /** One live child-process handle an in-process job owns, cancellable as a tree. */
 export interface ActiveProcessHandle {
@@ -19,42 +20,48 @@ export interface JobRuntimeContext {
 
 /**
  * Threads the current in-process job identity into synchronous/async process
- * spawns so the adapter can register its handles for cancellation. Falls back
- * to `undefined` when the call runs outside a worker (e.g. the UI's own git
+ * spawns so the adapter can register its handles for cancellation. Falls back to
+ * `undefined` when the call runs outside a worker (e.g. the UI's own git
  * calls), where no per-job cancellation is needed.
  */
 export const jobContext = new AsyncLocalStorage<JobRuntimeContext>();
 
-/** In-process jobs keyed by jobId, mirroring the queue's `running` view. */
+/** In-process jobs keyed by workspace::jobId（归一化路径拼接）。仅按 jobId 键控会让
+ *  两个工作区的同名任务共享上下文：abortRunningJob 跨工作区误杀、注销串台。 */
 const runningJobs = new Map<string, JobRuntimeContext>();
 
+function contextKey(workspace: string, jobId: string): string {
+  return `${path.resolve(workspace)}::${jobId}`;
+}
+
 export function registerRunningJob(workspace: string, jobId: string): JobRuntimeContext {
-  const existing = runningJobs.get(jobId);
+  const key = contextKey(workspace, jobId);
+  const existing = runningJobs.get(key);
   if (existing) return existing;
   const context: JobRuntimeContext = {
-    workspace,
+    workspace: path.resolve(workspace),
     jobId,
     controller: new AbortController(),
     handles: new Set(),
   };
-  runningJobs.set(jobId, context);
+  runningJobs.set(key, context);
   return context;
 }
 
-export function unregisterRunningJob(jobId: string): void {
-  runningJobs.delete(jobId);
+export function unregisterRunningJob(workspace: string, jobId: string): void {
+  runningJobs.delete(contextKey(workspace, jobId));
 }
 
-export function getRunningJob(jobId: string): JobRuntimeContext | undefined {
-  return runningJobs.get(jobId);
+export function getRunningJob(workspace: string, jobId: string): JobRuntimeContext | undefined {
+  return runningJobs.get(contextKey(workspace, jobId));
 }
 
 /**
  * Cancel an in-process job: signal its controller and terminate every active
  * subprocess handle it owns. Returns whether the job was running in-process.
  */
-export function abortRunningJob(jobId: string): boolean {
-  const context = runningJobs.get(jobId);
+export function abortRunningJob(workspace: string, jobId: string): boolean {
+  const context = runningJobs.get(contextKey(workspace, jobId));
   if (!context) return false;
   context.controller.abort();
   for (const handle of context.handles) {

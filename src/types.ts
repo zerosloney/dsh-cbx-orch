@@ -48,6 +48,8 @@ export interface JobContext {
   baseDirty?: boolean;
   baseStatus?: string;
   dirtyFingerprint?: string;
+  /** 脏指纹算法版本：2 = 仅跟踪文件（消除未跟踪 scratch 的漂移误报）；缺省 = v1。 */
+  dirtyFingerprintVersion?: number;
   trustMode: "trusted" | "untrusted";
   gitRoot?: string;
   adaptive?: AdaptiveOptions;

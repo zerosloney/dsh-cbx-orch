@@ -45,6 +45,33 @@ function jsonOutput() {
   };
 }
 
+/** 工具文本输出上限：agent.log/test.log/result.json 可达数十 MB，全量回给 LLM 会撑爆上下文。 */
+const MAX_TOOL_TEXT_CHARS = 64_000;
+
+function clampText(text: string): string {
+  if (text.length <= MAX_TOOL_TEXT_CHARS) return text;
+  const head = Math.floor(MAX_TOOL_TEXT_CHARS * 0.7);
+  const tail = Math.floor(MAX_TOOL_TEXT_CHARS * 0.2);
+  return `${text.slice(0, head)}\n\n…[cbx: 输出共 ${text.length} 字符，已截断保留头尾]…\n\n${text.slice(-tail)}`;
+}
+
+/** JSON 工具输出的深截断：state/adaptiveRounds 里的超长字符串（error、retryReason 等）同样会爆上下文。 */
+function clampJson(value: unknown): unknown {
+  if (typeof value === "string")
+    return value.length > 8_000
+      ? `${value.slice(0, 8_000)}…(${value.length} chars)`
+      : value;
+  if (Array.isArray(value)) return value.map(clampJson);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        clampJson(item),
+      ]),
+    );
+  return value;
+}
+
 /** Resolve the target workspace: explicit arg wins, else the invoking directory. */
 function workspaceOf(input: string | undefined): string {
   return path.resolve(input ?? process.cwd());
@@ -131,7 +158,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await loadState(workspaceOf(args.workspace), args.job_id));
+      return toJson(clampJson(await loadState(workspaceOf(args.workspace), args.job_id)));
     },
   }));
 
@@ -229,10 +256,9 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await cancelJob(workspaceOf(args.workspace), args.job_id));
+      return toJson(clampJson(await cancelJob(workspaceOf(args.workspace), args.job_id)));
     },
   }));
-
   tools.register(defineTool({
     name: "cbx_retry",
     description: "Re-enqueue a failed cbx job for another attempt.",
@@ -260,10 +286,9 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: jsonOutput(),
     async execute(args) {
-      const ws = workspaceOf(args.workspace);
-      const state = await approveJob(ws, args.job_id);
-      if (state.status === "queued") await startBackground(ws, args.job_id);
-      return toJson(state);
+      // before_run 审批通过即原子重入队（approval 内完成 + 立即 dispatch），无需再补启动。
+      const state = await approveJob(workspaceOf(args.workspace), args.job_id);
+      return toJson(clampJson(state));
     },
   }));
 
@@ -276,7 +301,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
     async execute(args) {
-      return await readArtifact(workspaceOf(args.workspace), args.job_id, "result.json");
+      return clampText(await readArtifact(workspaceOf(args.workspace), args.job_id, "result.json"));
     },
   }));
 
@@ -290,7 +315,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
     output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
     async execute(args) {
-      return await readArtifact(workspaceOf(args.workspace), args.job_id, args.artifact);
+      return clampText(await readArtifact(workspaceOf(args.workspace), args.job_id, args.artifact));
     },
   }));
 
@@ -327,13 +352,14 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
 
   tools.register(defineTool({
     name: "cbx_health",
-    description: "Queue depth, job status counts, failures/retries, pending deliveries, dead letters (no job bodies).",
+    description: "Queue depth, job status counts, failures/retries, pending deliveries, dead letters (no job bodies). Read-only by default; set prune=true to also apply retention cleanup.",
     parameters: {
       workspace: { type: "string", description: "Project directory." },
+      prune: { type: "boolean", description: "Also run retention cleanup (deletes terminal jobs older than governance.retentionDays). Default false (read-only)." },
     },
     output: jsonOutput(),
     async execute(args) {
-      return toJson(await health(workspaceOf(args.workspace)));
+      return toJson(await health(workspaceOf(args.workspace), { prune: args.prune === true }));
     },
   }));
 

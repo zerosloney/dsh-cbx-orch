@@ -20,7 +20,7 @@ import {
 import { normalizeAdaptiveOptions } from "./adaptive-manager.js";
 import {
   snapshotGitBaseline,
-  gitDirtyFingerprint,
+  gitDirtyFingerprintTracked,
   gitRoot,
 } from "./git-ops.js";
 import { DEFAULT_TOKEN_BUDGET, type ContextBudget } from "./context-pack.js";
@@ -139,8 +139,9 @@ export async function createJob(options: {
     );
   if (taskContract)
     await saveJson(path.join(directory, "context-contract.json"), taskContract);
-  const baseline = snapshotGitBaseline(workspace);
-  const dirtyFingerprint = gitDirtyFingerprint(workspace);
+  const baseline = await snapshotGitBaseline(workspace);
+  // v2 脏指纹（仅跟踪文件）：未跟踪 scratch 文件不再触发非隔离任务的脏漂移误报。
+  const dirtyFingerprint = await gitDirtyFingerprintTracked(workspace);
   const runtimeConfig = await loadConfig(workspace);
   const contextBudget = normalizeContextBudget(
     runtimeConfig.context?.tokenBudget,
@@ -157,8 +158,11 @@ export async function createJob(options: {
     maxTurns: options.maxTurns,
     timeoutMs: options.timeoutMs ?? 30 * 60_000,
     maxRetries: options.maxRetries ?? 1,
-    executionRetries: Math.max(1, (options.maxRetries ?? 1) + 1),
-    fixRetries: Math.max(1, options.maxRetries ?? 1),
+    // 重试预算语义：maxRetries = 首次执行失败后允许的重试次数（总执行 = 1 + maxRetries）。
+    // 旧实现 executionRetries = maxRetries + 1 被 stage-runner 当"重试次数"用，
+    // maxRetries:1 实际跑 3 次（多一次）。旧 job 按创建时持久化的值执行，不受影响。
+    executionRetries: Math.max(0, options.maxRetries ?? 1),
+    fixRetries: Math.max(0, options.maxRetries ?? 1),
     keepWorktree: options.keepWorktree ?? false,
     reviewRules: options.reviewRules,
     approvalBeforeRun: options.approvalBeforeRun ?? false,
@@ -177,12 +181,13 @@ export async function createJob(options: {
       : undefined,
     taskContract,
     trustMode: options.trustMode ?? "trusted",
-    gitRoot: baseline?.root ?? gitRoot(workspace),
+    gitRoot: baseline?.root ?? await gitRoot(workspace),
     baseCommit: baseline?.commit,
     baseBranch: baseline?.branch,
     baseDirty: baseline?.dirty,
     baseStatus: baseline?.status,
     dirtyFingerprint,
+    dirtyFingerprintVersion: 2,
     dependencyGuard: options.dependencyGuard ?? false,
     contextBudget,
   };

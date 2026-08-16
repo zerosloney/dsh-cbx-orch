@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { appendFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, unlinkSync } from "node:fs";
+import { writePidRecord } from "./pid-guard.js";
 
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 
@@ -63,9 +64,17 @@ export type ProcessSpawn = (
 
 let provider: ProcessSpawn | undefined;
 
-/** Install the process provider (typically the harness adapter). Pass undefined to reset. */
-export function setProcessSpawnProvider(fn: ProcessSpawn | undefined): void {
+/**
+ * Install the process provider (typically the harness adapter). Returns a
+ * disposer that only clears the provider if it is still THIS call's function —
+ * HMR/多实例下后装实例被先装实例的卸载清理误清空，会让所有 spawn 静默退回
+ * raw child_process（丢失树杀/取消集成/凭据脱敏）。
+ */
+export function setProcessSpawnProvider(fn: ProcessSpawn): () => void {
   provider = fn;
+  return () => {
+    if (provider === fn) provider = undefined;
+  };
 }
 
 export function getProcessSpawnProvider(): ProcessSpawn | undefined {
@@ -111,9 +120,12 @@ export function killTree(
   child?: ChildProcess,
 ): boolean {
   if (process.platform === "win32") {
+    // child.kill("SIGKILL") 只 TerminateProcess 直接子进程并同步返回 true——提前
+    // return 会让 taskkill /T 永不执行，孙进程（npm 包装的 CLI 等）全部成为孤儿。
+    // 因此 child.kill 仅作第一步，树级终止始终再跑一次 taskkill /T /F。
     if (child) {
       try {
-        if (child.kill("SIGKILL")) return true;
+        child.kill("SIGKILL");
       } catch {
         /* 进程已退出 */
       }
@@ -208,13 +220,33 @@ function runChildRaw(
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
-    if (pidFile && child.pid) writeFileSync(pidFile, String(child.pid), "utf8");
+    if (pidFile && child.pid) writePidRecord(pidFile, child.pid);
     const output = new BoundedOutput();
     let timedOut = false;
     let settled = false;
+    // 磁盘日志硬上限（与 seam 适配器一致）：raw 回退路径同样不能让 agent.log/test.log 无界增长。
+    const MAX_LOG_FILE_BYTES = 32 * 1024 * 1024;
+    let logBytes = 0;
+    let logCapped = false;
     const append = (chunk: Buffer) => {
       output.append(chunk);
-      if (logFile) appendFileSync(logFile, chunk);
+      if (logFile && !logCapped) {
+        logBytes += chunk.length;
+        if (logBytes > MAX_LOG_FILE_BYTES) {
+          logCapped = true;
+          try {
+            appendFileSync(
+              logFile,
+              `\n[cbx: 日志已达 ${MAX_LOG_FILE_BYTES} 字节上限，停止落盘；内存采集仍保留尾部]\n`,
+              "utf8",
+            );
+          } catch {
+            /* 磁盘已满等：静默 */
+          }
+          return;
+        }
+        appendFileSync(logFile, chunk);
+      }
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);

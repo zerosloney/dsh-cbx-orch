@@ -20,21 +20,48 @@ var STATUS_GROUPS=[
 function statusGroupKey(s){for(var i=0;i<STATUS_GROUPS.length;i++){if(STATUS_GROUPS[i].match.indexOf(s)>=0)return STATUS_GROUPS[i].key;}return '';}
 function matchesFilter(j){if(!filterStatus)return true;return statusGroupKey(j.status)===filterStatus;}
 function cardEnableFilter(){document.querySelectorAll('#cards .card').forEach(function(c){c.classList.toggle('clickable',!!c.dataset.filter);c.classList.toggle('filter-active',!!c.dataset.filter&&c.dataset.filter===filterStatus);});}
+// 401 处理：数据端点需要 token 时弹一次性输入框，POST /auth 换 HttpOnly cookie 后重试原请求。
+// token 本身不落 localStorage/URL（HttpOnly cookie 由浏览器托管），输入错误只提示不重试。
+var authInProgress=null;
+var authCooldownUntil=0;
+function ensureAuth(){
+  if(authInProgress)return authInProgress;
+  if(Date.now()<authCooldownUntil)return Promise.resolve(false);
+  authInProgress=new Promise(function(resolve){
+    var token=window.prompt('cbx 仪表盘需要访问令牌（见 <工作区>/.cbx/web.token 或 dsh 启动日志）：');
+    if(!token){authCooldownUntil=Date.now()+60_000;authInProgress=null;resolve(false);return;}
+// 所有请求走相对路径：页面位于 /cbx/ 时解析为 /cbx/...，独立根路径部署同样成立。
+    fetch('auth',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({token:token})})
+      .then(function(res){
+        if(res.ok){authInProgress=null;resolve(true);}
+        else{alert('令牌无效。');authCooldownUntil=Date.now()+60_000;authInProgress=null;resolve(false);}
+      })
+      .catch(function(){alert('登录请求失败。');authCooldownUntil=Date.now()+60_000;authInProgress=null;resolve(false);});
+  });
+  return authInProgress;
+}
 function cbxFetch(url,opts){
   opts=opts||{};
   opts.headers=Object.assign({},opts.headers||{});
   // token 走 HttpOnly cookie（同源请求自动携带），JS 不可读、不落 URL。
   opts.credentials='same-origin';
-  return fetch(url,opts);
+  return fetch(url,opts).then(function(res){
+    if(res.status===401){
+      return ensureAuth().then(function(ok){return ok?fetch(url,opts):res;});
+    }
+    return res;
+  });
 }
 function cbxPost(url,body){
   body=body||{};
   return cbxFetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
 }
+// 非 JSON 响应（挂载路径错误/网关错误页等）不再让轮询循环抛未处理 rejection。
+function safeJson(r){return r.json().catch(function(){return null})}
 async function refresh(){
   var ws=encodeURIComponent(currentWorkspace||'');
-  var jobs=await cbxFetch('/api/jobs?workspace='+ws).then(function(r){return r.json()});
-  var q=await cbxFetch('/api/queue?workspace='+ws).then(function(r){return r.json()});
+  var jobs=await cbxFetch('api/jobs?workspace='+ws).then(safeJson)||[];
+  var q=await cbxFetch('api/queue?workspace='+ws).then(safeJson)||{entries:[]};
   updateCards(jobs,q);
   var filtered=filterStatus?jobs.filter(matchesFilter):jobs;
   document.querySelector('#jobs').innerHTML=filtered.map(rowHtml).join('');
@@ -106,7 +133,7 @@ function renderDistBar(jobs){
 async function loadWorkspaces(){
   console.log('cbx-ui: loadWorkspaces called');
   try{
-    var response=await cbxFetch('/api/workspaces');
+    var response=await cbxFetch('api/workspaces');
     console.log('cbx-ui: fetch status', response.status);
     if(!response.ok) throw new Error('HTTP '+response.status);
     var data=await response.json();
@@ -162,7 +189,7 @@ function rowHtml(j){
   // 终态显示 totalSeconds,非终态用 createdAt 实时算 elapsed。
   var terminal=['done','failed','review_failed','cancelled','needs_fix'].indexOf(j.status)>=0;
   var elapsed = terminal && j.totalSeconds != null ? (j.totalSeconds < 60 ? j.totalSeconds + 's' : Math.floor(j.totalSeconds/60) + 'm ' + (j.totalSeconds%60) + 's') : fmtElapsed(j.createdAt);
-  return '<tr class="'+cls+'" data-id="'+esc(j.jobId)+'" data-created="'+esc(j.createdAt||'')+'" data-terminal="'+terminal+'"><td><button type="button" class="job-select">'+esc(j.jobId)+'</button></td><td class="s-'+esc(j.status)+'">'+esc(j.status)+'</td><td>'+esc(j.phase||'')+'</td><td>'+esc(String(j.attempt))+'</td><td class="v-'+esc(j.reviewVerdict||'')+'">'+esc(j.reviewVerdict||'—')+'</td><td class="elapsed">'+elapsed+'</td><td>'+fmt(j.updatedAt)+'</td></tr>';
+  return '<tr class="'+cls+'" data-id="'+esc(j.jobId)+'" data-created="'+esc(j.createdAt||'')+'" data-terminal="'+terminal+'"><td><button type="button" class="job-select">'+esc(j.jobId)+'</button></td><td class="s-'+esc(j.status)+'">'+esc(j.status)+'</td><td>'+esc(j.phase||'')+'</td><td>'+esc(String(j.attempt))+'</td><td class="v-'+esc(j.reviewVerdict||'')+'">'+esc(j.reviewVerdict||'—')+'</td><td class="elapsed">'+elapsed+'</td><td>'+esc(fmt(j.updatedAt))+'</td></tr>';
 }
 function selectJob(id){
   selected=(selected===id)?null:id;
@@ -174,7 +201,7 @@ async function loadDetail(id){
   body.innerHTML='<p>加载中…</p>';
   // Stage chain (top): 受 result.json.stages 驱动,失败/通过着色
   var result=null;
-  try{result=JSON.parse(await cbxFetch('/api/jobs/'+id+'/artifact/result.json').then(function(r){return r.text()}));}catch(e){}
+  try{result=JSON.parse(await cbxFetch('api/jobs/'+id+'/artifact/result.json').then(function(r){return r.text()}));}catch(e){}
   var stageHtml='';
   if(result&&result.stages&&result.stages.length){
     stageHtml+='<div class="stages">';
@@ -221,7 +248,7 @@ async function loadDetail(id){
         var orig=btn.textContent;
         btn.textContent='处理中…';
         try{
-          var res=await cbxPost('/api/jobs/'+encodeURIComponent(id)+'/'+action,action==='continue'?{message:'请根据 review.md 修复问题。'}:{});
+          var res=await cbxPost('api/jobs/'+encodeURIComponent(id)+'/'+action,action==='continue'?{message:'请根据 review.md 修复问题。'}:{});
           if(!res.ok){var err=await res.json();throw new Error(err.error||('HTTP '+res.status));}
           // forget / purge 后该 job 在 /api/jobs 里也消失；详情面板没意义，关闭它。
           if(action==='forget'||action==='purge'){selectJob(null);}
@@ -276,7 +303,7 @@ async function loadTab(id,tab,panelsEl,result){
       panel.innerHTML=html;
     }
     else if(tab==='timeline'){
-      var tl=await cbxFetch('/api/jobs/'+id+'/timeline').then(function(r){return r.json()});
+      var tl=await cbxFetch('api/jobs/'+id+'/timeline').then(function(r){return r.json()});
       if(!tl.stages||!tl.stages.length){panel.innerHTML='<p class="hint">无阶段转换记录。</p>';return;}
       var maxMs=Math.max.apply(null,tl.stages.map(function(s){return s.durationMs||0;}).concat([1000]));
       var rows=tl.stages.map(function(s){
@@ -289,7 +316,7 @@ async function loadTab(id,tab,panelsEl,result){
       panel.innerHTML='<div style="margin-bottom:8px;color:#888">当前阶段：<b>'+esc(tl.currentStage||'—')+'</b> · 已跑 '+tl.elapsedSec+'s</div>'+rows;
     }
     else if(tab==='executor'){
-      var ex=await cbxFetch('/api/jobs/'+id+'/executor').then(function(r){return r.json()});
+      var ex=await cbxFetch('api/jobs/'+id+'/executor').then(function(r){return r.json()});
       var pulse=ex.alive===true?'pulse-alive':ex.alive===false?'pulse-dead':'pulse-unknown';
       var html='<div class="exec-card">';
       html+='<div><div class="field-label">PID</div><div class="field-value"><span class="pulse '+pulse+'"></span>'+(ex.pid!=null?ex.pid:'—')+'</div></div>';
@@ -315,7 +342,7 @@ async function loadTab(id,tab,panelsEl,result){
       html+='</div>';
       if(ex.command)html+='<div class="cmd">'+esc(ex.command)+'</div>';
       // 增量 agent.log 拉取(默认读尾部 256KB)
-      var log=await cbxFetch('/api/jobs/'+id+'/agent.log?since=0').then(function(r){return r.json()});
+      var log=await cbxFetch('api/jobs/'+id+'/agent.log?since=0').then(function(r){return r.json()});
       if(log.content){
         html+='<h3 style="margin:14px 0 6px;color:#9ecbff">agent.log 尾部</h3>';
         html+='<pre class="art-view" style="display:block;max-height:240px;white-space:pre-wrap">'+esc(log.content)+'</pre>';
@@ -323,15 +350,15 @@ async function loadTab(id,tab,panelsEl,result){
       panel.innerHTML=html;
     }
     else if(tab==='diff'){
-      var txt=await cbxFetch('/api/jobs/'+id+'/artifact/complete.patch').then(function(r){return r.text()});
+      var txt=await cbxFetch('api/jobs/'+id+'/artifact/complete.patch').then(function(r){return r.text()});
       panel.innerHTML='<pre class="art-view" style="display:block;max-height:380px;white-space:pre">'+esc(txt)+'</pre>';
     }
     else if(tab==='test'){
-      try{var txt=await cbxFetch('/api/jobs/'+id+'/artifact/test.log').then(function(r){return r.text()});panel.innerHTML='<pre class="art-view" style="display:block;max-height:380px;white-space:pre-wrap">'+esc(txt)+'</pre>';}
+      try{var txt=await cbxFetch('api/jobs/'+id+'/artifact/test.log').then(function(r){return r.text()});panel.innerHTML='<pre class="art-view" style="display:block;max-height:380px;white-space:pre-wrap">'+esc(txt)+'</pre>';}
       catch(e){panel.innerHTML='<p class="hint">任务未运行测试或还没测试日志。</p>';}
     }
     else if(tab==='review'){
-      try{var txt=await cbxFetch('/api/jobs/'+id+'/artifact/review.md').then(function(r){return r.text()});panel.innerHTML='<pre class="art-view" style="display:block;max-height:380px;white-space:pre-wrap">'+esc(txt)+'</pre>';}
+      try{var txt=await cbxFetch('api/jobs/'+id+'/artifact/review.md').then(function(r){return r.text()});panel.innerHTML='<pre class="art-view" style="display:block;max-height:380px;white-space:pre-wrap">'+esc(txt)+'</pre>';}
       catch(e){panel.innerHTML='<p class="hint">任务未启用 review 或审查还在进行。</p>';}
     }
   } catch(e){
@@ -356,13 +383,13 @@ document.querySelector('#btn-clear-filter')&&document.querySelector('#btn-clear-
 });
 document.querySelector('#btn-pause').addEventListener('click',async function(){
   var btn=this;btn.disabled=true;
-  try{var res=await cbxPost('/api/queue/pause');if(!res.ok){var err=await res.json();throw new Error(err.error||('HTTP '+res.status));}refresh();}
+  try{var res=await cbxPost('api/queue/pause');if(!res.ok){var err=await res.json();throw new Error(err.error||('HTTP '+res.status));}refresh();}
   catch(e){alert('暂停失败：'+(e instanceof Error?e.message:String(e)));}
   finally{btn.disabled=false;}
 });
 document.querySelector('#btn-resume').addEventListener('click',async function(){
   var btn=this;btn.disabled=true;
-  try{var res=await cbxPost('/api/queue/resume');if(!res.ok){var err=await res.json();throw new Error(err.error||('HTTP '+res.status));}refresh();}
+  try{var res=await cbxPost('api/queue/resume');if(!res.ok){var err=await res.json();throw new Error(err.error||('HTTP '+res.status));}refresh();}
   catch(e){alert('恢复失败：'+(e instanceof Error?e.message:String(e)));}
   finally{btn.disabled=false;}
 });
@@ -374,7 +401,7 @@ document.querySelector('#btn-create').addEventListener('click',async function(){
   var btn=this;btn.disabled=true;
   try{
     var ws=encodeURIComponent(currentWorkspace||'');
-    var res=await cbxPost('/api/jobs?workspace='+ws,{task:task});
+    var res=await cbxPost('api/jobs?workspace='+ws,{task:task});
     if(!res.ok){var err=await res.json();throw new Error(err.error||('HTTP '+res.status));}
     input.value='';
     refresh();
@@ -387,7 +414,7 @@ document.querySelector('#new-task').addEventListener('keydown',function(e){
 loadWorkspaces().then(refresh);
 // intentional-simple: 全量轮询 refresh 与 SSE 增量推送并存——SSE 写入 DOM 后 refresh 会重建，存在冗余渲染。
 // 单用户本地 UI 的带宽/CPU 可忽略；升级路径：SSE 只更新内存状态，由轻量定时器统一渲染。
-setInterval(refresh,1500);
+setInterval(function(){refresh().catch(function(e){console.warn('cbx-ui: refresh failed',e);})},1500);
 // 每秒刷新所有行耗时(不重新拉数据,仅前端算 elapsed)
 function refreshElapsedRows(){
   document.querySelectorAll('tr.job').forEach(function(row){
@@ -400,10 +427,14 @@ function refreshElapsedRows(){
 }
 setInterval(refreshElapsedRows,1000);
 var stream=document.querySelector('#stream');
-	var es=new EventSource('/events',{withCredentials:true});
-	es.onerror=function(e){console.warn('cbx-ui: SSE 连接异常，浏览器将自动重连',e);};
-es.onmessage=function(e){
-  var d=JSON.parse(e.data);
+// 401/断网时 EventSource 会每 ~3s 无限重连打爆服务端日志：连续 10 次错误且无任何
+// 消息则主动 close，退化为纯轮询；收到消息即重置计数（连接恢复）。
+var esErrorStreak=0;
+	var es=new EventSource('events',{withCredentials:true});
+	es.onerror=function(e){esErrorStreak++;if(esErrorStreak>10){es.close();console.warn('cbx-ui: SSE 持续失败，已停止自动重连（依赖轮询刷新）');}};
+	es.onmessage=function(e){
+	esErrorStreak=0;
+	var d=JSON.parse(e.data);
   if(d.type==='heartbeat'||d.type==='connected')return;
   var p=d.payload||{};
   var status=p.status||'';
@@ -411,7 +442,7 @@ es.onmessage=function(e){
   div.className='evt';
   // status 来自 SSE payload，进 class 属性与文本前先 esc，防非常枚举值逃逸属性/标签。
   var sStatus=esc(status);
-  var txt='<span class="t">'+fmt(d.at)+'</span>';
+  var txt='<span class="t">'+esc(fmt(d.at))+'</span>';
   if(p.jobId)txt+='<span class="s-'+sStatus+'"><b>'+esc(p.jobId)+'</b></span> ';
   if(p.previousStatus)txt+='<span class="s-'+esc(p.previousStatus)+'">'+esc(p.previousStatus)+'</span> → <span class="s-'+sStatus+'">'+sStatus+'</span>';
   else if(status)txt+='<span class="s-'+sStatus+'">'+sStatus+'</span>';

@@ -5,11 +5,36 @@ import { fileURLToPath } from "node:url";
 import { inspectExecutorPlugin, type ExecutorResult, type ExecutorRequest } from "./executor.js";
 import { findExecutable, resolveExecutor } from "./executors/builtin.js";
 import { bumpInvocationCount, loadConfig } from "./state.js";
+import { validateTestCommand } from "./validation.js";
 import { runProcess, runShell, type ProcessResult } from "./process-runner.js";
-import { saveJson } from "./storage.js";
+import { redactText, saveJson } from "./storage.js";
 import { APP_VERSION } from "./version.js";
 
 export type InvocationRole = "stage" | "review" | "manager" | "gate";
+
+/** 事件载荷中的长字符串（内嵌 prompt 的 argv、输出片段）截断后落盘：审计要可读头部，不要全文。 */
+function truncateDeep(value: unknown, maxChars = 500): unknown {
+  if (typeof value === "string") {
+    return value.length > maxChars ? `${value.slice(0, maxChars)}…(${value.length} chars)` : value;
+  }
+  if (Array.isArray(value)) return value.map((item) => truncateDeep(item, maxChars));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, truncateDeep(item, maxChars)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * 事件流写入统一边界：内置凭据形状脱敏 + 长字段截断。prompt 经 argv 内嵌在
+ * process_started 的 command 里，原样落盘会把任务全文（含用户指令/handback 与
+ * 内联凭据）持久化并随 SSE / events artifact 暴露——agent.log/test.log 的脱敏
+ * 约束同样适用于事件流。
+ */
+function appendEvent(eventsFile: string, payload: Record<string, unknown>): void {
+  appendFileSync(eventsFile, redactText(JSON.stringify(truncateDeep(payload))) + "\n", "utf8");
+}
 
 export interface InvocationMeta {
   role: InvocationRole;
@@ -27,10 +52,10 @@ async function invokeBuiltin(spec: ReturnType<typeof resolveExecutor> & {}, dire
   const command = executable[0];
   const eventsFile = path.join(directory, "events.ndjson");
   const outputLog = path.join(directory, "agent.log");
-  appendFileSync(eventsFile, JSON.stringify({ event: "executor_metadata", source: "builtin", name: spec.name, version: APP_VERSION, at: new Date().toISOString() }) + "\n", "utf8");
-  appendFileSync(eventsFile, JSON.stringify({ event: "process_started", command: [command, ...args], cwd: workdir, at: new Date().toISOString() }) + "\n", "utf8");
+  appendEvent(eventsFile, { event: "executor_metadata", source: "builtin", name: spec.name, version: APP_VERSION, at: new Date().toISOString() });
+  appendEvent(eventsFile, { event: "process_started", command: [command, ...args], cwd: workdir, at: new Date().toISOString() });
   const result = await runProcess(command, args, workdir, timeoutMs, outputLog, path.join(directory, "active.pid"));
-  appendFileSync(eventsFile, JSON.stringify({ event: "process_finished", returncode: result.code, timedOut: result.timedOut, at: new Date().toISOString() }) + "\n", "utf8");
+  appendEvent(eventsFile, { event: "process_finished", returncode: result.code, timedOut: result.timedOut, at: new Date().toISOString() });
   return result;
 }
 
@@ -45,17 +70,13 @@ export async function invokeExecutor(executor: string, workspace: string, direct
       );
     } catch (error) {
       // 计数失败不应阻塞执行器调用；落审计事件便于排障。
-      appendFileSync(
-        path.join(directory, "events.ndjson"),
-        JSON.stringify({
-          event: "invocation_count_failed",
-          role: invocationMeta.role,
-          stageIndex: invocationMeta.stageIndex,
-          error: error instanceof Error ? error.message : String(error),
-          at: new Date().toISOString(),
-        }) + "\n",
-        "utf8",
-      );
+      appendEvent(path.join(directory, "events.ndjson"), {
+        event: "invocation_count_failed",
+        role: invocationMeta.role,
+        stageIndex: invocationMeta.stageIndex,
+        error: error instanceof Error ? error.message : String(error),
+        at: new Date().toISOString(),
+      });
     }
   }
   const builtin = resolveExecutor(executor);
@@ -66,16 +87,23 @@ export async function invokeExecutor(executor: string, workspace: string, direct
     // 默认不强制插件白名单：显式告警并落审计事件，提醒生产环境启用 plugins.enforce。
     const warning = `executor 指向插件 ${identity.path}，但 plugins.enforce 未启用，插件未经路径/SHA 白名单校验即被加载；生产环境请配置 plugins.enforce=true 与 allowPaths/allowSha256。`;
     console.error(`cbx: ${warning}`);
-    appendFileSync(path.join(directory, "events.ndjson"), JSON.stringify({ event: "plugin_policy_warning", executor: identity.name, path: identity.path, sha256: identity.sha256, enforce: false, at: new Date().toISOString() }) + "\n", "utf8");
+    appendEvent(path.join(directory, "events.ndjson"), { event: "plugin_policy_warning", executor: identity.name, path: identity.path, sha256: identity.sha256, enforce: false, at: new Date().toISOString() });
   }
   const request: ExecutorRequest = { directory, workdir, prompt, permissionMode, maxTurns, timeoutMs, executor, plugin: { policy: config.plugins, sha256: identity.sha256 } };
-  appendFileSync(path.join(directory, "events.ndjson"), JSON.stringify({ event: "executor_metadata", source: identity.source, name: identity.name, version: identity.version, apiVersion: identity.apiVersion, capabilities: identity.capabilities, sha256: identity.sha256, at: new Date().toISOString() }) + "\n", "utf8");
-  appendFileSync(path.join(directory, "events.ndjson"), JSON.stringify({ event: "plugin_started", executor: identity.name, at: new Date().toISOString() }) + "\n", "utf8");
+  appendEvent(path.join(directory, "events.ndjson"), { event: "executor_metadata", source: identity.source, name: identity.name, version: identity.version, apiVersion: identity.apiVersion, capabilities: identity.capabilities, sha256: identity.sha256, at: new Date().toISOString() });
+  appendEvent(path.join(directory, "events.ndjson"), { event: "plugin_started", executor: identity.name, at: new Date().toISOString() });
   const requestFile = path.join(directory, "plugin-request.json");
   const resultFile = path.join(directory, "plugin-result.json");
   await saveJson(requestFile, request);
   const host = path.join(path.dirname(fileURLToPath(import.meta.url)), "plugin-host.js");
-  const processResult = await runProcess(process.execPath, [host, executor, workspace, requestFile, resultFile], workdir, timeoutMs, path.join(directory, "agent.log"), path.join(directory, "active.pid"));
+  // plugin-request.json 内嵌完整 prompt（用户指令，可能携带内联凭据），是 job 目录里
+  // 唯一未经脱敏的明文落盘面——插件宿主读取完毕后立即删除，不留持久副本。
+  let processResult: ProcessResult;
+  try {
+    processResult = await runProcess(process.execPath, [host, executor, workspace, requestFile, resultFile], workdir, timeoutMs, path.join(directory, "agent.log"), path.join(directory, "active.pid"));
+  } finally {
+    await unlink(requestFile).catch(() => undefined);
+  }
   let pluginResult: ExecutorResult = { code: processResult.code, timedOut: processResult.timedOut, output: processResult.output };
   if (!processResult.timedOut && existsSync(resultFile)) {
     try { pluginResult = JSON.parse(await readFile(resultFile, "utf8")) as ExecutorResult; }
@@ -91,12 +119,21 @@ export async function invokeExecutor(executor: string, workspace: string, direct
     }
   }
   const normalized = { code: Number(pluginResult.code ?? processResult.code), timedOut: processResult.timedOut || Boolean(pluginResult.timedOut), output: String(pluginResult.output ?? processResult.output) };
-  appendFileSync(path.join(directory, "events.ndjson"), JSON.stringify({ event: "plugin_finished", executor, code: normalized.code, timedOut: normalized.timedOut, at: new Date().toISOString() }) + "\n", "utf8");
+  appendEvent(path.join(directory, "events.ndjson"), { event: "plugin_finished", executor, code: normalized.code, timedOut: normalized.timedOut, at: new Date().toISOString() });
   return normalized;
 }
 
 export async function runTest(directory: string, workdir: string, command: string | undefined, timeoutMs: number): Promise<ProcessResult> {
   if (!command) { await writeFile(path.join(directory, "test.log"), "未指定测试命令。\n", "utf8"); return { code: 0, timedOut: false, output: "" }; }
+  // 执行期复验：context.json 是执行器可写文件，测试命令可能在创建校验之后被篡改。
+  // 这里失败直接按执行失败处理（非零退出），不跑 shell。
+  try {
+    validateTestCommand(command);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await writeFile(path.join(directory, "test.log"), `$ ${command}\n\n拒绝执行：${message}\n`, "utf8");
+    return { code: 1, timedOut: false, output: `测试命令被拒绝：${message}` };
+  }
   const logFile = path.join(directory, "test.log");
   await writeFile(logFile, `$ ${command}\n\n`, "utf8");
   const result = await runShell(command, workdir, timeoutMs, logFile, path.join(directory, "active.pid"));

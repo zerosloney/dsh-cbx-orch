@@ -32,13 +32,23 @@ export async function runWorkerJob(
   const pidFile = path.join(directory, "pid");
   const context = registerRunningJob(workspace, jobId);
 
+  // 心跳/pid 写失败若静默吞掉，回收路径会把健康的 running 任务误判为死 worker。
+  // 首次失败记入事件流便于诊断；持续失败不再刷屏。
+  let heartbeatWarned = false;
+  const warnHeartbeat = (error: unknown): void => {
+    if (heartbeatWarned) return;
+    heartbeatWarned = true;
+    logJobEvent(workspace, jobId, "worker_heartbeat_write_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  };
   await writeFile(heartbeatFile, new Date().toISOString(), "utf8").catch(
-    () => undefined,
+    warnHeartbeat,
   );
   await writeFile(pidFile, String(process.pid), "utf8").catch(() => undefined);
   const heartbeat = setInterval(() => {
     void writeFile(heartbeatFile, new Date().toISOString(), "utf8").catch(
-      () => undefined,
+      warnHeartbeat,
     );
   }, HEARTBEAT_INTERVAL_MS);
   heartbeat.unref();
@@ -51,7 +61,7 @@ export async function runWorkerJob(
     clearInterval(heartbeat);
     await unlink(heartbeatFile).catch(() => undefined);
     await unlink(pidFile).catch(() => undefined);
-    unregisterRunningJob(jobId);
+    unregisterRunningJob(workspace, jobId);
   }
 }
 

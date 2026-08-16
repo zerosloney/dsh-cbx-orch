@@ -1,9 +1,10 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { loadJobContext, loadJson, saveJson } from "./storage.js";
+import { loadJobContext, loadJson, saveJson, updateJobContext } from "./storage.js";
 import {
   snapshotGitBaseline,
   gitDirtyFingerprint,
+  gitDirtyFingerprintTracked,
   snapshotDiff,
   gitRoot,
 } from "./git-ops.js";
@@ -14,6 +15,7 @@ import { createExecutorContextPack } from "./context-pack.js";
 import { createHumanGate } from "./human-gate.js";
 import { contextArtifacts } from "./artifacts.js";
 import { resolveExecutor } from "./executors/builtin.js";
+import { captureAsync } from "./process-runner.js";
 import type {
   JobContext,
   JobState,
@@ -32,12 +34,23 @@ export function semanticReviewFailure(review: string): boolean {
     );
 }
 
-export function evaluateBaselineDrift(
+/** 按任务记录的指纹版本选择算法：v2（仅跟踪文件）消除"未跟踪 scratch 文件引发
+ *  脏漂移误报"；旧任务（无版本字段）保持 v1 比对，避免升级即全员漂移。 */
+async function dirtyFingerprintFor(
+  context: Pick<JobContext, "dirtyFingerprintVersion">,
+  workspace: string,
+): Promise<string | undefined> {
+  return context.dirtyFingerprintVersion === 2
+    ? gitDirtyFingerprintTracked(workspace)
+    : gitDirtyFingerprint(workspace);
+}
+
+export async function evaluateBaselineDrift(
   context: JobContext,
   workspace: string,
-): BaselineDrift {
-  const currentBaseline = snapshotGitBaseline(workspace);
-  const currentDirtyFingerprint = gitDirtyFingerprint(workspace);
+): Promise<BaselineDrift> {
+  const currentBaseline = await snapshotGitBaseline(workspace);
+  const currentDirtyFingerprint = await dirtyFingerprintFor(context, workspace);
   return {
     currentBaseline,
     currentDirtyFingerprint,
@@ -59,9 +72,10 @@ export async function refreshBaseline(
   jobId: string,
   directory: string,
 ): Promise<JobState> {
-  const baseline = snapshotGitBaseline(workspace);
-  const dirtyFingerprint = gitDirtyFingerprint(workspace);
+  const baseline = await snapshotGitBaseline(workspace);
   const context = await loadJobContext(directory);
+  // 刷新即升级到 v2 指纹：用户显式确认当前状态为新基线，此后未跟踪文件不再参与漂移判定。
+  const dirtyFingerprint = await gitDirtyFingerprintTracked(workspace);
   Object.assign(context, {
     gitRoot: baseline?.root,
     baseCommit: baseline?.commit,
@@ -69,6 +83,7 @@ export async function refreshBaseline(
     baseDirty: baseline?.dirty,
     baseStatus: baseline?.status,
     dirtyFingerprint,
+    dirtyFingerprintVersion: 2,
   });
   await saveJson(path.join(directory, "context.json"), context);
   const refreshedState = await writeState(workspace, jobId, {
@@ -84,6 +99,41 @@ export async function refreshBaseline(
     baseDirty: baseline?.dirty,
   });
   return refreshedState;
+}
+
+/**
+ * context.json schema 迁移基础设施（首个迁移）：旧任务（无 dirtyFingerprintVersion，
+ * 即 v1 指纹）在下次执行时懒升级到 v2——未跟踪 scratch 文件不再参与漂移判定。
+ *
+ * 迁移守卫：仅在"已跟踪改动为空"时才升级。工作区存在真实已跟踪改动时保留 v1
+ * 语义（继续按 v1 比对、让脏漂移照常拦截），由用户显式 refreshBaseline 才升级——
+ * 否则懒迁移会把未提交改动静默洗成新基线。
+ */
+export async function tryMigrateDirtyFingerprintV2(
+  workspace: string,
+  jobId: string,
+  directory: string,
+  context: JobContext,
+): Promise<void> {
+  if (context.dirtyFingerprintVersion || context.isolated) return;
+  const trackedStatus = await captureAsync(
+    ["git", "status", "--porcelain", "--untracked-files=no", "--", ".", ":(exclude).cbx", ":(exclude).cbx/**"],
+    workspace,
+  );
+  if (trackedStatus.code !== 0 || trackedStatus.stdout.trim()) return;
+  const dirtyFingerprint = await gitDirtyFingerprintTracked(workspace);
+  if (dirtyFingerprint === undefined) return;
+  await updateJobContext(workspace, jobId, {
+    dirtyFingerprint,
+    dirtyFingerprintVersion: 2,
+  });
+  context.dirtyFingerprint = dirtyFingerprint;
+  context.dirtyFingerprintVersion = 2;
+  logJobEvent(workspace, jobId, "context_schema_migrated", {
+    from: 1,
+    to: 2,
+    reason: "dirty fingerprint v2",
+  });
 }
 
 export async function performContextHandshake(

@@ -26,11 +26,18 @@ export interface TaskContract {
   stages?: TaskStage[];
 }
 
+/** Windows 保留设备名（含带扩展形式，如 con.txt 也指向设备）：mkdir/open 会 EINVAL 或被重定向。 */
+const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
+
 export function assertJobId(jobId: string): void {
   if (
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(jobId) ||
     jobId === "." ||
-    jobId === ".."
+    jobId === ".." ||
+    // Win32 会剥掉段尾的点和空格："abc" 与 "abc." 共享一个目录而 SQLite 行不同，
+    // 状态会串；设备名（con/nul/com1…）让文件操作 EINVAL。
+    /[. ]$/.test(jobId) ||
+    WINDOWS_DEVICE_NAME.test(jobId)
   )
     throw new CbxError("E_INVALID_JOB_ID", `无效的任务 ID：${jobId}`);
 }
@@ -51,23 +58,34 @@ export function normalizeJobId(value?: string): string {
 export function validateWorkspace(workspace: string): void {
   const resolved = path.resolve(workspace);
   if (path.dirname(resolved) === resolved)
-    throw new Error("不允许把文件系统根目录作为工作区。");
-  if (!existsSync(resolved)) throw new Error(`工作区不存在：${resolved}`);
+    throw new CbxError("E_INVALID_WORKSPACE", "不允许把文件系统根目录作为工作区。");
+  if (!existsSync(resolved))
+    throw new CbxError("E_INVALID_WORKSPACE", `工作区不存在：${resolved}`);
 }
 
 export function validateTestCommand(command?: string): void {
   if (!command) return;
   // 拒绝 shell 链式/重定向操作符、换行（命令分隔）、反引号与 $( 命令替换——这些是绕过黑名单的主要手法。
   if (/[;&|<>`\r\n]/.test(command) || command.includes("$(")) {
-    throw new Error("测试命令包含不允许的 shell 操作符、换行或命令替换。");
+    throw new CbxError("E_INVALID_TEST_COMMAND", "测试命令包含不允许的 shell 操作符、换行或命令替换。");
   }
-  // 拒绝递归/强制删除与编码执行等破坏性命令（覆盖常见参数变体）。
-  // 软防线：无法穷举所有变体，非隔离任务仍依赖运行环境隔离。补 find -delete/git clean/truncate/dd/shred 等。
+  // 黑名单匹配前先做归一化视图：剥掉引号/反斜号转义、${var} 与 %var% 展开，再压空白。
+  // 字母拼接类绕过（r\m、r""m、r${x}m 都还原成 rm）、PS 独有引号 r'm' 同样命中。
+  const normalized = command
+    .replace(/["'`\\]/g, "")
+    .replace(/\$\{[^}]*\}/g, "")
+    .replace(/%[^%]*%/g, "")
+    .replace(/\s+/g, " ");
+  // 破坏性命令（软防线：正则仍可被构造绕过，非隔离任务依赖运行环境隔离）。
+  // - del/rm 支持任意 flag 顺序（del /q /s、git -C x clean）；
+  // - find -delete 与 -exec（; 已被禁，剩 + 变体）；
+  // - eval 仅禁首 token（; & | 已禁，eval 只能出现在命令头）。
   const destructive =
-    /(?:\brm\s+(?:-[a-z]*[rf]|--recurs|--forc)|\brd\s+\/s|\brmdir\s+\/s|Remove-Item|\bdel\s+\/s|\bdeltree\b|\bformat\s+|\bfind\s+.*\b-delete\b|\bgit\s+clean\b|\btruncate\b|\bdd\b.*\bof=|\bshred\b)/i;
-  const encodedCommand = /\s-(?:enc|encodedcommand)\b/i;
-  if (destructive.test(command) || encodedCommand.test(command)) {
-    throw new Error("测试命令包含不允许的破坏性命令或编码执行。");
+    /(?:\brm\s+(?:-[a-z]*[rf]|--recurs|--forc)|\brd\s+\/s|\brmdir\s+\/s|Remove-Item|\bdel\b[\s\S]*\/s\b|\bdeltree\b|\bformat\s+|\bfind\b[\s\S]*?(?:-delete|-exec)\b|\bgit\s+(?:-\S+\s+(?:\S+\s+)?)*clean\b|\btruncate\b|\bdd\b[\s\S]*\bof=|\bshred\b|^\s*eval\s)/i;
+  // PowerShell -EncodedCommand 的合法缩写（-e/-en/-ec 在 PS5+ 等价）。
+  const encodedCommand = /\b(?:powershell|pwsh)\b[\s\S]*\s-(?:e|en|ec|enc|encodedcommand)\b/i;
+  if (destructive.test(normalized) || encodedCommand.test(normalized)) {
+    throw new CbxError("E_INVALID_TEST_COMMAND", "测试命令包含不允许的破坏性命令、eval 或编码执行。");
   }
 }
 
@@ -76,9 +94,11 @@ export function validatePermissionMode(
   allowUnsafe = false,
 ): void {
   const allowed = new Set(["default", "acceptEdits", "auto", "dontAsk"]);
-  if (!allowed.has(mode)) throw new Error(`不支持的 permission mode：${mode}`);
+  if (!allowed.has(mode))
+    throw new CbxError("E_INVALID_PERMISSION_MODE", `不支持的 permission mode：${mode}`);
   if (mode === "dontAsk" && !allowUnsafe)
-    throw new Error(
+    throw new CbxError(
+      "E_INVALID_PERMISSION_MODE",
       "dontAsk 需要显式使用 --dangerously-skip-permissions；请在编排器外部确认后再启用。",
     );
 }
@@ -190,6 +210,7 @@ export function normalizeTaskContract(
   if (value.stages !== undefined) {
     if (!Array.isArray(value.stages) || value.stages.length === 0)
       throw new Error("taskContract.stages 必须是非空数组。");
+    const seenStageNames = new Set<string>();
     result.stages = value.stages.map((stage, index) => {
       if (!stage || typeof stage !== "object")
         throw new Error(`taskContract.stages[${index}] 必须是对象。`);
@@ -212,6 +233,13 @@ export function normalizeTaskContract(
         throw new Error(
           `taskContract.stages[${index}].name 必须是非空字符串。`,
         );
+      const stageName = stage.name.trim();
+      // 重名会让依赖图 Set/邻接表静默折叠，校验与执行都失去确定性。
+      if (seenStageNames.has(stageName))
+        throw new Error(
+          `taskContract.stages 存在重复 stage name：${stageName}。`,
+        );
+      seenStageNames.add(stageName);
       if (typeof stage.executor !== "string" || !stage.executor.trim())
         throw new Error(
           `taskContract.stages[${index}].executor 必须是非空字符串。`,

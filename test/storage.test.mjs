@@ -9,6 +9,7 @@ import {
   insertEvent,
   eventsAfterCursor,
   loadPersistedQueue,
+  loadRuntimeExecutorsAllowlist,
   prunePersistedData,
   savePersistedState,
   savePersistedStateCas,
@@ -117,4 +118,49 @@ test("prune 孤儿目录回收：无 SQLite 行 + 超 1h 宽限的目录被清�
   assert.equal(existsSync(liveDir), true, "活跃任务目录应保留");
   assert.equal(existsSync(orphanDir), false, "超宽限孤儿应被回收");
   assert.equal(existsSync(freshDir), true, "宽限期内目录不应回收");
+});
+
+test("loadRuntimeExecutorsAllowlist: 缺失 .cbx.json 视为未配置（回落全局）", async () => {
+  const ws = workspace();
+  assert.deepEqual(await loadRuntimeExecutorsAllowlist(ws), {
+    configured: false,
+    allowlist: undefined,
+  });
+});
+
+test("loadRuntimeExecutorsAllowlist: 无顶层 executors 视为未配置", async () => {
+  const ws = workspace();
+  writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ review: true }), "utf8");
+  assert.deepEqual(await loadRuntimeExecutorsAllowlist(ws), {
+    configured: false,
+    allowlist: undefined,
+  });
+});
+
+test("loadRuntimeExecutorsAllowlist: 配置白名单列表返回 configured=true", async () => {
+  const ws = workspace();
+  writeFileSync(
+    path.join(ws, ".cbx.json"),
+    JSON.stringify({ executors: { envAllowlist: ["GITHUB_TOKEN", "OPENAI_API_KEY"] } }),
+    "utf8",
+  );
+  assert.deepEqual(await loadRuntimeExecutorsAllowlist(ws), {
+    configured: true,
+    allowlist: ["GITHUB_TOKEN", "OPENAI_API_KEY"],
+  });
+});
+
+test("loadRuntimeExecutorsAllowlist: 显式空数组返回 configured=true 空列表（覆盖全局）", async () => {
+  const ws = workspace();
+  writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ executors: { envAllowlist: [] } }), "utf8");
+  assert.deepEqual(await loadRuntimeExecutorsAllowlist(ws), {
+    configured: true,
+    allowlist: [],
+  });
+});
+
+test("loadRuntimeExecutorsAllowlist: 非法白名单类型抛错", async () => {
+  const ws = workspace();
+  writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ executors: { envAllowlist: "TOKEN" } }), "utf8");
+  await assert.rejects(loadRuntimeExecutorsAllowlist(ws));
 });

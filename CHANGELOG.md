@@ -22,11 +22,15 @@
 - 日志体量控制：`agent.log`/`test.log` 磁盘 32MB 上限；`events.ndjson`/`telemetry.ndjson` 10MB 单代轮转；SQLite events 随保留期清理 + 孤儿目录回收（1h 宽限）。
 - Web：CSP（`default-src 'self'; frame-ancestors 'none'`）、SSE 连接数上限 16 + 背压断开、cookie HTTPS 下自动 `Secure`、token 文件 0600、登录限速成功即清零、工作区白名单归一化去重。
 - 依赖守卫覆盖**新建**依赖文件（事件标注「新增」）；worktree 孤儿目录自愈；未跟踪符号链接/junction 不跟随（含 Windows 祖先链检查）。
-- 测试与冒烟：30 个单测（node:test）+ 端到端冒烟 `smoke/e2e.sh`（24 断言，含三插件合体加载）+ 发布物冒烟 `smoke/pack.sh`（tarball 安装 + native binding 验证，内置 npm ≥11.6 install-scripts 门控兜底）；CI workflow。
+- 测试与冒烟：30 个单测（node:test）+ 端到端冒烟 `smoke/e2e.sh`（24 断言，含三插件合体加载）+ 发布物冒烟 `smoke/pack.sh`（tarball 安装 + native binding 验证，内置 npm ≥11.6 install-scripts 门控兜底）；CI workflow（含 `e2e-mock` job，用 `smoke/mock-executor` 假执行器跑通任务生命周期）。
+- **会话内后台任务桥**：`cbx_run`/`cbx_continue`/`/cbx-run`/`/cbx-continue` 在 harness 提供 `ctx.jobs` 时，把委派注册为 `kind: "cbx"` 的原生后台任务——当前会话可实时看到执行进度与最终输出（`job_output`/`job_wait`/`job_kill` 工具可用，完成后有完成通知），`job_kill` 幂等转发为 `cbx_cancel`；桥不可用时静默退化为旧行为（cbx job 照常运行，只是不在会话内显示）。详见 `docs/alignment.md` §4.2 与 `src/jobs-bridge.ts`。
 - 设计文档 `docs/alignment.md`：与 harness 原生服务（jobs/schedule/subagents/settings/事件）的边界与互操作决策。
 
 ### Fixed
 
+- **Web 仪表盘默认工作区改为跟随 harness 工作区注册表**：`/cbx/` 默认显示 `ctx.workspaceRegistry`（harness GUI 中打开过的工作区/会话目录），`?workspace=` 可在其中切换；注册表不可用/为空时回落进程 cwd。此前 Web 层只默认进程 cwd，导致「会话目录里用 `/cbx-run` 创建的 job 在仪表盘上完全不可见，显式选择该目录还被 400 拒绝」。
+- **默认工作区跟随目录委派**（行为变更）：`cbx_*` 工具与 `/cbx-*` 命令在未显式传 `workspace` 时，默认工作区从「harness 进程 cwd」改为「当前 agent 会话的 `header.cwd`（目录委派时设定的工作目录）」，回落 `process.cwd()`。空配置（`workspaces: []`）时委派到哪个目录就在哪个目录跑 cbx；显式配置白名单时仍精确匹配列表，会话 cwd 不在列表内同样拒绝并提示配置位置。
+- **"无提示"诊断补齐**：原本只写进 `events.ndjson`、队列只留笼统错误的根因现在直接可见——`isolated=true` 但工作区不是 Git 仓库时，`cbx_run`/Web 创建接口**创建即报错**并给出修复建议（`git init` 或 `isolated: false`），不再让任务带病入队、崩溃 4 次后才以"worker 反复无法恢复"收场；已入队的任务熔断失败时，队列错误会携带最近一条 `worker_crash` 的真实原因。工作区授权被拒时，报错会列出**当前允许的工作区**并指明配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。
 - **仪表盘在 harness 挂载模式下完全不可用**（根相对路径资源全部 404）。
 - **无校验 PID 树杀**：跨进程清理残留执行器前按平台校验 pid 归属（spawn 时刻比对），pid 复用时跳过 kill 落审计事件；Windows 树杀始终走 `taskkill /T /F`。
 - **卡死 worker 的 run.lock 永久死锁**：进程内死 worker 即刻回收（注册表注销即判死）；事件循环阻塞的僵尸由调度器接管（取消标记 + 终止句柄 + 强制释放本进程锁）。

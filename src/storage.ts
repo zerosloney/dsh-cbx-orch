@@ -89,6 +89,11 @@ export interface RuntimeConfig {
   context?: {
     tokenBudget?: { manager?: number; executor?: number; auditor?: number };
   };
+  /** 工作区级执行器/测试子进程环境变量白名单。显式配置时优先于插件全局
+   *  `executors.envAllowlist`；缺省/未配置时回落到全局（插件 config 或缺省=完整继承）。 */
+  executors?: {
+    envAllowlist?: string[];
+  };
 }
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -167,6 +172,7 @@ export async function loadRuntimeConfig(
     "dependencyGuard",
     "ui",
     "context",
+    "executors",
     "templates",
   ]);
   optionalString(config.testCommand, "testCommand");
@@ -345,6 +351,21 @@ export async function loadRuntimeConfig(
         optionalInteger(budget[role], `context.tokenBudget.${role}`, 100);
     }
   }
+  if (config.executors !== undefined) {
+    const value = object(config.executors, "executors");
+    known(value, "executors", ["envAllowlist"]);
+    if (value.envAllowlist !== undefined) {
+      if (
+        !Array.isArray(value.envAllowlist) ||
+        value.envAllowlist.some(
+          (item) => typeof item !== "string" || !item.trim(),
+        )
+      )
+        throw new Error(
+          "executors.envAllowlist 必须是非空字符串数组（可留空数组=显式继承宿主 env）。",
+        );
+    }
+  }
   if (config.templates !== undefined) {
     // 任务模板：task 必填非空字符串；可选字段类型校验；未知模板键拒绝（防拼写错误静默失效）。
     const templates = object(config.templates, "templates");
@@ -366,6 +387,48 @@ export async function loadRuntimeConfig(
     }
   }
   return config as RuntimeConfig;
+}
+
+/**
+ * 读取某工作区 `.cbx.json` 的工作区级执行器环境白名单 `executors.envAllowlist`。
+ *
+ * 返回语义（三值，供上层区分"覆盖"与"回落"）：
+ *  - `{ configured: false, allowlist: undefined }`：`.cbx.json` 缺失或没有顶层 `executors`
+ *    对象 → 上层应回落到插件全局白名单（或缺省=完整继承宿主 env）。
+ *  - `{ configured: true, allowlist: [...] }`：工作区显式配置了白名单（可含空数组，
+ *    空数组 = 显式"只继承系统变量，过滤全部凭据"，或按上层语义处理）。
+ * 字段类型/格式已在 `loadRuntimeConfig` 校验，此 helper 做严格二次校验以防半损坏文件。
+ */
+export async function loadRuntimeExecutorsAllowlist(
+  workspaceInput: string,
+): Promise<{ configured: boolean; allowlist: string[] | undefined }> {
+  const workspace = path.resolve(workspaceInput);
+  const file = path.join(workspace, ".cbx.json");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await readFile(file, "utf8"));
+  } catch (error) {
+    if (isMissing(error)) return { configured: false, allowlist: undefined };
+    throw error;
+  }
+  const config = object(parsed, ".cbx.json");
+  // 加载路径严格校验（与 loadRuntimeConfig 同规则），确保配置不因新字段漂移静默失效。
+  if (config.executors === undefined)
+    return { configured: false, allowlist: undefined };
+  const executors = object(config.executors, "executors");
+  known(executors, "executors", ["envAllowlist"]);
+  if (executors.envAllowlist === undefined)
+    return { configured: true, allowlist: [] };
+  if (
+    !Array.isArray(executors.envAllowlist) ||
+    executors.envAllowlist.some(
+      (item) => typeof item !== "string" || !item.trim(),
+    )
+  )
+    throw new Error(
+      "executors.envAllowlist 必须是非空字符串数组（可留空数组=显式继承宿主 env）。",
+    );
+  return { configured: true, allowlist: [...executors.envAllowlist] };
 }
 
 // 默认敏感字段名：governance.redactFields 未配置时仍对常见密钥字段脱敏，
@@ -1429,6 +1492,26 @@ function peekQueueBlob(
   }
 }
 
+/**
+ * 事件 SQLite 镜像写入失败计数（按 workspace 聚合，进程内存态）。镜像失败时 SSE 回放
+ * （读 SQLite events 表）会与该 job 的审计轨迹（events.ndjson）漂移——这是主动接受的
+ * 降级，但必须可见。observability.publishEvent 在镜像 catch 中调用本函数；persistedMetrics
+ * 读取并暴露给 health / 仪表盘。定义在 storage 而非 observability，避免循环依赖。
+ */
+const eventMirrorFailures = new Map<string, number>();
+/** 有界：防止长期运行/大量工作区时该诊断 Map 无限增长。超过上限丢弃最旧条目。 */
+const EVENT_MIRROR_FAILURES_MAX = 64;
+
+/** 累计一次某 workspace 的事件镜像失败（幂等计数）。 */
+export function recordEventMirrorFailure(workspace: string): void {
+  eventMirrorFailures.set(workspace, (eventMirrorFailures.get(workspace) ?? 0) + 1);
+  // intentional-simple: 线性淘汰最旧条目，条目数远小于 64 时无感知；需按 LRU 淘汰时再升级。
+  if (eventMirrorFailures.size > EVENT_MIRROR_FAILURES_MAX) {
+    const oldest = eventMirrorFailures.keys().next().value as string | undefined;
+    if (oldest !== undefined) eventMirrorFailures.delete(oldest);
+  }
+}
+
 export async function persistedMetrics(workspace: string): Promise<{
   jobsByStatus: Record<string, number>;
   queueDepth: number;
@@ -1436,6 +1519,9 @@ export async function persistedMetrics(workspace: string): Promise<{
   retryingJobs: number;
   deliveryFailures: number;
   pendingDeliveries: number;
+  /** 事件 SQLite 镜像写入失败累计次数（本进程内存态）；>0 说明 SSE 回放可能
+   *  与 events.ndjson 审计轨迹漂移。跨进程/重启后归零，仅作近期漂移信号。 */
+  eventMirrorFailures: number;
 }> {
   const db = await database(workspace);
   const rows = db.prepare("SELECT state_json FROM jobs").all() as Array<{
@@ -1479,6 +1565,7 @@ export async function persistedMetrics(workspace: string): Promise<{
         }
       ).count,
     ),
+    eventMirrorFailures: eventMirrorFailures.get(workspace) ?? 0,
   };
 }
 

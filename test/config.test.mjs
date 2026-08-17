@@ -13,6 +13,7 @@ test("CbxOrchestrator.Config: 空配置使用部署默认值", () => {
     review: true,
     isolated: true,
     workspaces: [],
+    executors: { envAllowlist: [] },
   });
 });
 
@@ -22,6 +23,7 @@ test("CbxOrchestrator.Config: 部分配置补齐默认值", () => {
     review: false,
     isolated: true,
     workspaces: [],
+    executors: { envAllowlist: [] },
   });
 });
 
@@ -35,6 +37,7 @@ test("CbxOrchestrator.Config: 完整配置保持覆盖语义", () => {
     review: false,
     isolated: false,
     workspaces: [],
+    executors: { envAllowlist: [] },
   });
 });
 
@@ -45,6 +48,17 @@ test("CbxOrchestrator.Config: 显式 workspace 列表保持覆盖语义", () => 
     review: true,
     isolated: true,
     workspaces,
+    executors: { envAllowlist: [] },
+  });
+});
+
+test("CbxOrchestrator.Config: executors.envAllowlist 覆盖各自定义", () => {
+  assert.deepEqual(CbxOrchestrator.Config({ executors: { envAllowlist: ["MY_TOKEN"] } }), {
+    executor: "codebuddy",
+    review: true,
+    isolated: true,
+    workspaces: [],
+    executors: { envAllowlist: ["MY_TOKEN"] },
   });
 });
 

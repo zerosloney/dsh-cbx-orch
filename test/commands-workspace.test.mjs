@@ -97,3 +97,44 @@ test("core scheduler follows the allowed canonical workspace and commands reject
     assert.equal(existsSync(cwdCbx), false, "测试不得在 cwd 留下 .cbx");
   }
 });
+
+test("命令默认工作区跟随委派的 agent 会话 cwd（header.cwd），不回落到进程 cwd", async (t) => {
+  const cwdCbx = path.join(process.cwd(), ".cbx");
+  if (existsSync(cwdCbx)) {
+    t.skip("当前 cwd 已有 .cbx，跳过避免触碰用户数据");
+    return;
+  }
+
+  // 空配置：显式白名单不启用，命令默认工作区 = 会话 header.cwd，回落 process.cwd()。
+  const harness = fakeHarness();
+  try {
+    new CbxOrchestrator(harness.context, {
+      executor: "codebuddy",
+      review: true,
+      isolated: true,
+      workspaces: [],
+    });
+
+    const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-command-session-"));
+    const command = harness.commands.get("cbx-list");
+    assert.ok(command, "应捕获 cbx-list 命令");
+    // 委派目录的会话上下文：命令应在该目录解析工作区，而非进程 cwd。
+    const result = await command.handler({
+      rawInput: "",
+      agent: { session: { header: { cwd: delegated } } },
+    });
+    assert.equal(result.kind, "success", "委派目录应放行并返回列表");
+    // listJobs 只读数据库会在解析出的工作区落盘 state.sqlite——若默认工作区正确
+    // 跟随 header.cwd，.cbx 应出现在委派目录而非进程 cwd。
+    assert.equal(
+      existsSync(path.join(delegated, ".cbx", "state.sqlite")),
+      true,
+      "命令应在委派目录解析工作区（.cbx 落在委派目录）",
+    );
+    assert.equal(existsSync(cwdCbx), false, "命令不应在进程 cwd 创建 .cbx");
+    await rm(delegated, { recursive: true, force: true });
+  } finally {
+    await harness.dispose();
+    assert.equal(existsSync(cwdCbx), false, "测试不得在 cwd 留下 .cbx");
+  }
+});

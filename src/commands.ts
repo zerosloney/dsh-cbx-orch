@@ -4,7 +4,8 @@ import { createJob } from "./jobs.js";
 import { listQueue, pauseQueue, resumeQueue } from "./queue-api.js";
 import { listJobs, readArtifact } from "./artifacts.js";
 import { loadConfig, loadState, mergeConfig } from "./state.js";
-import type { CbxDefaults } from "./tools.js";
+import { bridgeCbxJob } from "./jobs-bridge.js";
+import type { CbxDefaults, SessionCwdContext } from "./tools.js";
 import type { CommandResult } from "@deepseek-ai/dsh-commands";
 import { WorkspacePolicy } from "./workspace-policy.js";
 
@@ -26,8 +27,12 @@ export function registerCbxCommands(service: CbxCommandContext): void {
   const commands = service.ctx.commands;
   const defaults = service.defaults;
   const workspacePolicy = defaults.workspacePolicy ?? new WorkspacePolicy();
-  const resolveWorkspace = (): Promise<string> =>
-    workspacePolicy.resolveWorkspace(process.cwd());
+  // 默认工作区 = 当前 agent 会话的工作目录（目录委派时设定），回落 process.cwd()。
+  const resolveWorkspace = (invocation?: SessionCwdContext): Promise<string> =>
+    workspacePolicy.resolveWorkspace(
+      undefined,
+      invocation?.agent?.session?.header?.cwd,
+    );
 
   commands.register({
     name: "cbx-run",
@@ -37,7 +42,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const task = invocation.rawInput.trim();
       if (!task) return err("Usage: /cbx-run <task>");
       try {
-        const ws = await resolveWorkspace();
+        const ws = await resolveWorkspace(invocation);
         const config = await loadConfig(ws);
         const merged = mergeConfig(config, {
           review: defaults.review,
@@ -66,7 +71,18 @@ export function registerCbxCommands(service: CbxCommandContext): void {
           dependencyGuard: merged.dependencyGuard,
         });
         await startBackground(ws, created.jobId, "", 0);
-        return ok(`job ${created.jobId} queued (executor ${merged.executor ?? defaults.executor ?? "codebuddy"}). Use /cbx-status ${created.jobId} to track it.`);
+        // 会话内可见：注册 harness 原生后台任务，让当前会话能看到执行进度与最终输出
+        // （job_output / job_wait / job_kill；tool-jobs 完成通知会投递回会话）。
+        const sessionJobId = bridgeCbxJob(service.ctx, {
+          workspace: ws,
+          jobId: created.jobId,
+          task,
+          agent: invocation.agent,
+        });
+        const sessionHint = sessionJobId !== undefined
+          ? ` session job ${sessionJobId}（会话内跟踪：job_output / job_kill）`
+          : "";
+        return ok(`job ${created.jobId} queued (executor ${merged.executor ?? defaults.executor ?? "codebuddy"}). Use /cbx-status ${created.jobId} to track it.${sessionHint}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }
@@ -81,7 +97,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-status <job_id>");
       try {
-        const state = await loadState(await resolveWorkspace(), jobId);
+        const state = await loadState(await resolveWorkspace(invocation), jobId);
         return ok(`[${jobId}] ${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.stage ? ` / stage ${state.stage}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
@@ -98,8 +114,18 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       if (!jobId) return err("Usage: /cbx-continue <job_id> [message]");
       const message = rest.join(" ");
       try {
-        await startBackground(await resolveWorkspace(), jobId, message, 0);
-        return ok(`job ${jobId} re-queued for continuation.`);
+        const ws = await resolveWorkspace(invocation);
+        await startBackground(ws, jobId, message, 0);
+        const sessionJobId = bridgeCbxJob(service.ctx, {
+          workspace: ws,
+          jobId,
+          task: message || "continue",
+          agent: invocation.agent,
+        });
+        const sessionHint = sessionJobId !== undefined
+          ? ` session job ${sessionJobId}（会话内跟踪：job_output / job_kill）`
+          : "";
+        return ok(`job ${jobId} re-queued for continuation.${sessionHint}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }
@@ -114,7 +140,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-cancel <job_id>");
       try {
-        const state = await cancelJob(await resolveWorkspace(), jobId);
+        const state = await cancelJob(await resolveWorkspace(invocation), jobId);
         return ok(`[${jobId}] ${state.status}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
@@ -125,9 +151,9 @@ export function registerCbxCommands(service: CbxCommandContext): void {
   commands.register({
     name: "cbx-list",
     description: "List cbx jobs in the current workspace.",
-    async handler() {
+    async handler(invocation) {
       try {
-        const jobs = await listJobs(await resolveWorkspace());
+        const jobs = await listJobs(await resolveWorkspace(invocation));
         if (jobs.length === 0) return ok("no cbx jobs in this workspace.");
         const lines = jobs.map((job) =>
           `[${job.jobId}] ${job.status}${job.phase ? ` / ${job.phase}` : ""}${job.createdAt ? ` created ${job.createdAt}` : ""}`,
@@ -146,7 +172,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
     async handler(invocation) {
       const action = invocation.rawInput.trim();
       try {
-        const ws = await resolveWorkspace();
+        const ws = await resolveWorkspace(invocation);
         if (action === "pause") return ok(JSON.stringify(await pauseQueue(ws)));
         if (action === "resume") return ok(JSON.stringify(await resumeQueue(ws)));
         if (action === "") return ok(JSON.stringify(await listQueue(ws)));
@@ -166,7 +192,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-result <job_id>");
       try {
-        return ok(await readArtifact(await resolveWorkspace(), jobId, "result.json"));
+        return ok(await readArtifact(await resolveWorkspace(invocation), jobId, "result.json"));
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }

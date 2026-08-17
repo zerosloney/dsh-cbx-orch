@@ -22,6 +22,7 @@ import {
   snapshotGitBaseline,
   gitDirtyFingerprintTracked,
   gitRoot,
+  requireGitRoot,
 } from "./git-ops.js";
 import { DEFAULT_TOKEN_BUDGET, type ContextBudget } from "./context-pack.js";
 import { APP_VERSION } from "./version.js";
@@ -108,6 +109,12 @@ export async function createJob(options: {
       "cbx 提示：autoCommit=true 已隐含开启 isolated=true（提交到 worktree，避免污染主工作区）。",
     );
     options.isolated = true;
+  }
+  // isolated 任务要求工作区位于 Git 仓库：创建时即校验并给出修复途径，而不是
+  // 让任务带病入队、worker 崩溃 4 次熔断后只留一句笼统的"worker 反复无法恢复"，
+  // 把真实根因（不是 Git 仓库）淹没在 events.ndjson 里。
+  if (options.isolated) {
+    await requireGitRoot(workspace);
   }
   // 测试命令黑名单是软防线（正则可被变体绕过）。非隔离时强警告：cbx 不保证命令安全，应运行在受控环境。
   if (options.testCommand && !options.isolated) {

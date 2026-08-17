@@ -1,7 +1,7 @@
 import { Context, Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { setProcessSpawnProvider } from "./process-runner.js";
-import { createSubprocessProvider } from "./subprocess-adapter.js";
+import { createSubprocessProvider, setExecutorEnvAllowlist } from "./subprocess-adapter.js";
 import { closeDatabaseConnections } from "./storage.js";
 import { disposeObservability } from "./observability.js";
 import { registerCbxTools, type CbxDefaults } from "./tools.js";
@@ -26,6 +26,12 @@ export interface Config {
   isolated?: boolean;
   /** Explicitly authorized workspace directories; an empty list means cwd only. */
   workspaces?: string[];
+  /** Opt-in host env allowlist for executor/test child processes. When set (non-empty),
+   *  only these vars (plus essential system vars) reach the child; when empty/missing
+   *  the host env is inherited as before (intentional: coding CLIs need API credentials). */
+  executors?: {
+    envAllowlist?: string[];
+  };
 }
 
 /**
@@ -41,6 +47,9 @@ export default class CbxOrchestrator extends Service {
     review: z.boolean().default(true),
     isolated: z.boolean().default(true),
     workspaces: z.array(z.string()).default([]),
+    executors: z.object({
+      envAllowlist: z.array(z.string()).default([]),
+    }),
   });
 
   constructor(ctx: Context, config: Config) {
@@ -56,6 +65,11 @@ export default class CbxOrchestrator extends Service {
     // subprocess seam (tree-scoped termination, cancel integration).
     // disposer 带属主校验：HMR 下旧实例卸载只会撤掉自己的 provider。
     const disposeProvider = setProcessSpawnProvider(createSubprocessProvider(ctx.subprocess));
+    // executor 子进程环境变量白名单（可选，opt-in 硬化）。空数组 = 保持完整继承。
+    const envAllowlist = config.executors?.envAllowlist;
+    const disposeEnvAllowlist = setExecutorEnvAllowlist(
+      envAllowlist && envAllowlist.length > 0 ? envAllowlist : undefined,
+    );
     registerCbxTools(ctx, defaults);
     registerCbxCommands({ ctx, defaults });
     let disposeSchedulers: (() => Promise<void>) | undefined;
@@ -70,9 +84,13 @@ export default class CbxOrchestrator extends Service {
           disposeProvider();
         } finally {
           try {
-            await closeDatabaseConnections();
+            disposeEnvAllowlist();
           } finally {
-            disposeObservability();
+            try {
+              await closeDatabaseConnections();
+            } finally {
+              disposeObservability();
+            }
           }
         }
       }

@@ -17,6 +17,15 @@ export type JobStatus =
   | "done"
   | "cancelled";
 
+/** 终态判定：任务不再自动推进的状态（needs_fix 可经 cbx_continue 续跑，故不属于终态）。
+ *  timeline 的 finishedAt 与"任务是否仍在推进"以此为准。 */
+export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  "done",
+  "failed",
+  "review_failed",
+  "cancelled",
+]);
+
 export type CbxConfig = RuntimeConfig;
 
 export interface JobContext {

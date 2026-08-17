@@ -79,6 +79,10 @@ dsh --profile web
 
 > 工具参数使用 **snake_case**（如 `timeout_ms` / `max_retries` / `max_turns`）；`.cbx.json` 配置键与 Web/命令层使用 **camelCase**（`timeoutMs` / `maxRetries` / `maxTurns`）。二者仅命名风格不同，语义一一对应。
 >
+> **默认工作区**：各工具/命令的 `workspace` 参数可省略，缺省 = 当前 agent 会话的工作目录（目录委派时设定，见「行为语义」）；显式传参必须命中工作区白名单。
+>
+> **会话内后台任务桥**：`cbx_run` / `cbx_continue` / `/cbx-run` / `/cbx-continue` 在 harness 提供 `ctx.jobs`（dsh-base 的 dsh-jobs-local + agent preset 的 dsh-tool-jobs）时，把委派注册为 `kind: "cbx"` 的原生后台任务——当前会话可实时看到执行进度与最终输出（`job_output` / `job_wait` / `job_kill` 可用，完成后有完成通知），`job_kill` 幂等转发为 `cbx_cancel`。桥不可用时（无 agent 上下文 / 无 jobs 服务 / 并发上限）静默退化为旧行为：cbx job 照常运行，只是不在会话内显示。返回消息中的 `session job <id>` 提示即此桥已启用。
+>
 > **输出上限**：`cbx_result` / `cbx_artifact` 的文本输出截断到 64K 字符（保头尾并标注总长）；`cbx_status` / `cbx_cancel` / `cbx_approve` 等返回 state 的工具对超长字符串字段做深截断（8K）。完整内容仍在磁盘工件里，需要时用 `cbx_logs` 增量读取。
 
 ## 斜杠命令（`ctx.commands`）
@@ -110,26 +114,42 @@ dsh --profile web
         executor: codebuddy   # codebuddy / opencode / omp / cline / qwen / 插件路径
         review: true          # 测试通过后跑独立审查
         isolated: true        # git worktree 隔离执行
-        workspaces: []        # cbx 工具工作区白名单；空/缺省仅允许 canonical cwd
+        workspaces: []        # cbx 工具工作区白名单；空/缺省 = 默认工作区跟随目录委派（agent 会话 cwd），显式列表仅精确放行
+        executors:
+          envAllowlist: []    # 可选硬化：非空时执行器/测试子进程只继承这些环境变量
+                              #（外加 PATH/HOME 等不可缺系统变量）；空/缺省 = 完整继承宿主 env
     - id: cbx-orch-web
       name: 'dsh-cbx-orch/web'
       config:
         web:
           token: ''           # 非空 = 使用配置值；空/缺省 = 读取或生成 <首个工作区>/.cbx/web.token（生成时 0600），无免鉴权模式
-          workspaces: []      # ?workspace= 白名单；空 = 当前目录
+          workspaces: []      # ?workspace= 白名单；空 = 跟随 harness 工作区注册表（会话目录），注册表不可用/为空时回落进程 cwd
 ```
 
-core 的 `workspaces` 是 `cbx_*` 工具的工作区白名单：空或缺省时只允许经 canonical 化后的当前目录；显式列表只授权其中精确的 workspace。路径通过 `realpath` canonicalize（Windows 下折叠路径大小写），越权、缺失路径或非目录都会拒绝。`cbx_list_workspaces` 只列出该白名单中的 workspace，不再扫描任意 root 或子目录。
+> **`executors.envAllowlist`（可选硬化，支持工作区级覆盖）**：默认情况下，执行器/测试/审查子进程**完整继承宿主进程的 `process.env`**——这是 cbx 的有意设计：编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境里的 API 凭据才能工作，过滤会破坏认证。代价是"受损/不可信执行器能读取宿主全部凭据"。若你的执行器来源可受控但你想收窄暴露面，可设置白名单——此时只把这些变量加上 `PATH/HOME/TEMP` 等不可缺系统变量传给子进程，其余一律剔除。空/缺省即恢复完整继承，完全向后兼容。
+>
+> **配置优先级（自上而下）**：
+> 1. **工作区级** `.cbx.json` 顶层 `executors.envAllowlist`（最具体，优先）；
+> 2. **全局** 插件 config 的 `executors.envAllowlist`（缺省回落）；
+> 3. 均未配置 = 完整继承宿主 env。
+>
+> 工作区一旦显式配置即覆盖全局（工作区配置 `envAllowlist: []` 表示"显式只继承系统变量"，同样覆盖全局）；工作区未配置才回落到全局。工作区级配置经任务工作区解析；非任务调用按 `cwd` 向上定位最近含 `.cbx/` 的工作区，**隔离 worktree** 内还会按 `.cbx-worktrees` 布局反解到主工作区（`.<repo>.cbx-worktrees/<jobId>` → 主工作区）。对执行器/测试/审查/Git 全部子进程生效，文件修改最多 5s 后生效（短缓存）。
+
+core 的 `workspaces` 是 `cbx_*` 工具的工作区白名单：**空或缺省 = 默认工作区跟随目录委派**——无显式 `workspace` 参数时，以当前 agent 会话的工作目录（`session.header.cwd`，即目录委派时设定的目录）为默认工作区，回落 harness 进程 cwd；显式列表只授权其中精确的 workspace。路径通过 `realpath` canonicalize（Windows 下折叠路径大小写），越权、缺失路径或非目录都会拒绝。`cbx_list_workspaces` 只列出该白名单中的 workspace，不再扫描任意 root 或子目录。
 
 Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlist，但使用相同的 `WorkspacePolicy` 语义（canonicalization、越权/不存在/非目录拒绝）。core 的 `workspaces` 与 Web 的 `web.workspaces` 是两个独立配置，不会自动共享配置值。
 
+**Web 空配置的默认工作区来源（v0.1 起）**：`web.workspaces` 为空/缺省时，Web 层不再盲回落 `process.cwd()`，而是跟随 **harness 工作区注册表**（`ctx.workspaceRegistry`，即用户在 harness GUI 中实际打开过的目录；DMS 会话目录 `sessions/--<path>--` 由 harness 维护）。这保证了「在某个工作区会话里跑 `/cbx-run` 创建的任务，能在同一目录的仪表盘上看到」——Web 层本身没有会话上下文，注册表是 harness 侧对「用户工作区」的权威来源。注册表不可用或为空时（例如无 harness workspace 服务的瘦身 profile）回落进程 cwd，保持旧行为。
+
 ### 工作区配置（`.cbx.json`，与 cbx-orch 相同）
 
-`executor`、`testCommand`、`review`、`isolated`、`timeoutMs`、`maxRetries`、`maxTurns`、`maxConcurrent`、`reviewRules`、`approval`、`git`、`reviewGate`（`enabled`、`failOpen`）、`notifications`（webhook/OTLP outbox）、`governance`（retention/redact）、`telemetry`、`ui.token` 等，见 cbx-orch 文档。
+`executor`、`testCommand`、`review`、`isolated`、`timeoutMs`、`maxRetries`、`maxTurns`、`maxConcurrent`、`reviewRules`、`approval`、`git`、`reviewGate`（`enabled`、`failOpen`）、`notifications`（webhook/OTLP outbox）、`governance`（retention/redact）、`telemetry`、`ui.token`、`executors`（`envAllowlist`，工作区级环境白名单，见「配置」节）等，见 cbx-orch 文档。
 
 ## 行为语义
 
 - **重试预算**：`maxRetries` = 首次执行失败后允许的重试次数，总执行次数 = 1 + maxRetries（`maxRetries: 1` 即 2 次执行 + 1 次修复重试）。每个 stage 的预算独立持久化，崩溃重入不重置；用户 resolve Human Gate 或显式 retry 时归零。
+- **默认工作区跟随目录委派**：`cbx_*` 工具与 `/cbx-*` 命令在未显式传 `workspace` 时，默认工作区 = 当前 agent 会话的工作目录（`session.header.cwd`，即目录委派时设定的目录），无 agent 上下文时回落 `process.cwd()`。空配置（`workspaces: []`）时委派到哪个目录就在哪个目录跑；显式白名单仍精确匹配，会话 cwd 不在列表内同样拒绝并提示配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。调度器按工作区动态拉起（入队即 `ensureScheduler`），委派目录无需预先配置即可自动接管队列。
+- **创建期前提校验（省去无谓的崩溃循环）**：`isolated=true` 但工作区不是 Git 仓库时，`cbx_run`/Web 创建接口**创建即报错**，错误信息直接给出修复建议（`git init` 或 `isolated: false`）。已入队的此类任务崩溃熔断时，队列错误的 `最后崩溃原因` 会带出真实的 `worker_crash` 根因，而不是笼统的"worker 反复无法恢复"。工作区授权被拒时，错误会列出当前允许的工作区与配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。
 - **取消语义**：取消先落盘标记再终止子进程；正在收口的 done 遇到取消标记会改按取消收口（state 与队列条目保持一致）。跨进程清理残留执行器时先校验 pid 归属（记录 spawn 时刻，按平台比对进程实际启动时间），pid 已被系统复用时跳过 kill 并落审计事件——宁可留待人工处理，不误杀无关进程树。
 - **审批流**：before_run 审批通过即原子重入队并立即 dispatch；before_complete 审批在 commit 前后各核一次取消标记，证据哈希与 worktree 快照不符则拒绝完成（`completion_evidence_stale`）。
 - **基线漂移（v2 指纹）**：脏指纹只统计已跟踪文件的状态与 diff——工作区里的未跟踪 scratch 文件、其他任务留下的产物不再触发误报。旧任务仍按 v1 比对，显式 `refresh_baseline` 时升级到 v2。
@@ -137,6 +157,7 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 - **worktree 自愈**：`git worktree add` 撞到上次崩溃残留的孤儿目录时自动 prune + 清除 + 重试一次，不再永久失败。
 - **符号链接**：未跟踪的符号链接/junction 不被跟随——diff 与审计材料记录链接本身而非目标内容，工作区之外的文件不会被吸进任务产物。
 - **skipReview**：契约中全部 stage 声明 `skipReview` 时，完成门不再要求 `review.md` 与 `VERDICT: PASS`（job 级 `review: true` 与 stage 级跳过不再互锁死）。
+- **执行器 CLI 版本耦合**：内置适配器（`src/executors/builtin.ts`）把 `(prompt, permissionMode, maxTurns)` 翻译成各 CLI 的具体参数（codebuddy 的 `--max-turns`/`--permission-mode`、opencode 的 `--auto`、qwen 的 `--yolo`/`--max-session-turns` 等）。这些参数可能随 CLI 版本漂移；升级外部 CLI 后请回归冒烟（`npm run smoke:e2e` 或 mock 版）。版本由工作区 `.cbx.json` 的 `executor`/`reviewExecutor` 或工具参数选择。
 
 ## 数据布局
 
@@ -145,15 +166,18 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 - `agent.log` / `test.log`：内存采集尾部 4MB，磁盘落盘上限 32MB（超限留标记停止写入）。
 - `events.ndjson`（job 级与工作区级）/ `telemetry.ndjson`：超 10MB 滚动单代 `.1`。
 - `active.pid`：JSON 记录 `{"pid", "startedAt"}`，供取消/重试路径做 pid 归属校验。
+- `agent.log.cursor`：`cbx_logs`/Web 增量读时记录上次协商的字节游标，agent.log 被手动截断/重建时自动从尾部重对齐（见 `readAgentLogIncremental`）。
+
+**事件一致性说明**：事件同时写 `events.ndjson`（审计轨迹，权威）与 SQLite `events` 表（SSE 回放/查询源）。SQLite 镜像写入失败时不让事件发布失败、也不重试——它会与 ndjson 暂时漂移，属主动降级。镜像失败累计计数经 `/cbx/api/metrics`（`healthz` 只读指标）的 `eventMirrorFailures` 暴露（进程内存态，重启归零），>0 时说明 SSE 回放可能与此 job 的 ndjson 不一致，值得排查。
 
 ## 安全说明
 
-- **环境变量继承**：执行器/测试命令的子进程完整继承宿主的 `process.env`（与终端直接运行一致）。这是有意设计——编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境中的 API 凭据才能工作，因此不做变量过滤。
+- **环境变量继承**：执行器/测试命令的子进程完整继承宿主的 `process.env`（与终端直接运行一致）。这是有意设计——编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境中的 API 凭据才能工作，因此不做变量过滤。可选硬化：插件 config 的 `executors.envAllowlist` 可收窄（见「配置」节）；日志落盘边界仍统一脱敏。
 - **落盘脱敏**：`agent.log` / `test.log` / `events.ndjson` 在写入边界对常见凭据形状（OpenAI/GitHub/Slack/Google/AWS key、私钥、Bearer token）做正则脱敏（流式跨 chunk 边界保留 16 字节重叠，防 key 被切断漏网）；事件流与遥测 span 中的长字段同时做长度截断，敏感键名（token/password/secret/…）整体替换；`plugin-request.json`（内嵌完整 prompt）在插件宿主读取后立即删除，不留持久副本。
 - **测试命令防线**：黑名单在匹配前先归一化（剥引号/反斜杠/`${var}`/`%var%`），拦截 `r\m`、`r""m` 一类拼接绕过；覆盖 `rm -rf`/`del /s`/`find -exec`/`git clean`/`truncate`/`dd`/`shred`/首 token `eval`/PowerShell 全部 `-EncodedCommand` 缩写；创建时与**执行时各验一次**（context.json 是执行器可写文件）。仍属软防线——非隔离任务请运行在受控环境，敏感场景建议 `isolated: true`。
 - **进程终止安全**：跨进程 kill 前按 pid 归属校验（见「行为语义」）；Windows 树杀始终走 `taskkill /T /F`（不用会漏掉孙进程的 `child.kill`）；abort 后设硬死线，杀不死的子进程不再让任务永久挂起。
 - **路径安全**：jobId 全链路校验（字符集白名单 + 拒绝 `..`/Windows 设备名/尾点段），目录删除与 context 写入共用同一道门；未跟踪符号链接不被跟随。
-- **Web 鉴权**：`web.token` 非空时直接使用配置值；为空或缺省时，插件先从首个配置工作区（未配置时为当前目录）的 `.cbx/web.token` 读取非空值，文件不存在或为空则生成随机 token，并以 `0600` 权限写入该文件，后续未配置显式 token 的启动会复用它。未配置显式 token 时启动日志只打印 token 文件路径，不打印 token 值；浏览器提示从该文件或日志路径取得 token。**token 无法解析时拒绝挂载 Web 路由（fail-closed）**，绝不退化成无鉴权面。浏览器端首次请求数据端点收到 401，页面弹出 token 输入框，经 `POST /cbx/auth` 换取 HttpOnly cookie（SameSite=Strict，HTTPS 下加 Secure；token 不出现在页面源码或 URL）。`/healthz` 与 `/api/metrics` 均为只读，但只有 `/healthz` 公开，`/api/metrics` 仍需鉴权（均不触发保留期清理）。仪表盘带 CSP；SSE 有连接数与背压上限。
+- **Web 鉴权**：`web.token` 非空时直接使用配置值；为空或缺省时，插件先从首个生效工作区（显式列表 / harness 注册表派生的第一项，见「配置」节）的 `.cbx/web.token` 读取非空值，文件不存在或为空则生成随机 token，并以 `0600` 权限写入该文件，后续未配置显式 token 的启动会复用它。未配置显式 token 时启动日志只打印 token 文件路径，不打印 token 值；浏览器提示从该文件或日志路径取得 token。**token 无法解析时拒绝挂载 Web 路由（fail-closed）**，绝不退化成无鉴权面。浏览器端首次请求数据端点收到 401，页面弹出 token 输入框，经 `POST /cbx/auth` 换取 HttpOnly cookie（SameSite=Strict，HTTPS 下加 Secure；token 不出现在页面源码或 URL）。`/healthz` 与 `/api/metrics` 均为只读，但只有 `/healthz` 公开，`/api/metrics` 仍需鉴权（均不触发保留期清理）。仪表盘带 CSP；SSE 有连接数与背压上限。
 - **review stop-gate**：审查执行异常/超时/非零退出/无法解析 VERDICT 时默认 **fail-closed 拦截**（门禁的意义就是拦住行为异常的审查代理）；基础设施错误（如配置读取失败）仍放行以维持 hook 契约。需要旧行为配置 `reviewGate.failOpen: true`。
 - **执行器插件**：`executor` 指向工作区内的插件路径时，默认仅告警不强制白名单；生产环境请配置 `plugins.enforce=true` 与 `allowPaths`/`allowSha256`（路径/哈希白名单校验后才加载）。
 
@@ -170,6 +194,14 @@ npm run smoke:e2e    # 端到端冒烟：起 dsh profile → 静态面/鉴权/SS
 ### 冒烟测试
 
 本地 profile（`$DSH_HOME/profiles/cbx`）已配置为 `[dsh-base, dsh-web-app, dsh-cbx-orch]`，可 `dsh --profile cbx --port 3180` 启动后访问 `/cbx/`。
+
+无真实编码 CLI 时也可验证全生命周期（create→run→test→done + 取消树级终止）：
+
+```sh
+CBX_SMOKE_MOCK=1 bash smoke/e2e.sh
+```
+
+`smoke/mock-executor/codebuddy.mjs` 是一个 npm-发布之外的冒烟假执行器，经 `CBX_CODEBUDDY` 注入 `findExecutable`，不依赖 PATH。CI 的 `e2e-mock` job 即用它跑通任务生命周期断言。
 
 ## 许可
 

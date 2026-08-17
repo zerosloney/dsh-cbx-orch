@@ -108,3 +108,70 @@ test("缺失或非目录 workspace 在 health 下游前被拒绝", async () => {
     await rm(allowed, { recursive: true, force: true });
   }
 });
+
+test("空配置时默认工作区跟随 tool 调用的 agent 会话 cwd（目录委派语义）", async (t) => {
+  const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-session-"));
+  const unauthorized = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-session-"));
+  try {
+    // 空 allowlist：无显式 workspace 参数时，以 exec.agent.session.header.cwd 为默认工作区。
+    const tools = registeredTools(); // WorkspacePolicy() → 空配置
+    const lossless = (value) => JSON.parse(JSON.stringify(value));
+    const execWith = (cwd) => ({
+      agent: { session: { header: { cwd } } },
+      signal: new AbortController().signal,
+    });
+    // cbx_health 在委派目录上执行成功（不落盘 .cbx 之外的痕迹；health 只读）。
+    const result = await tools.get("cbx_health").execute({}, execWith(delegated));
+    assert.equal(lossless(result).status, "ok");
+    // 另一个委派目录同样放行：空配置不缓存首个调用方，随调用上下文动态解析。
+    const second = await tools.get("cbx_health").execute({}, execWith(unauthorized));
+    assert.equal(lossless(second).status, "ok");
+    // 显式传入的 workspace 参数仍受约束：与上下文目录不同则拒绝。
+    const other = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-session-"));
+    try {
+      await assert.rejects(
+        () => tools.get("cbx_health").execute({ workspace: other }, execWith(delegated)),
+        (error) => isCbxError(error, "E_INVALID_WORKSPACE"),
+      );
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
+    // 无 agent 上下文（exec 缺省）回落 process.cwd()。
+    const cwdResult = await tools.get("cbx_health").execute({});
+    assert.equal(lossless(cwdResult).status, "ok");
+  } finally {
+    await closeDatabaseConnections();
+    await Promise.all([
+      rm(delegated, { recursive: true, force: true }),
+      rm(unauthorized, { recursive: true, force: true }),
+    ]);
+  }
+});
+
+test("显式白名单时工具默认工作区不自作主张：会话 cwd 不在列表内则拒绝", async (t) => {
+  const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-policy-"));
+  const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-session-"));
+  try {
+    const tools = registeredTools(new WorkspacePolicy([allowed]));
+    const execWith = (cwd) => ({
+      agent: { session: { header: { cwd } } },
+      signal: new AbortController().signal,
+    });
+    // 显式白名单优先：即使会话 cwd 是委派目录，不在列表内依然拒绝并给出提示。
+    await assert.rejects(
+      () => tools.get("cbx_health").execute({}, execWith(delegated)),
+      (error) => {
+        assert.equal(isCbxError(error, "E_INVALID_WORKSPACE"), true);
+        assert.match(String(error.message), /当前允许的工作区/);
+        assert.equal(String(error.message).includes(allowed), true);
+        return true;
+      },
+    );
+  } finally {
+    await closeDatabaseConnections();
+    await Promise.all([
+      rm(allowed, { recursive: true, force: true }),
+      rm(delegated, { recursive: true, force: true }),
+    ]);
+  }
+});

@@ -1,10 +1,11 @@
 import type { ServerResponse, IncomingMessage } from "node:http";
-import { open, readFile, stat } from "node:fs/promises";
+import { open, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { jobDir, listJobs, listQueue, loadState } from "./core.js";
 import { captureAsync } from "./process-runner.js";
 import { parsePidRecordText } from "./pid-guard.js";
 import { constantTimeEqual, eventsAfterCursor, processAlive } from "./storage.js";
+import { TERMINAL_STATUSES } from "./types.js";
 
 /** 校验 token; 未配置 token 时始终放行。常量时间比较避免时序侧信道。
  *  凭证只接受 Authorization Bearer header（curl/API 客户端）或 `cbx_token`
@@ -117,13 +118,6 @@ export interface JobTimeline {
   finishedAt: string | null;
   elapsedSec: number;
 }
-
-const TERMINAL_STATUSES = new Set([
-  "done",
-  "failed",
-  "review_failed",
-  "cancelled",
-]);
 
 /**
  * 从 events.ndjson 推导阶段时间线。兼容两套事件:
@@ -377,23 +371,43 @@ interface AgentLogChunk {
   truncated: boolean;
 }
 
-/** 增量读 agent.log: since=0 读尾部 maxBytes 初始展示, since>0 按字节游标续读,截到最后一个完整行。 */
+/** 增量读 agent.log: since=0 读尾部 maxBytes 初始展示, since>0 按字节游标续读,截到最后一个完整行。
+ *  旋转自愈：agent.log 是"追加到 32MB 上限后停止写入"的日志，正常不会变短。但若被手动截断/
+ *  轮转（或崩溃恢复重建），磁盘文件可能比客户端上次拿到的游标小——此时按旧游标续读会读到
+ *  新文件里无关的字节。做法：把每次返回的 nextOffset 持久化到 <job>/agent.log.cursor，
+ *  since>0 且磁盘文件长度小于该游标时判定为"旋转/截断"，回落到尾部重新对齐。cursor 写失败
+ *  不阻塞读取（最优努力），退回"since 超长即回落"的旧兜底。 */
 export async function readAgentLogIncremental(
   workspace: string,
   jobId: string,
   since = 0,
   maxBytes = 256 * 1024,
 ): Promise<AgentLogChunk> {
-  const file = path.join(jobDir(workspace, jobId), "agent.log");
+  const dir = jobDir(workspace, jobId);
+  const file = path.join(dir, "agent.log");
+  const cursorFile = path.join(dir, "agent.log.cursor");
   let raw: Buffer;
   try {
     raw = await readFile(file);
   } catch {
     return { content: "", nextOffset: 0, truncated: false };
   }
-  // since=0: 尾部 maxBytes; since>0: 从该字节续读增量。
   const tailStart = raw.length > maxBytes ? raw.length - maxBytes : 0;
-  const start = since > 0 && since <= raw.length ? since : tailStart;
+  let effectiveSince = since;
+  if (since > 0 && since <= raw.length) {
+    // 续读：校验是否发生了旋转/截断（磁盘比上次游标小）。cursor 读失败（不存在/损坏）
+    // 时按"since 仍在范围内"处理——旧行为；无法确认就不冒险重置。
+    try {
+      const persisted = Number((await readFile(cursorFile, "utf8")).trim());
+      if (Number.isSafeInteger(persisted) && persisted > 0 && raw.length < persisted)
+        effectiveSince = tailStart;
+    } catch {
+      /* no cursor yet */
+    }
+  } else {
+    effectiveSince = tailStart;
+  }
+  const start = since > 0 ? effectiveSince : tailStart;
   const slice = raw.subarray(start);
   const text = slice.toString("utf8");
   // 截到最后一个完整行, 避免半行：末尾是换行则全保留；内部有换行但末尾非换行则退到上一个换行；
@@ -401,9 +415,14 @@ export async function readAgentLogIncremental(
   const lastNl = text.lastIndexOf("\n");
   const end = text.endsWith("\n") || lastNl < 0 ? text.length : lastNl + 1;
   const content = text.slice(0, end);
+  const nextOffset = start + Buffer.byteLength(content, "utf8");
+  if (since > 0) {
+    // 持久化本次协商出的边界，供下一次续读做旋转自愈。写失败不阻塞读取。
+    await writeFile(cursorFile, String(nextOffset), "utf8").catch(() => undefined);
+  }
   return {
     content,
-    nextOffset: start + Buffer.byteLength(content, "utf8"),
+    nextOffset,
     truncated: start > 0,
   };
 }

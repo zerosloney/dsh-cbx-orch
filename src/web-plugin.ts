@@ -1,7 +1,7 @@
 import { Context, Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { registerCbxWebRoutes } from "./web.js";
 import { acquireScheduler, type SchedulerHandle } from "./queue-api.js";
@@ -12,9 +12,70 @@ export interface WebConfig {
   web?: {
     /** Bearer token for data endpoints; shell and healthz stay open. */
     token?: string;
-    /** Workspace allowlist for `?workspace=` selection; defaults to the invoking directory. */
+    /**
+     * Workspace allowlist for `?workspace=` selection. Empty/missing = follow
+     * the harness workspace registry (`ctx.workspaceRegistry`, i.e. the
+     * directories the user actually opens in the harness GUI); when the
+     * registry is unavailable or has no entries, falls back to the process cwd
+     * (legacy behavior). Explicit paths are exact-match authorized.
+     */
     workspaces?: string[];
   };
+}
+
+/** Minimal structural view of the harness workspace registry (dsh-workspace). */
+export interface WorkspaceRegistryLike {
+  list(): ReadonlyArray<{ path: string }>;
+}
+
+/**
+ * Resolve the effective workspace list for the web dashboard.
+ *
+ * An explicit `web.workspaces` list wins verbatim (exact-match allowlist).
+ * With an empty list, the Web layer has no session context of its own, so the
+ * harness's own workspace registry is the authoritative "directories the user
+ * actually works in" (session cwd → workspace record). Entries whose directory
+ * has been deleted are dropped; an unavailable/empty registry yields `[]`,
+ * which the caller falls back to the process cwd.
+ */
+export async function resolveWebWorkspaceList(
+  config: WebConfig,
+  registry?: WorkspaceRegistryLike,
+): Promise<readonly string[]> {
+  const explicit = config.web?.workspaces ?? [];
+  if (explicit.length > 0) return explicit;
+  if (!registry || typeof registry.list !== "function") return [];
+  const existing: string[] = [];
+  const seen = new Set<string>();
+  for (const workspace of registry.list()) {
+    const candidate = workspace?.path;
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    const key = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      if ((await stat(candidate)).isDirectory()) existing.push(candidate);
+    } catch {
+      /* 目录已不存在：不计入，避免 WorkspacePolicy 因缺失目录整体抛错 */
+    }
+  }
+  return existing;
+}
+
+/** 短时轮询等待 harness 工作区注册表就绪（可选依赖：注册表晚于 web 插件启动时也能取到）。 */
+async function waitForWorkspaceRegistry(
+  ctx: Context,
+): Promise<WorkspaceRegistryLike | undefined> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      const registry = ctx.get("workspaceRegistry") as WorkspaceRegistryLike | undefined;
+      if (registry && typeof registry.list === "function") return registry;
+    } catch {
+      /* 服务尚未提供：继续等待 */
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return undefined;
 }
 
 /**
@@ -36,6 +97,18 @@ async function resolveWebToken(
     if (existing) return existing;
   } catch {
     /* first run: no token file yet */
+  }
+  // 默认工作区来源变化（进程 cwd → harness 工作区注册表）后保持 token 连续性：
+  // 若旧位置（进程 cwd/.cbx/web.token）已有 token，复用它，避免浏览器 cookie 在
+  // 重启后突然失效要求重新登录。
+  if (path.resolve(process.cwd()) !== path.resolve(workspace)) {
+    try {
+      const legacyFile = path.join(process.cwd(), ".cbx", "web.token");
+      const legacy = (await readFile(legacyFile, "utf8")).trim();
+      if (legacy) return legacy;
+    } catch {
+      /* 旧位置无 token：生成新的 */
+    }
   }
   const token = randomBytes(24).toString("base64url");
   await mkdir(cbxDir, { recursive: true });
@@ -62,7 +135,8 @@ export default class CbxWeb extends Service {
 
   constructor(ctx: Context, config: WebConfig) {
     super(ctx, "cbxWeb");
-    const workspacePolicy = new WorkspacePolicy(config.web?.workspaces ?? []);
+    const explicitWorkspaces = config.web?.workspaces ?? [];
+    const workspacePolicy = new WorkspacePolicy(explicitWorkspaces);
     const ownedSchedulers = new Set<SchedulerHandle>();
     const pendingAcquires = new Set<Promise<void>>();
     const releaseOwned = async (): Promise<void> => {
@@ -105,49 +179,26 @@ export default class CbxWeb extends Service {
       await releaseOwned();
     }, "cbxWeb.lifecycle");
     void (async () => {
-      let workspaces: readonly string[];
-      try {
-        // Canonicalize once and share the exact same policy with the route
-        // selector, token path, and scheduler startup.
-        workspaces = await workspacePolicy.listAllowedWorkspaces();
-      } catch (error) {
-        ctx.logger("cbx").error(
-          `cbx web 工作区策略解析失败：${error instanceof Error ? error.message : String(error)}`,
-        );
-        return;
+      if (explicitWorkspaces.length === 0) {
+        // 空配置：Web 层没有会话上下文，但 harness 工作区注册表（ctx.workspaceRegistry）
+        // 记录了用户实际打开的工作区目录（会话 cwd → workspace 记录）。跟随注册表而非
+        // 默认回落 process.cwd()：后者在 `dsh web` 从别的目录启动时会导致仪表盘显示
+        // 一个与真实工作区无关的空目录（jobs 为空、?workspace= 还被 400 拒绝）。
+        const registry = await waitForWorkspaceRegistry(ctx);
+        if (registry) {
+          const registryWorkspaces = await resolveWebWorkspaceList(config, registry);
+          if (registryWorkspaces.length > 0) {
+            ctx.logger("cbx").info(
+              `cbx web 未配置 web.workspaces，跟随 harness 工作区注册表（${registryWorkspaces.length} 个）：${registryWorkspaces.join(", ")}`,
+            );
+            // 注册表路径已是 canonical（realpath），WorkspacePolicy 会再次校验目录存在性。
+            await registerWebWith(new WorkspacePolicy([...registryWorkspaces]));
+            return;
+          }
+          // 注册表存在但为空：回落 process.cwd()（旧行为）。
+        }
       }
-      if (disposed) return;
-      await Promise.all(workspaces.map((workspace) => acquireOne(workspace)));
-      if (disposed) return;
-
-      let token: string | undefined;
-      try {
-        token = await resolveWebToken(config, workspaces[0]);
-      } catch (error) {
-        ctx.logger("cbx").error(
-          `cbx web token 自动生成失败：${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      if (disposed) return;
-      // fail-closed：解析不到任何 token 时绝不挂载无鉴权的数据端点——webServer 一旦
-      // 绑定非 loopback，等于把任务控制面（创建/取消/purge）裸奔到局域网。
-      if (!token) {
-        ctx.logger("cbx").error(
-          "cbx web 无法获得访问 token（.cbx 不可写且未配置 web.token），拒绝挂载仪表盘路由；请显式配置 web.token 或修复工作区写权限。",
-        );
-        return;
-      }
-      if (!config.web?.token) {
-        ctx.logger("cbx").info(
-          `cbx web 未配置 token，已自动生成随机 token：${path.join(workspaces[0], ".cbx", "web.token")}`,
-        );
-      }
-      if (disposed) return;
-      await registerCbxWebRoutes(ctx, {
-        workspacePolicy,
-        token,
-        isDisposed: () => disposed,
-      });
+      await registerWebWith(workspacePolicy);
     })().catch(async (error) => {
       const wasDisposed = disposed;
       disposed = true;
@@ -160,5 +211,52 @@ export default class CbxWeb extends Service {
         );
       }
     });
+    // registerWebWith 内部完成调度器获取、token 解析与路由挂载；拆成函数以支持
+    // 注册表派生列表与显式列表两条路径共用同一套启动流程。
+    function registerWebWith(policy: WorkspacePolicy): Promise<void> {
+      return (async () => {
+        let workspaces: readonly string[];
+        try {
+          workspaces = await policy.listAllowedWorkspaces();
+        } catch (error) {
+          ctx.logger("cbx").error(
+            `cbx web 工作区策略解析失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+          return;
+        }
+        if (disposed) return;
+        await Promise.all(workspaces.map((workspace) => acquireOne(workspace)));
+        if (disposed) return;
+
+        let token: string | undefined;
+        try {
+          token = await resolveWebToken(config, workspaces[0]);
+        } catch (error) {
+          ctx.logger("cbx").error(
+            `cbx web token 自动生成失败：${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        if (disposed) return;
+        // fail-closed：解析不到任何 token 时绝不挂载无鉴权的数据端点——webServer 一旦
+        // 绑定非 loopback，等于把任务控制面（创建/取消/purge）裸奔到局域网。
+        if (!token) {
+          ctx.logger("cbx").error(
+            "cbx web 无法获得访问 token（.cbx 不可写且未配置 web.token），拒绝挂载仪表盘路由；请显式配置 web.token 或修复工作区写权限。",
+          );
+          return;
+        }
+        if (!config.web?.token) {
+          ctx.logger("cbx").info(
+            `cbx web 未配置 token，已自动生成随机 token：${path.join(workspaces[0], ".cbx", "web.token")}`,
+          );
+        }
+        if (disposed) return;
+        await registerCbxWebRoutes(ctx, {
+          workspacePolicy: policy,
+          token,
+          isDisposed: () => disposed,
+        });
+      })();
+    }
   }
 }

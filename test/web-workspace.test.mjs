@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { closeDatabaseConnections } from "../lib/storage.js";
 import { registerCbxWebRoutes } from "../lib/web.js";
+import { resolveWebWorkspaceList } from "../lib/web-plugin.js";
 import { WorkspacePolicy } from "../lib/workspace-policy.js";
 
 const TOKEN = "web-workspace-test-token";
@@ -157,6 +158,46 @@ function queueUrl(workspace) {
     ? "/cbx/api/queue"
     : `/cbx/api/queue?workspace=${encodeURIComponent(workspace)}`;
 }
+
+test("resolveWebWorkspaceList: 显式列表原样返回", async () => {
+  const paths = await resolveWebWorkspaceList({ web: { workspaces: ["/a", "/b"] } });
+  assert.deepEqual(paths, ["/a", "/b"]);
+});
+
+test("resolveWebWorkspaceList: 空列表跟随注册表，丢弃缺失目录并去重", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cbx-web-registry-"));
+  try {
+    const alive = path.join(root, "alive");
+    await mkdir(alive);
+    const missing = path.join(root, "missing");
+    const registry = {
+      list() {
+        return [
+          { path: alive },
+          { path: missing },
+          { path: alive }, // 去重
+        ];
+      },
+    };
+    const paths = await resolveWebWorkspaceList({}, registry);
+    assert.equal(paths.length, 1);
+    assert.equal(path.resolve(paths[0]), path.resolve(alive));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveWebWorkspaceList: 无注册表或注册表为空时返回空数组", async () => {
+  assert.deepEqual(await resolveWebWorkspaceList({}), []);
+  assert.deepEqual(
+    await resolveWebWorkspaceList({}, { list: () => [] }),
+    [],
+  );
+  assert.deepEqual(
+    await resolveWebWorkspaceList({}, undefined),
+    [],
+  );
+});
 
 test("Web 注册是 async：完成前不假定 /cbx 路由已就绪，effect dispose 会卸载路由", async () => {
   await withWorkspaces(async ({ workspaces, server }) => {

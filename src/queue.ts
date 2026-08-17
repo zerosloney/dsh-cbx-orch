@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { stat, unlink, writeFile } from "node:fs/promises";
+import { readFile, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { acquireServiceLease, forceReleaseOwnLock, loadPersistedQueue, now, processAlive, savePersistedQueue, withQueueLock } from "./storage.js";
 import { isCbxError } from "./errors.js";
@@ -48,6 +48,37 @@ async function loadQueue(workspace: string): Promise<QueueFile> {
 async function saveQueue(workspace: string, queue: QueueFile): Promise<void> {
   queue.updatedAt = now();
   await savePersistedQueue(workspace, queue);
+}
+
+/** 从 job 事件流里取最近一条 worker_crash 的 error，供熔断/失败信息携带真实根因。
+ *  事件文件不存在、为空或全为坏行时返回占位文案而非抛错——诊断信息不应让调度失败。 */
+async function lastWorkerCrashReason(directory: string): Promise<string> {
+  const scan = async (file: string): Promise<string | undefined> => {
+    let raw: string;
+    try {
+      raw = await readFile(file, "utf8");
+    } catch {
+      return undefined; // 文件缺失/不可读：交回上层扫描
+    }
+    const lines = raw.split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const event = JSON.parse(line) as { event?: string; error?: string };
+        if (event.event === "worker_crash" && event.error) return event.error;
+      } catch {
+        /* 跳过坏行 */
+      }
+    }
+    return undefined;
+  };
+  // 先扫当前事件文件；未命中再扫轮转的 .1（>10MB 时 events.ndjson 滚到 events.ndjson.1）。
+  const current = await scan(path.join(directory, "events.ndjson"));
+  if (current !== undefined) return current;
+  const rotated = await scan(path.join(directory, "events.ndjson.1"));
+  if (rotated !== undefined) return rotated;
+  return "事件流中未找到 worker_crash 记录（请查看 events.ndjson / agent.log）";
 }
 
 function configuredConcurrency(value: number | undefined): number {
@@ -131,10 +162,15 @@ export async function dispatchQueue(runtime: QueueRuntime, workspaceInput: strin
           entry.lastReclaimAt = now();
           if (entry.reclaimCount > MAX_RECLAIMS) {
             // 熔断：worker 反复无法恢复（多为状态永久损坏），停止重派避免无限 spawn。
+            // 错误信息携带最近一条 worker_crash 的真实根因，而不是笼统的"反复无法
+            // 恢复"——否则像"isolated 要求 Git 仓库"这类可修复错误会被淹没在事件流里。
+            const rootCause = await lastWorkerCrashReason(
+              runtime.jobDir(workspace, entry.jobId),
+            );
             entry.status = "failed";
-            entry.error = `worker 反复无法恢复（已回收 ${entry.reclaimCount} 次），停止自动重派；请检查任务状态后用 retry 手动重跑。`;
+            entry.error = `worker 反复无法恢复（已回收 ${entry.reclaimCount} 次），停止自动重派。最后崩溃原因：${rootCause}；请修复后用 retry 手动重跑。`;
             entry.finishedAt = now();
-            logJobEvent(workspace, entry.jobId, "queue_reclaim_circuit_breaker", { reclaimCount: entry.reclaimCount });
+            logJobEvent(workspace, entry.jobId, "queue_reclaim_circuit_breaker", { reclaimCount: entry.reclaimCount, workerCrash: rootCause });
           } else {
             entry.status = "queued";
           }

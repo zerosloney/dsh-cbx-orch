@@ -1,5 +1,7 @@
-import { appendFileSync, unlinkSync } from "node:fs";
+import { appendFileSync, statSync, unlinkSync } from "node:fs";
+import path from "node:path";
 import type { SubprocessRuntime } from "@deepseek-ai/dsh-subprocess";
+import { loadRuntimeExecutorsAllowlist } from "./storage.js";
 import { jobContext, type ActiveProcessHandle } from "./job-runtime.js";
 import { writePidRecord } from "./pid-guard.js";
 import {
@@ -10,6 +12,208 @@ import {
 } from "./process-runner.js";
 
 const TREE_QUIESCE_TIMEOUT_MS = 7_000;
+
+/**
+ * 执行器/测试子进程的环境变量继承策略。
+ *
+ * 默认（全局未设置 + 工作区未配置）= 完整继承宿主的 process.env（与终端直接运行一致，
+ * 这是 cbx 的有意设计：编码 CLI 依赖环境里的 API 凭据才能工作）。安全硬化的 operator 可以
+ * 显式设置白名单——这会把拉起的 codebuddy/opencode/omp/cline/qwen 子进程的可见环境裁剪
+ * 到白名单 + 一组不可缺的系统变量（PATH/HOME 等），降低"受损执行器可读取宿主全部凭据"
+ * 的暴露面。优先级（自上而下）：
+ *   1. 当前任务工作区的 `.cbx.json` 顶层 `executors.envAllowlist`（最具体，优先）；
+ *   2. 插件 config 的全局 `executors.envAllowlist`（缺省回落）；
+ *   3. `undefined` = 完整继承宿主 env。
+ * 工作区显式配置（含空数组 = 显式只继承系统变量）会覆盖全局；工作区未配置则回落到全局。
+ */
+let executorEnvAllowlist: readonly string[] | undefined;
+
+/** 设置全局（插件 config）执行器/测试子进程的环境变量白名单；传 undefined 恢复完整继承。
+ *  该值作为工作区未显式配置时的缺省。返回还原函数；还原只清掉仍是本调用设置的值——
+ *  HMR/多实例下后装实例的还原不会误清前装实例的设置（与 setProcessSpawnProvider 同约定）。 */
+export function setExecutorEnvAllowlist(
+  allowlist: readonly string[] | undefined,
+): () => void {
+  executorEnvAllowlist = allowlist;
+  return () => {
+    if (executorEnvAllowlist === allowlist) executorEnvAllowlist = undefined;
+  };
+}
+
+/** 白名单 + 不可缺的系统变量。系统变量无论是否在白名单都会保留，避免裁掉 PATH
+ *  等导致子进程连可执行文件都找不到（那不是安全目标，是搬起石头砸自己脚）。 */
+const ALWAYS_PRESERVE_ENV = new Set([
+  "PATH",
+  "PATHEXT",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "HOME",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "TEMP",
+  "TMP",
+  "SYSTEMROOT",
+  "SYSTEMDRIVE",
+  "COMSPEC",
+  "WINDIR",
+  "ProgramFiles",
+  "ProgramFiles(x86)",
+  "ProgramW6432",
+  "NODE_ENV",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+]);
+
+/** 工作区级白名单短缓存（TTL 5s，与 observability 的 configCache 同约定）：spawn 高频
+ *  （git 操作、executor），不能每次读盘；`.cbx.json` 编辑最多 5s 后生效，对安全硬化可接受。 */
+interface WorkspaceAllowlistCacheEntry {
+  configured: boolean;
+  allowlist: string[] | undefined;
+  at: number;
+}
+const workspaceAllowlistCache = new Map<string, WorkspaceAllowlistCacheEntry>();
+const WORKSPACE_ALLOWLIST_TTL_MS = 5_000;
+
+/** 从 cwd 向上定位最近含 `.cbx/` 或 `.cbx.json` 的工作区根（限深，防跳到系统根）。
+ *  返回 undefined 表示无法定位（如 review-gate 的临时目录、非 cbx 目录）。最深层向上 6 层。 */
+function resolveWorkspaceRoot(cwd: string): string | undefined {
+  let current = path.resolve(cwd);
+  for (let depth = 0; depth < 6; depth += 1) {
+    try {
+      if (statSync(path.join(current, ".cbx")).isDirectory()) return current;
+    } catch { /* 向上 */ }
+    try {
+      if (statSync(path.join(current, ".cbx.json")).isFile()) return current;
+    } catch { /* 向上 */ }
+    const parent = path.dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+  return undefined;
+}
+
+/** 从 worktree 路径反解主工作区根（导出供测试覆盖各分支）。
+ *
+ * cbx 的隔离 worktree 布局（见 git-ops.ts）：主工作区 `<root>` 的 worktree 位于
+ * `parent(<root>)/.<basename(root)>.cbx-worktrees/<jobId>`，即主工作区的**兄弟目录**。
+ * 因此在 worktree 内、且无 jobContext（主进程非任务调用）时，向上遍历找不到含 `.cbx/`
+ * 的祖先。这里在路径片段中定位 `.<basename>.cbx-worktrees/<jobId>` 标记：
+ *   - 命中 → 主工作区 = 该标记上一级目录 + 捕获的 `<basename>`；
+ *   - 校验主工作区确实含 `.cbx/` 或 `.cbx.json`，否则不认（防误匹配）；
+ *   - windows 折叠大小写比较。
+ * 未命中或无 `.cbx` 标记返回 undefined（交回上级调用走全局回落）。 */
+export function resolveWorktreeWorkspace(cwd: string): string | undefined {
+  const parts = path.resolve(cwd).split(/[\\/]/);
+  const markerIndex = parts.findIndex((segment) => /^\.(.+)\.cbx-worktrees$/.test(segment));
+  if (markerIndex < 1) return undefined; // 需要至少一个上层目录（主工作区父目录）
+  const match = /^\.(.+)\.cbx-worktrees$/.exec(parts[markerIndex]!);
+  const base = match?.[1];
+  if (!base) return undefined;
+  // 构造候选主工作区根：[父目录, `<basename>`]
+  const parentParts = parts.slice(0, markerIndex);
+  const candidate = path.resolve(...parentParts, base);
+  try {
+    if (statSync(path.join(candidate, ".cbx")).isDirectory()) return candidate;
+  } catch { /* 不是 cbx 主工作区 */ }
+  try {
+    if (statSync(path.join(candidate, ".cbx.json")).isFile()) return candidate;
+  } catch { /* 不是 cbx 主工作区 */ }
+  return undefined;
+}
+
+/** 取某 workspace 的工作区级白名单（缓存 + TTL）。失败（读/校验异常）时按"未配置"
+ *  回落，绝不因 `.cbx.json` 坏配置让整个 spawn 挂掉——白名单是硬化，不是执行的前置。 */
+async function workspaceAllowlist(
+  workspace: string,
+): Promise<{ configured: boolean; allowlist: string[] | undefined }> {
+  const key = process.platform === "win32" ? workspace.toLowerCase() : workspace;
+  const hit = workspaceAllowlistCache.get(key);
+  if (hit && Date.now() - hit.at < WORKSPACE_ALLOWLIST_TTL_MS) return hit;
+  let result: { configured: boolean; allowlist: string[] | undefined };
+  try {
+    result = await loadRuntimeExecutorsAllowlist(workspace);
+  } catch (error) {
+    result = { configured: false, allowlist: undefined };
+  }
+  workspaceAllowlistCache.set(key, { ...result, at: Date.now() });
+  return result;
+}
+
+/** 解析一次 spawn 的有效白名单，按优先级：
+ *   1. jobContext 的任务工作区（覆盖隔离 worktree 场景，权威）；
+ *   2. cwd 所在的 worktree → 主工作区（`.cbx-worktrees` 反解，覆盖主进程非任务隔离调用）；
+ *   3. cwd 向上定位的含 `.cbx/` 工作区；
+ *   4. 全局（插件 config）缺省；
+ *   5. undefined = 完整继承宿主 env。
+ * 逐级取第一个"工作区已显式配置"的结果；全未配置才回落全局。 */
+async function effectiveAllowlist(cwd: string): Promise<readonly string[] | undefined> {
+  const jobStore = jobContext.getStore();
+  const jobWorkspace = jobStore?.workspace;
+  if (jobWorkspace) {
+    const ws = await workspaceAllowlist(jobWorkspace);
+    if (ws.configured) return ws.allowlist;
+  }
+  const worktreeWorkspace = resolveWorktreeWorkspace(cwd);
+  if (worktreeWorkspace) {
+    const ws = await workspaceAllowlist(worktreeWorkspace);
+    if (ws.configured) return ws.allowlist;
+  }
+  const cwdWorkspace = resolveWorkspaceRoot(cwd);
+  if (cwdWorkspace) {
+    const ws = await workspaceAllowlist(cwdWorkspace);
+    if (ws.configured) return ws.allowlist;
+  }
+  return executorEnvAllowlist;
+}
+
+/** 按有效白名单裁剪环境；undefined = 原样返回 process.env（避免复制开销与语义变化）。 */
+function envForChild(filter: readonly string[] | undefined): (typeof process.env) | undefined {
+  if (!filter) return process.env;
+  const allowed = new Set(filter.map((key) => key.toUpperCase()));
+  const filtered: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    const upper = key.toUpperCase();
+    if (allowed.has(upper) || ALWAYS_PRESERVE_ENV.has(upper)) {
+      if (value !== undefined) filtered[key] = value;
+    }
+  }
+  return filtered;
+}
+
+/** 工作区白名单的同步查询：仅命中短缓存；未命中/过期返回 undefined（调用方回落全局）。
+ *  供少量必须保持同步 spawn 的内部调用（git hash-object、可执行文件探测）复用白名单，
+ *  与异步 effectiveAllowlist 共享同一份缓存与 TTL 语义。 */
+function workspaceAllowlistCached(workspace: string): { configured: boolean; allowlist: string[] | undefined } | undefined {
+  const key = process.platform === "win32" ? workspace.toLowerCase() : workspace;
+  const hit = workspaceAllowlistCache.get(key);
+  if (hit && Date.now() - hit.at < WORKSPACE_ALLOWLIST_TTL_MS) return hit;
+  return undefined;
+}
+
+/** 同步 spawn 路径的有效白名单（jobContext 同步可得，其余候选回落全局）。
+ *  与异步 effectiveAllowlist 的差异：不读盘、不反解 worktree——仅当工作区缓存已有
+ *  新鲜条目时采用工作区级覆盖，否则用全局（插件 config）白名单。这些内部调用不面向
+ *  不可信执行器，5s TTL 内的工作区配置延迟生效是可接受的。 */
+function syncEffectiveAllowlist(cwd: string): readonly string[] | undefined {
+  const jobWorkspace = jobContext.getStore()?.workspace;
+  if (jobWorkspace) {
+    const cached = workspaceAllowlistCached(jobWorkspace);
+    if (cached?.configured) return cached.allowlist;
+  }
+  return executorEnvAllowlist;
+}
+
+/** 同步 spawn 路径的环境裁剪入口（git-ops 的 hash-object、builtin 的可执行文件探测）。 */
+export function syncEnvForChild(cwd: string): (typeof process.env) | undefined {
+  return envForChild(syncEffectiveAllowlist(cwd));
+}
+
+/** 清空工作区白名单缓存（测试用；编辑 `.cbx.json` 后如需立即生效可调用）。 */
+export function resetWorkspaceAllowlistCache(): void {
+  workspaceAllowlistCache.clear();
+}
 
 async function waitForTreeExit(
   handle: ReturnType<SubprocessRuntime["spawn"]>,
@@ -121,10 +325,12 @@ class LogRedactor {
  * subprocess seam: tree-scoped termination, graceful escalation, and the
  * job-runtime registry that lets `cbx cancel` terminate live subprocesses.
  *
- * 环境变量：执行器子进程完整继承宿主的 process.env（与终端直接运行一致）。这是
- * 有意设计——用户配置的编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境里的
- * API 凭据才能工作，过滤变量会破坏执行器认证。对应缓解在落盘边界：日志写入前按
- * 凭据形状正则脱敏（见 LogRedactor），防止执行器输出回显凭据形成持久的磁盘泄漏。
+ * 环境变量：默认完整继承宿主的 process.env（与终端直接运行一致）。这是有意设计——
+ * 用户配置的编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境里的 API 凭据才能
+ * 工作，过滤变量会破坏执行器认证。对应缓解在落盘边界：日志写入前按凭据形状正则脱敏
+ * （见 LogRedactor），防止执行器输出回显凭据形成持久的磁盘泄漏。安全硬化场景可经
+ * `setExecutorEnvAllowlist` 裁剪子进程可见环境（见该函数与插件 config
+ * `executors.envAllowlist`）。
  */
 export function createSubprocessProvider(subprocess: SubprocessRuntime): ProcessSpawn {
   return async (
@@ -160,6 +366,8 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
 
     let handle: ReturnType<SubprocessRuntime["spawn"]>;
     try {
+      // 工作区级白名单覆盖：任务上下文优先，其次 cwd 定位的工作区，回落到全局。
+      const envForSpawn = envForChild(await effectiveAllowlist(cwd));
       handle = subprocess.spawn({
         argv,
         cwd,
@@ -170,7 +378,7 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
         },
         graceMs: 2_000,
         signal: spawnSignal,
-        env: process.env,
+        env: envForSpawn,
       });
     } catch (error) {
       clearTimeout(timeoutTimer);

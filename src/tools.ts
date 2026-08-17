@@ -19,6 +19,7 @@ import {
 } from "./queue-api.js";
 import { runReviewGate } from "./review-gate.js";
 import { readAgentLogIncremental } from "./ui.js";
+import { bridgeCbxJob } from "./jobs-bridge.js";
 import { forgetJobKeepWorktree, loadConfig, loadState, mergeConfig, purgeJob } from "./state.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
 
@@ -33,6 +34,23 @@ export interface CbxDefaults {
 
 function jsonContent(value: unknown): ContentBlock[] {
   return [{ type: "text", text: JSON.stringify(value, null, 2) }];
+}
+
+/** 工具执行上下文的最小结构：只取 agent 会话的 cwd，避免引入 dsh-agent 类型依赖。 */
+export interface SessionCwdContext {
+  agent?: {
+    session?: {
+      header?: { cwd?: string };
+    };
+  };
+}
+
+/**
+ * 默认工作区 = 当前 agent 会话的工作目录（目录委派时设定），回落 process.cwd()。
+ * 显式传 workspace 参数时仍以参数为准（受白名单约束）。
+ */
+function sessionCwdOf(exec: SessionCwdContext | undefined): string | undefined {
+  return exec?.agent?.session?.header?.cwd;
 }
 
 /** Engine types (some `unknown` fields, no index signature) are real JSON at runtime. */
@@ -76,8 +94,8 @@ function clampJson(value: unknown): unknown {
 export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
   const tools = ctx.tools;
   const workspacePolicy = defaults.workspacePolicy ?? new WorkspacePolicy();
-  const workspaceOf = (input: string | undefined): Promise<string> =>
-    workspacePolicy.resolveWorkspace(input);
+  const workspaceOf = (input: string | undefined, exec?: SessionCwdContext): Promise<string> =>
+    workspacePolicy.resolveWorkspace(input, sessionCwdOf(exec));
 
   tools.register(defineTool({
     name: "cbx_run",
@@ -102,8 +120,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       review_executor: { type: "string", description: "Executor for the review phase (defaults to executor)." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      const ws = await workspaceOf(args.workspace);
+    async execute(args, exec) {
+      const ws = await workspaceOf(args.workspace, exec);
       const config = await loadConfig(ws);
       const merged = mergeConfig(config, {
         testCommand: args.test,
@@ -144,7 +162,20 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         dependencyGuard: merged.dependencyGuard,
       });
       await startBackground(ws, created.jobId, "", 0);
-      return { job_id: created.jobId, status: "queued" };
+      // 会话内可见：把委派注册为 harness 原生后台任务（kind=cbx，归属当前 agent）。
+      // 当前会话随即能在 UI/工具中看到执行情况（job_output/job_kill/job_wait），
+      // 完成后 tool-jobs 会把最终输出投递回会话。桥不可用时静默退化为纯 cbx。
+      const sessionJobId = bridgeCbxJob(ctx, {
+        workspace: ws,
+        jobId: created.jobId,
+        task: args.task,
+        agent: exec.agent,
+      });
+      return {
+        job_id: created.jobId,
+        status: "queued",
+        ...(sessionJobId !== undefined ? { jobId: sessionJobId } : {}),
+      };
     },
   }));
 
@@ -156,8 +187,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory holding the job." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(clampJson(await loadState(await workspaceOf(args.workspace), args.job_id)));
+    async execute(args, exec) {
+      return toJson(clampJson(await loadState(await workspaceOf(args.workspace, exec), args.job_id)));
     },
   }));
 
@@ -168,8 +199,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory holding the jobs." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await listJobs(await workspaceOf(args.workspace)));
+    async execute(args, exec) {
+      return toJson(await listJobs(await workspaceOf(args.workspace, exec)));
     },
   }));
 
@@ -180,8 +211,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await listQueue(await workspaceOf(args.workspace)));
+    async execute(args, exec) {
+      return toJson(await listQueue(await workspaceOf(args.workspace, exec)));
     },
   }));
 
@@ -192,8 +223,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await pauseQueue(await workspaceOf(args.workspace)));
+    async execute(args, exec) {
+      return toJson(await pauseQueue(await workspaceOf(args.workspace, exec)));
     },
   }));
 
@@ -204,8 +235,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await resumeQueue(await workspaceOf(args.workspace)));
+    async execute(args, exec) {
+      return toJson(await resumeQueue(await workspaceOf(args.workspace, exec)));
     },
   }));
 
@@ -216,8 +247,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await dispatchQueue(await workspaceOf(args.workspace)));
+    async execute(args, exec) {
+      return toJson(await dispatchQueue(await workspaceOf(args.workspace, exec)));
     },
   }));
 
@@ -232,9 +263,10 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       refresh_baseline: { type: "boolean", description: "Refresh the baseline before continuing." },
     },
     output: jsonOutput(),
-    async execute(args) {
+    async execute(args, exec) {
+      const ws = await workspaceOf(args.workspace, exec);
       await startBackground(
-        await workspaceOf(args.workspace),
+        ws,
         args.job_id,
         args.message ?? "",
         0,
@@ -242,7 +274,17 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         args.refresh_baseline === true,
         args.extra_rounds === undefined ? 0 : Number(args.extra_rounds),
       );
-      return { job_id: args.job_id, status: "queued" };
+      const sessionJobId = bridgeCbxJob(ctx, {
+        workspace: ws,
+        jobId: args.job_id,
+        task: args.message ?? "continue",
+        agent: exec.agent,
+      });
+      return {
+        job_id: args.job_id,
+        status: "queued",
+        ...(sessionJobId !== undefined ? { jobId: sessionJobId } : {}),
+      };
     },
   }));
 
@@ -254,8 +296,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(clampJson(await cancelJob(await workspaceOf(args.workspace), args.job_id)));
+    async execute(args, exec) {
+      return toJson(clampJson(await cancelJob(await workspaceOf(args.workspace, exec), args.job_id)));
     },
   }));
   tools.register(defineTool({
@@ -267,9 +309,9 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       priority: { type: "integer", description: "Queue priority (higher first)." },
     },
     output: jsonOutput(),
-    async execute(args) {
+    async execute(args, exec) {
       return toJson(await retryQueueJob(
-        await workspaceOf(args.workspace),
+        await workspaceOf(args.workspace, exec),
         args.job_id,
         args.priority === undefined ? 0 : Number(args.priority),
       ));
@@ -284,9 +326,9 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: jsonOutput(),
-    async execute(args) {
+    async execute(args, exec) {
       // before_run 审批通过即原子重入队（approval 内完成 + 立即 dispatch），无需再补启动。
-      const state = await approveJob(await workspaceOf(args.workspace), args.job_id);
+      const state = await approveJob(await workspaceOf(args.workspace, exec), args.job_id);
       return toJson(clampJson(state));
     },
   }));
@@ -299,8 +341,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
-    async execute(args) {
-      return clampText(await readArtifact(await workspaceOf(args.workspace), args.job_id, "result.json"));
+    async execute(args, exec) {
+      return clampText(await readArtifact(await workspaceOf(args.workspace, exec), args.job_id, "result.json"));
     },
   }));
 
@@ -313,8 +355,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
-    async execute(args) {
-      return clampText(await readArtifact(await workspaceOf(args.workspace), args.job_id, args.artifact));
+    async execute(args, exec) {
+      return clampText(await readArtifact(await workspaceOf(args.workspace, exec), args.job_id, args.artifact));
     },
   }));
 
@@ -326,8 +368,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Project directory." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await listArtifacts(await workspaceOf(args.workspace), args.job_id));
+    async execute(args, exec) {
+      return toJson(await listArtifacts(await workspaceOf(args.workspace, exec), args.job_id));
     },
   }));
 
@@ -340,9 +382,9 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       since: { type: "integer", description: "Byte offset to resume from." },
     },
     output: jsonOutput(),
-    async execute(args) {
+    async execute(args, exec) {
       return toJson(await readAgentLogIncremental(
-        await workspaceOf(args.workspace),
+        await workspaceOf(args.workspace, exec),
         args.job_id,
         args.since === undefined ? 0 : Number(args.since),
       ));
@@ -357,8 +399,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       prune: { type: "boolean", description: "Also run retention cleanup (deletes terminal jobs older than governance.retentionDays). Default false (read-only)." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      return toJson(await health(await workspaceOf(args.workspace), { prune: args.prune === true }));
+    async execute(args, exec) {
+      return toJson(await health(await workspaceOf(args.workspace, exec), { prune: args.prune === true }));
     },
   }));
 
@@ -371,8 +413,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       purge: { type: "boolean", description: "Also remove the isolated worktree (true = purge)." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      const ws = await workspaceOf(args.workspace);
+    async execute(args, exec) {
+      const ws = await workspaceOf(args.workspace, exec);
       if (args.purge === true) {
         return toJson(await purgeJob(ws, args.job_id, "tool:purge"));
       }
@@ -387,9 +429,9 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       root: { type: "string", required: true, description: "Authorized workspace to list." },
     },
     output: jsonOutput(),
-    async execute(args) {
-      const root = await workspaceOf(args.root);
-      const roots = (await workspacePolicy.listAllowedWorkspaces())
+    async execute(args, exec) {
+      const root = await workspaceOf(args.root, exec);
+      const roots = (await workspacePolicy.listAllowedWorkspaces(sessionCwdOf(exec)))
         .filter((workspace) => workspace === root);
       const jobs = [];
       for (const ws of roots) {
@@ -411,7 +453,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     async execute(args, exec) {
       const signal = exec?.signal;
       signal?.throwIfAborted();
-      const workspace = await workspaceOf(args.workspace);
+      const workspace = await workspaceOf(args.workspace, exec);
       signal?.throwIfAborted();
       return toJson(await runReviewGate(workspace, {
         executor: args.executor,

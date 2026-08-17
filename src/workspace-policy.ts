@@ -9,10 +9,14 @@ import { CbxError } from "./errors.js";
  * each existing directory and never expands an allowlist to arbitrary child
  * paths. Callers that need artifact/worktree containment should add a narrower
  * policy on top of this workspace boundary.
+ *
+ * 默认工作区语义（空配置时）：以「调用方上下文的目录」为准——工具由 agent 调起时
+ * 传 `agent.session.header.cwd`（目录委派时的工作目录），回落 `process.cwd()`。
+ * 显式配置白名单后仍是精确匹配，只在列表内的目录可用。
  */
 export class WorkspacePolicy {
   private readonly configured: readonly string[];
-  private allowedPromise: Promise<readonly string[]> | undefined;
+  private explicitAllowedPromise: Promise<readonly string[]> | undefined;
 
   constructor(allowedWorkspaces: readonly string[] = []) {
     this.configured = [...allowedWorkspaces];
@@ -20,32 +24,45 @@ export class WorkspacePolicy {
 
   /**
    * Resolve an optional request to one of the configured workspaces.
-   * Missing input means the invoking directory, matching existing defaults.
+   * Missing input means the caller's context directory (`defaultCwd`),
+   * which itself falls back to `process.cwd()`.
    */
-  async resolveWorkspace(input?: string): Promise<string> {
-    const requested = await canonicalDirectory(input ?? process.cwd());
-    const allowed = await this.canonicalAllowed();
+  async resolveWorkspace(input?: string, defaultCwd?: string): Promise<string> {
+    const fallback = defaultCwd ?? process.cwd();
+    const requested = await canonicalDirectory(input ?? fallback);
+    const allowed = await this.allowedFor(fallback);
     const match = allowed.find((candidate) => samePath(candidate, requested));
     if (match) return match;
+    const allowedList = allowed.map((item) => `  - ${item}`).join("\n");
     throw invalidWorkspace(
-      input ?? process.cwd(),
-      "工作区未获授权：只能访问允许列表中的目录。",
+      input ?? fallback,
+      "工作区未获授权：只能访问允许列表中的目录。\n" +
+        `当前允许的工作区：\n${allowedList}\n` +
+        "如需新增授权：在 dsh profile 的 cordis.patch.yml 中给 cbx-orch 配 config.workspaces（core 工具），" +
+        "或给 cbx-orch-web 配 config.web.workspaces（Web 选择），重启后生效。",
     );
   }
 
   /** Return a frozen copy so callers cannot mutate the policy state. */
-  async listAllowedWorkspaces(): Promise<ReadonlyArray<string>> {
-    return Object.freeze([...(await this.canonicalAllowed())]);
+  async listAllowedWorkspaces(defaultCwd?: string): Promise<ReadonlyArray<string>> {
+    if (this.configured.length > 0) {
+      return Object.freeze([...(await this.explicitAllowed())]);
+    }
+    // 空配置：随调用方上下文目录动态解析（无上下文时回落 process.cwd()）。
+    return Object.freeze([await canonicalDirectory(defaultCwd ?? process.cwd())]);
   }
 
-  private canonicalAllowed(): Promise<readonly string[]> {
-    if (!this.allowedPromise) {
-      const values = this.configured.length > 0
-        ? this.configured
-        : [process.cwd()];
-      this.allowedPromise = canonicalizeAllowed(values);
+  /** 允许列表：显式配置时缓存；空配置时随调用方上下文目录动态计算（不缓存）。 */
+  private allowedFor(fallback: string): Promise<readonly string[]> {
+    if (this.configured.length > 0) return this.explicitAllowed();
+    return canonicalizeAllowed([fallback]);
+  }
+
+  private explicitAllowed(): Promise<readonly string[]> {
+    if (!this.explicitAllowedPromise) {
+      this.explicitAllowedPromise = canonicalizeAllowed(this.configured);
     }
-    return this.allowedPromise;
+    return this.explicitAllowedPromise;
   }
 }
 

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# 冒烟用的 mock 编码 CLI：让无真实执行器（codebuddy/opencode/...）的 CI runner 也能
+# 跑通任务生命周期（create → run → test → done/cancel）。满足内置 codebuddy adapter
+# 的调用契约：`codebuddy -p --output-format stream-json --max-turns N --permission-mode M <prompt>`。
+#
+# 契约要点（对齐 stage-runner 的 snapshot-diff 守卫）：
+#   - 退出码 0（执行器成功），不超时；
+#   - 绝不修改 worktree——stage 完成后的 collectDiff 要求工作区与执行前一致，
+#     否则判"执行器篡改工作区"而 stops。handback.md 由编排器写到 job 目录，不在 cwd。
+#   - 以 cwd（=worktree）为基准，模拟 CLI 完成后的 stdout 流。
+# 特殊标记（嵌在 prompt 里触发分支）：
+#   - "__mock_hang__"：长时间占用，供取消路径验证树级终止。
+#   - "__mock_fail__"：非零退出，供失败/重试路径验证。
+set -u
+cd "${CBX_MOCK_CWD:-$(pwd)}" >/dev/null 2>&1 || true
+
+PROMPT="${!#}"
+case "${PROMPT:-}" in
+  *"__mock_hang__"*)
+    sleep 3600
+    exit 0
+    ;;
+  *"__mock_fail__"*)
+    echo "mock: 刻意失败" >&2
+    exit 1
+    ;;
+esac
+
+echo '{"type":"stream-json","isThinking":false}'
+echo 'mock-codebuddy: completed'
+exit 0

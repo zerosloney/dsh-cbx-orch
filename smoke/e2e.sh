@@ -2,7 +2,8 @@
 # dsh-cbx-orch 端到端冒烟：把手工验证固化为可重复脚本。
 # 前置：无——profile 不存在时自动创建（CI 可直接跑）。
 # 环境变量：CBX_SMOKE_PORT（默认 3180）、CBX_SMOKE_SKIP_JOB=1（跳过任务生命周期
-# 一节，用于无执行器 CLI 的环境，如 CI runner）。
+# 一节，用于无执行器 CLI 的环境，如 CI runner 默认）、CBX_SMOKE_MOCK=1（用内置 mock
+# 编码 CLI 跑全生命周期——无真实执行器也能验证 create→run→test→done/cancel）。
 # 用法：npm run smoke:e2e   （或 bash smoke/e2e.sh）
 set -u
 
@@ -16,6 +17,16 @@ PROFILE_DIR="${DSH_HOME:-$HOME/.dsh}/profiles/cbx"
 LOG="$SMOKE_WS/dsh-smoke.log"
 COOKIE="$(mktemp)"
 SSE_OUT="$(mktemp)"
+
+# mock 执行器：CBX_SMOKE_MOCK=1 时用本仓库的假 codebuddy 跑任务生命周期。
+# 经 CBX_CODEBUDDY 注入后，findExecutable 会命中 mock 的 .mjs（node 执行），不依赖 PATH。
+MOCK_DIR="$PLUGIN_DIR/smoke/mock-executor"
+if [ "${CBX_SMOKE_MOCK:-0}" = "1" ]; then
+  MOCK_BIN="$MOCK_DIR/codebuddy.mjs"
+  [ -f "$MOCK_BIN" ] || { echo "FAIL  mock 执行器缺失: $MOCK_BIN"; exit 1; }
+  # 需求：findExecutable 首读 CBX_CODEBUDDY（.mjs → node 执行）。
+  export CBX_CODEBUDDY="$MOCK_BIN"
+fi
 
 PASS=0; FAIL=0
 check() { # name condition...
@@ -113,7 +124,9 @@ sleep 2
 check "cookie 连接收到 connected" bash -c "grep -q '\"type\":\"connected\"' \"$SSE_OUT\""
 
 echo "== 6. 任务生命周期 =="
-if [ "${CBX_SMOKE_SKIP_JOB:-0}" = "1" ]; then
+if [ "${CBX_SMOKE_MOCK:-0}" = "1" ]; then
+  echo "（CBX_SMOKE_MOCK=1：使用内置 mock codebuddy 验证全生命周期，包括 done 收口与取消）"
+elif [ "${CBX_SMOKE_SKIP_JOB:-0}" = "1" ]; then
   echo "SKIP  （CBX_SMOKE_SKIP_JOB=1：无执行器 CLI 的环境跳过本节）"
 else
 JOB=$(curl -s -b "$COOKIE" -X POST "$BASE/cbx/api/jobs?workspace=$WS_ENC" \
@@ -128,13 +141,45 @@ for i in $(seq 1 8); do
   sleep 1
 done
 check "任务进入 running(调度器+worker 生效)" test "$RAN" = 1
-curl -s -b "$COOKIE" -X POST "$BASE/cbx/api/jobs/$JOB/cancel" > /dev/null
-sleep 3
-FINAL=$(curl -s -b "$COOKIE" "$BASE/cbx/api/jobs/$JOB" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).status))")
-check "取消后终态 cancelled" test "$FINAL" = "cancelled"
-check "事件流已落盘" test -s ".cbx/jobs/$JOB/events.ndjson"
-check "worktree 容器已清理" bash -c "[ ! -d \"$PLUGIN_DIR/..smoke-ws.cbx-worktrees\" ]"
-check "取消无 cleanup_failed 噪音" bash -c "! grep -q cleanup_failed .cbx/jobs/$JOB/events.ndjson"
+if [ "${CBX_SMOKE_MOCK:-0}" = "1" ]; then
+  # mock 顺利时推进到 done（test_command 是 echo，恒成功）：
+  DONE=0
+  for i in $(seq 1 12); do
+    ST=$(curl -s -b "$COOKIE" "$BASE/cbx/api/jobs/$JOB" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).status))")
+    if [ "$ST" = "done" ]; then DONE=1; break; fi
+    [ "$ST" = "failed" ] && break
+    sleep 1
+  done
+  check "mock 任务终态 done(执行+测试+收口)" test "$DONE" = 1
+  check "result.json 已落盘" test -s ".cbx/jobs/$JOB/result.json"
+  check "事件流已落盘" test -s ".cbx/jobs/$JOB/events.ndjson"
+  check "worktree 容器已清理" bash -c "[ ! -d \"$PLUGIN_DIR/..smoke-ws.cbx-worktrees\" ]"
+  # 再来一个会挂起的任务验证取消的树级终止 + pid 归属。
+  HANG=$(curl -s -b "$COOKIE" -X POST "$BASE/cbx/api/jobs?workspace=$WS_ENC" \
+    -H 'content-type: application/json' \
+    -d '{"task":"e2e smoke hang __mock_hang__","review":false,"isolated":true,"test_command":"echo x","timeout_ms":20000,"max_retries":0}' \
+    | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).job_id))")
+  check "hang 任务创建返回 job_id" test -n "$HANG"
+  HR=0
+  for i in $(seq 1 8); do
+    ST=$(curl -s -b "$COOKIE" "$BASE/cbx/api/jobs/$HANG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).status))")
+    if [ "$ST" = "running" ]; then HR=1; break; fi
+    sleep 1
+  done
+  check "hang 任务进入 running" test "$HR" = 1
+  curl -s -b "$COOKIE" -X POST "$BASE/cbx/api/jobs/$HANG/cancel" > /dev/null
+  sleep 3
+  HF=$(curl -s -b "$COOKIE" "$BASE/cbx/api/jobs/$HANG" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).status))")
+  check "取消 hang 任务终态 cancelled(树级终止生效)" test "$HF" = "cancelled"
+else
+  curl -s -b "$COOKIE" -X POST "$BASE/cbx/api/jobs/$JOB/cancel" > /dev/null
+  sleep 3
+  FINAL=$(curl -s -b "$COOKIE" "$BASE/cbx/api/jobs/$JOB" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).status))")
+  check "取消后终态 cancelled" test "$FINAL" = "cancelled"
+  check "事件流已落盘" test -s ".cbx/jobs/$JOB/events.ndjson"
+  check "worktree 容器已清理" bash -c "[ ! -d \"$PLUGIN_DIR/..smoke-ws.cbx-worktrees\" ]"
+  check "取消无 cleanup_failed 噪音" bash -c "! grep -q cleanup_failed .cbx/jobs/$JOB/events.ndjson"
+fi
 fi
 
 echo "== 7. 三插件合体加载（cbx + ralph + state-graph 同场） =="

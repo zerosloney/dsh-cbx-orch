@@ -12,11 +12,21 @@
         review: true
         # Run tasks in an isolated git worktree.
         isolated: true
-        # Workspace allowlist for cbx tools. Empty/missing means only the
-        # canonical process.cwd(); explicit paths authorize exact workspaces.
+        # Workspace allowlist for cbx tools. Empty/missing = default workspace
+        # follows directory delegation (the agent session's working directory,
+        # falling back to process.cwd() when there is no session context);
+        # explicit paths authorize only those exact workspaces.
         # WorkspacePolicy realpath-canonicalizes entries (case-folding Windows
         # paths) and rejects unauthorized, missing, or non-directory targets.
         workspaces: []
+        # Optional host-env hardening for executor/test children (global fallback).
+        # Empty/missing = full process.env inheritance (intentional: coding CLIs
+        # need API credentials). Non-empty = only these vars (plus essential
+        # system vars like PATH/HOME/TEMP) reach the child. A workspace may
+        # override per-workspace via `.cbx.json` top-level `executors.envAllowlist`
+        # (workspace wins; workspace unconfigured falls back here). See README.
+        executors:
+          envAllowlist: []
     - id: cbx-orch-web
       name: 'dsh-cbx-orch/web'
       config:
@@ -29,5 +39,10 @@
           # Separate Web allowlist for ?workspace= selection. Uses the same
           # WorkspacePolicy canonicalization and rejects unauthorized, missing,
           # or non-directory targets; it is not automatically shared with the
-          # core cbx-orch workspaces setting.
+          # core cbx-orch workspaces setting. Empty = follow the harness
+          # workspace registry (ctx.workspaceRegistry): the dashboard shows the
+          # directories the user actually opens as workspaces in the harness
+          # GUI (so jobs created by /cbx-run in a delegated session directory
+          # appear on the dashboard); falls back to the process cwd when the
+          # registry is unavailable or empty.
           workspaces: []

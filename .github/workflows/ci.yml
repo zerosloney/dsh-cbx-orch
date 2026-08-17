@@ -48,6 +48,34 @@ jobs:
         env:
           CBX_SMOKE_SKIP_JOB: "1"
 
+  # 全生命周期冒烟：用内置 mock 编码 CLI（smoke/mock-executor/codebuddy.mjs）在无真实
+  # 执行器时也跑通 create→run→test→done + 取消的树级终止。不需要装 codebuddy。
+  e2e-mock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dsh-cbx-orch
+      - uses: actions/checkout@v4
+        with:
+          repository: zerosloney/dsh-ralph-loop
+          path: dsh-ralph-loop
+      - uses: actions/checkout@v4
+        with:
+          repository: zerosloney/dsh-state-graph
+          path: dsh-state-graph
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+        working-directory: dsh-cbx-orch
+      - run: npm install -g @deepseek-ai/dsh --no-audit --no-fund
+      - run: bash smoke/e2e.sh
+        working-directory: dsh-cbx-orch
+        env:
+          CBX_SMOKE_MOCK: "1"
+          CBX_SMOKE_PORT: "3181"
+
   # 发布物冒烟：npm pack → tarball 安装 → 真实加载（含 better-sqlite3 门控兜底）
   pack:
     runs-on: ubuntu-latest

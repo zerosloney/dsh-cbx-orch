@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { atomicWriteFile, loadJson, now, saveJson } from "./storage.js";
 import { captureAsync } from "./process-runner.js";
+import { syncEnvForChild } from "./subprocess-adapter.js";
 
 const CODE_PATHS = [".", ":(exclude).cbx", ":(exclude).cbx/**"];
 
@@ -13,6 +14,21 @@ const CODE_PATHS = [".", ":(exclude).cbx", ":(exclude).cbx/**"];
 export async function gitRoot(workspace: string): Promise<string | undefined> {
   const result = await captureAsync(["git", "rev-parse", "--show-toplevel"], workspace);
   return result.code === 0 && result.stdout.trim() ? path.resolve(result.stdout.trim()) : undefined;
+}
+
+/**
+ * isolated 任务要求工作区位于 Git 仓库：创建/准备时统一校验，抛出带修复途径的
+ * 错误（git init 或 isolated: false），避免任务带病入队后崩溃熔断才暴露根因。
+ */
+export async function requireGitRoot(workspace: string): Promise<string> {
+  const root = await gitRoot(workspace);
+  if (!root)
+    throw new Error(
+      `isolated=true 要求工作区位于 Git 仓库中：${workspace}。` +
+        `请先在该目录初始化 Git（git init）或改用已有仓库；` +
+        `或将 isolated 设为 false（任务将直接在主工作区执行）。`,
+    );
+  return root;
 }
 
 export interface GitBaseline { root: string; commit?: string; branch?: string; dirty: boolean; status: string; }
@@ -54,6 +70,8 @@ export async function gitDirtyFingerprint(workspace: string): Promise<string | u
         input: paths.join("\n") + "\n",
         encoding: "utf8",
         maxBuffer: 16 * 1024 * 1024,
+        // 同步 spawn 无法走 provider 白名单，这里显式复用同一套 env 裁剪。
+        env: syncEnvForChild(root),
       },
     );
     const blobs = (batched.stdout ?? "").split("\n").filter(Boolean);
@@ -92,8 +110,7 @@ export async function gitDirtyFingerprintTracked(workspace: string): Promise<str
 
 export async function prepareWorktree(workspace: string, directory: string, jobId: string, isolated: boolean, autoBranch = false, baseCommit = "HEAD"): Promise<string> {
   if (!isolated) return workspace;
-  const root = await gitRoot(workspace);
-  if (!root) throw new Error("--isolated 要求工作区位于 Git 仓库中。");
+  const root = await requireGitRoot(workspace);
   const target = path.join(path.dirname(root), `.${path.basename(root)}.cbx-worktrees`, jobId);
   await mkdir(path.dirname(target), { recursive: true });
   const branch = `cbx/${jobId}`;

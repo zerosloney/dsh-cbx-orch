@@ -138,7 +138,9 @@ test("invokeExecutor: job 运行中取消保留原始 reason 并清理插件 art
     import path from "node:path";
     export default { async run(request) {
       writeFileSync(path.join(request.directory, "plugin-running.marker"), "running");
-      await new Promise(() => {});
+      // setInterval 保持事件循环存活；纯 pending promise 会让子进程在写完 marker 后
+      // 立刻以 code 0 退出，取消路径探测不到"运行中的插件"。
+      await new Promise(() => setInterval(() => {}, 1_000));
     } };
   `);
   const controller = new AbortController();
@@ -162,7 +164,8 @@ test("invokeExecutor: caller 取消保留 caller reason 并清理插件 artifact
     import path from "node:path";
     export default { async run(request) {
       writeFileSync(path.join(request.directory, "plugin-running.marker"), "running");
-      await new Promise(() => {});
+      // setInterval 保持事件循环存活（纯 pending promise 会让子进程即刻退出）。
+      await new Promise(() => setInterval(() => {}, 1_000));
     } };
   `);
   const jobController = new AbortController();
@@ -187,7 +190,8 @@ test("invokeExecutor: caller 与 job 同时取消时 caller reason 优先", asyn
     import path from "node:path";
     export default { async run(request) {
       writeFileSync(path.join(request.directory, "plugin-running.marker"), "running");
-      await new Promise(() => {});
+      // setInterval 保持事件循环存活（纯 pending promise 会让子进程即刻退出）。
+      await new Promise(() => setInterval(() => {}, 1_000));
     } };
   `);
   const jobController = new AbortController();
@@ -214,7 +218,8 @@ test("invokeExecutor: 清理失败不遮蔽取消 reason，并写脱敏审计事
     export default { async run(request) {
       mkdirSync(path.join(request.directory, "plugin-request.json"));
       writeFileSync(path.join(request.directory, "plugin-running.marker"), "running");
-      await new Promise(() => {});
+      // setInterval 保持事件循环存活（纯 pending promise 会让子进程即刻退出）。
+      await new Promise(() => setInterval(() => {}, 1_000));
     } };
   `);
   const controller = new AbortController();

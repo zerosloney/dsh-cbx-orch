@@ -10,6 +10,7 @@ import {
   nextEventSeq,
   nextPendingDeliveryAt,
   recordDeliveryFailure,
+  recordEventMirrorFailure,
   redactSensitive,
   redactText,
   rescheduleDelivery,
@@ -294,6 +295,9 @@ export function flushDeliveries(
 
 const eventChains = new Map<string, Promise<void>>();
 
+/** 镜像失败只告警一次（按 workspace）：持续刷屏会淹没真正日志，但首次失败必须留痕。 */
+const eventMirrorWarned = new Set<string>();
+
 export async function publishEvent(
   workspace: string,
   type: string,
@@ -314,12 +318,17 @@ export async function publishEvent(
       ) as typeof event;
       await append(workspace, "events.ndjson", redacted);
       // SQLite 镜像（SSE 回放/查询源）：与 ndjson 同序写入（本进程内由 eventChains
-      // 串行化，seq 已在 nextEventSeq 分配）。镜像失败只落日志，不阻塞事件发布。
-      await insertEvent(workspace, seq, type, redacted).catch((error) =>
-        console.error(
-          `cbx: 事件 SQLite 镜像写入失败：${error instanceof Error ? error.message : String(error)}`,
-        ),
-      );
+      // 串行化，seq 已在 nextEventSeq 分配）。镜像失败只落日志 + 累计计数器，不阻塞事件发布；
+      // 计数器在 storage.ts（recordEventMirrorFailure），避免本模块与 storage 循环依赖。
+      await insertEvent(workspace, seq, type, redacted).catch((error) => {
+        recordEventMirrorFailure(workspace);
+        if (!eventMirrorWarned.has(workspace)) {
+          eventMirrorWarned.add(workspace);
+          console.error(
+            `cbx: 事件 SQLite 镜像写入失败（SSE 回放将与该 workspace 的 events.ndjson 漂移）：${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      });
       const notifications = current.notifications;
       const webhook = notifications?.webhook;
       if (webhook && notifications) {

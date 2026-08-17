@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { syncEnvForChild } from "../subprocess-adapter.js";
 
 // 内置执行器适配层：把 codebuddy / opencode / omp / cline / qwen 等编码 CLI 收敛到统一的调用契约。
 // 每个 adapter 描述：发现二进制的方式 + 如何把 (prompt, permissionMode, maxTurns) 翻译成 CLI 参数。
@@ -128,7 +129,7 @@ export function findExecutable(spec: BuiltinExecutor): string[] {
     const primary = spec.candidates[0];
     let resolved = resolvedPathCache.get(primary);
     if (resolved === undefined) {
-      const ps = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-Command ${primary}).Source`], { encoding: "utf8", windowsHide: true });
+      const ps = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-Command ${primary}).Source`], { encoding: "utf8", windowsHide: true, env: syncEnvForChild(process.cwd()) });
       resolved = ps.status === 0 ? String(ps.stdout).trim() : "";
       resolvedPathCache.set(primary, resolved);
     }

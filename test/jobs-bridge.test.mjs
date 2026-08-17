@@ -59,20 +59,60 @@ async function writeState(dir, status, extra = {}) {
   await savePersistedState(state.workspace, state.jobId, state);
 }
 
-test("bridgeCbxJob: 无 agent 上下文时不注册（返回 undefined）", async () => {
+test("bridgeCbxJob: 无 agent 上下文时不注册（返回 reason=no-agent-context）", async () => {
   await withJob(async ({ workspace, jobId }) => {
     let started = 0;
     const jobs = { start: () => { started += 1; return "cbx-1"; } };
-    const id = bridgeCbxJob(fakeContext(jobs), { workspace, jobId, task: "t", agent: undefined });
-    assert.equal(id, undefined);
+    const logs = [];
+    const result = bridgeCbxJob(fakeContext(jobs), {
+      workspace,
+      jobId,
+      task: "t",
+      agent: undefined,
+      logger: (m) => logs.push(m),
+    });
+    assert.equal(result.id, undefined);
+    assert.equal(result.reason, "no-agent-context");
     assert.equal(started, 0);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /无 agent 上下文/);
   });
 });
 
-test("bridgeCbxJob: 无 jobs 服务时不注册（返回 undefined）", async () => {
+test("bridgeCbxJob: exec.agent 缺省时回落到 ctx.agents.currentInitiator()", async () => {
   await withJob(async ({ workspace, jobId }) => {
-    const id = bridgeCbxJob(fakeContext(undefined), { workspace, jobId, task: "t", agent: {} });
-    assert.equal(id, undefined);
+    const specs = [];
+    const agent = { id: "session-from-initiator" };
+    const jobs = {
+      start: (spec) => { specs.push(spec); return "cbx-9"; },
+    };
+    const ctx = {
+      get(name) {
+        if (name === "jobs") return jobs;
+        if (name === "agents") return { currentInitiator: () => agent };
+        return undefined;
+      },
+    };
+    const result = bridgeCbxJob(ctx, { workspace, jobId, task: "fallback" });
+    assert.equal(result.id, "cbx-9");
+    assert.equal(specs.length, 1);
+    assert.equal(specs[0].owner, agent);
+  });
+});
+
+test("bridgeCbxJob: 无 jobs 服务时不注册（返回 reason=no-jobs-service）", async () => {
+  await withJob(async ({ workspace, jobId }) => {
+    const logs = [];
+    const result = bridgeCbxJob(fakeContext(undefined), {
+      workspace,
+      jobId,
+      task: "t",
+      agent: {},
+      logger: (m) => logs.push(m),
+    });
+    assert.equal(result.id, undefined);
+    assert.equal(result.reason, "no-jobs-service");
+    assert.match(logs[0] ?? "", /ctx.jobs 服务不可用/);
   });
 });
 
@@ -83,8 +123,14 @@ test("bridgeCbxJob: 有 agent 与 jobs 时注册并返回 harness job id", async
       start: (spec) => { specs.push(spec); return "cbx-7"; },
     };
     const agent = { id: "session-1" };
-    const id = bridgeCbxJob(fakeContext(jobs), { workspace, jobId, task: "  fix   the   bug  ", agent });
-    assert.equal(id, "cbx-7");
+    const result = bridgeCbxJob(fakeContext(jobs), {
+      workspace,
+      jobId,
+      task: "  fix   the   bug  ",
+      agent,
+    });
+    assert.equal(result.id, "cbx-7");
+    assert.equal(result.reason, undefined);
     assert.equal(specs.length, 1);
     assert.equal(specs[0].kind, "cbx");
     assert.equal(specs[0].owner, agent);
@@ -98,11 +144,21 @@ test("bridgeCbxJob: 有 agent 与 jobs 时注册并返回 harness job id", async
   });
 });
 
-test("bridgeCbxJob: jobs.start 抛错时静默退化为 undefined", async () => {
+test("bridgeCbxJob: jobs.start 抛错时返回 reason=registration-rejected + detail", async () => {
   await withJob(async ({ workspace, jobId }) => {
+    const logs = [];
     const jobs = { start: () => { throw new Error("no controller"); } };
-    const id = bridgeCbxJob(fakeContext(jobs), { workspace, jobId, task: "t", agent: {} });
-    assert.equal(id, undefined);
+    const result = bridgeCbxJob(fakeContext(jobs), {
+      workspace,
+      jobId,
+      task: "t",
+      agent: {},
+      logger: (m) => logs.push(m),
+    });
+    assert.equal(result.id, undefined);
+    assert.equal(result.reason, "registration-rejected");
+    assert.equal(result.detail, "no controller");
+    assert.match(logs[0] ?? "", /注册被拒绝/);
   });
 });
 
@@ -125,11 +181,18 @@ test("monitorCbxJob: 队列→运行→done 状态迁移与终态摘要", async 
     assert.equal(outcome.status, "completed");
     assert.match(outcome.output ?? "", /handback content/);
     assert.match(outcome.output ?? "", /changed files: 1/);
+    // 任务清单直接显示：终态摘要跟在状态行之后附上全量 job 表格（不必再单独调 cbx_list）。
+    assert.match(outcome.output ?? "", /任务清单/);
+    assert.match(outcome.output ?? "", /1 个 cbx job:/);
+    assert.match(outcome.output ?? "", /\| 20260101000000-abc123 \| done/);
 
     const read = hooks.readOutput();
     assert.match(read, /\[running/);
     assert.match(read, /\[done/);
     assert.match(read, /handback content/);
+    // 首轮快照：任务还在跑时 job_output 就能看到任务清单
+    assert.match(read, /任务清单/);
+    assert.match(read, /1 个 cbx job:/);
   });
 });
 

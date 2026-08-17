@@ -7,14 +7,15 @@ import path from "node:path";
 import CbxOrchestrator from "../lib/index.js";
 import { closeDatabaseConnections } from "../lib/storage.js";
 
-function fakeHarness() {
+function fakeHarness(overrides = {}) {
   const tools = new Map();
   const commands = new Map();
   const effects = [];
   const logger = { error() {}, warn() {}, info() {} };
+  const services = { ...(overrides.services ?? {}) };
   const context = {
     reflect: { provide() {} },
-    subprocess: {},
+    subprocess: overrides.subprocess ?? {},
     tools: {
       register(definition) {
         tools.set(definition.name, definition);
@@ -35,6 +36,13 @@ function fakeHarness() {
       effects.push({ cleanup, label });
       return cleanup;
     },
+    get(name) {
+      if (Object.prototype.hasOwnProperty.call(services, name)) return services[name];
+      // core 插件把 subprocess 作为 ctx 注入属性（index.ts 用 ctx.subprocess）；
+      // ctx.get 侧需能经同一路径读到，供 /cbx-web 的浏览器唤起走 subprocess 服务。
+      if (name === "subprocess") return overrides.subprocess ?? {};
+      return undefined;
+    },
   };
   return {
     context,
@@ -54,6 +62,20 @@ function fakeHarness() {
       await closeDatabaseConnections();
     },
   };
+}
+
+/** Windows 瞬态句柄的目录清理：退避重试并每轮重关连接（与 jobs-bridge 测试同模式）。 */
+async function rmRetry(target) {
+  for (let attempt = 0; ; attempt += 1) {
+    await closeDatabaseConnections();
+    try {
+      await rm(target, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt >= 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 async function waitForFile(file, timeoutMs = 5_000) {
@@ -136,5 +158,108 @@ test("命令默认工作区跟随委派的 agent 会话 cwd（header.cwd），�
   } finally {
     await harness.dispose();
     assert.equal(existsSync(cwdCbx), false, "测试不得在 cwd 留下 .cbx");
+  }
+});
+
+test("/cbx-web 解析会话 cwd 工作区并输出仪表盘链接（无 webServer 回落默认端口）", async (t) => {
+  const cwdCbx = path.join(process.cwd(), ".cbx");
+  if (existsSync(cwdCbx)) {
+    t.skip("当前 cwd 已有 .cbx，跳过避免触碰用户数据");
+    return;
+  }
+
+  const harness = fakeHarness();
+  const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-command-web-"));
+  try {
+    new CbxOrchestrator(harness.context, {
+      executor: "codebuddy",
+      review: true,
+      isolated: true,
+      workspaces: [],
+    });
+
+    const command = harness.commands.get("cbx-web");
+    assert.ok(command, "应捕获 cbx-web 命令");
+    const result = await command.handler({
+      rawInput: "",
+      agent: { session: { header: { cwd: delegated } } },
+    });
+    assert.equal(result.kind, "success");
+    // 会话 cwd 作为工作区；无 webServer 服务时回落默认端口 3080
+    assert.match(result.text, /cbx 仪表盘/);
+    assert.ok(result.text.includes(encodeURIComponent(delegated)), "链接应编码会话 cwd");
+    assert.match(result.text, /http:\/\/127\.0\.0\.1:3080\/cbx\/\?workspace=/);
+    // headless profile 提示 + 未自动打开浏览器的回落提示
+    assert.match(result.text, /未自动打开浏览器/);
+    assert.match(result.text, /未加载 cbx-orch-web/);
+    assert.equal(existsSync(cwdCbx), false, "命令不应在进程 cwd 创建 .cbx");
+  } finally {
+    await harness.dispose();
+    await rmRetry(delegated);
+    assert.equal(existsSync(cwdCbx), false, "测试不得在 cwd 留下 .cbx");
+  }
+});
+
+test("/cbx-web 显式 workspace 命中白名单并尝试在系统浏览器打开（实际端口 + cbxWeb 激活）", async () => {
+  const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-command-web-"));
+  const spawned = [];
+  const harness = fakeHarness({
+    services: { webServer: { port: 3456, host: "127.0.0.1" }, cbxWeb: {} },
+    subprocess: {
+      spawn(spec) {
+        spawned.push(spec);
+        return { done: Promise.resolve({ exitCode: 0, signal: null }) };
+      },
+    },
+  });
+  try {
+    new CbxOrchestrator(harness.context, {
+      executor: "codebuddy",
+      review: true,
+      isolated: true,
+      workspaces: [allowed],
+    });
+
+    const command = harness.commands.get("cbx-web");
+    assert.ok(command, "应捕获 cbx-web 命令");
+    const result = await command.handler({ rawInput: allowed });
+    assert.equal(result.kind, "success");
+    const url = `http://127.0.0.1:3456/cbx/?workspace=${encodeURIComponent(allowed)}`;
+    assert.ok(result.text.includes(url), `回复应包含实际端口的完整 URL：\n${result.text}`);
+    // cbx 插件激活：给出 token 提示而不是 headless 提示
+    assert.match(result.text, /Web token/);
+    assert.equal(result.text.includes("未加载 cbx-orch-web"), false);
+    // 已尝试通过 subprocess 打开浏览器：argv 末尾即完整 URL
+    assert.equal(spawned.length, 1);
+    assert.equal(spawned[0].argv[spawned[0].argv.length - 1], url);
+    assert.match(result.text, /已在系统默认浏览器尝试打开/);
+  } finally {
+    await harness.dispose();
+    await rmRetry(allowed);
+  }
+});
+
+test("/cbx-web 越权 workspace 拒绝并提示授权位置", async () => {
+  const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-command-web-"));
+  const denied = await mkdtemp(path.join(os.tmpdir(), "cbx-command-web-"));
+  const harness = fakeHarness();
+  try {
+    new CbxOrchestrator(harness.context, {
+      executor: "codebuddy",
+      review: true,
+      isolated: true,
+      workspaces: [allowed],
+    });
+
+    const command = harness.commands.get("cbx-web");
+    const result = await command.handler({ rawInput: denied });
+    assert.equal(result.kind, "error");
+    assert.match(result.text, /工作区|workspace/i);
+    assert.equal(result.text.includes(allowed), true, "报错应列出允许的工作区");
+    assert.equal(existsSync(path.join(allowed, ".cbx")), false, "拒绝时不应创建 .cbx");
+    assert.equal(existsSync(path.join(denied, ".cbx")), false, "拒绝时不应创建 .cbx");
+  } finally {
+    await harness.dispose();
+    await Promise.all([rmRetry(allowed), rmRetry(denied)]);
   }
 });

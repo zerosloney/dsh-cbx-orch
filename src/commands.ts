@@ -1,13 +1,17 @@
 import type { Context } from "@deepseek-ai/cordis";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import { startBackground, cancelJob } from "./lifecycle.js";
 import { createJob } from "./jobs.js";
 import { listQueue, pauseQueue, resumeQueue } from "./queue-api.js";
 import { listJobs, readArtifact } from "./artifacts.js";
+import { formatTaskList } from "./format.js";
 import { loadConfig, loadState, mergeConfig } from "./state.js";
 import { bridgeCbxJob } from "./jobs-bridge.js";
 import type { CbxDefaults, SessionCwdContext } from "./tools.js";
 import type { CommandResult } from "@deepseek-ai/dsh-commands";
 import { WorkspacePolicy } from "./workspace-policy.js";
+import { CBX_MOUNT } from "./web.js";
 
 /** Registration entry shared by the interactive command layer. */
 interface CbxCommandContext {
@@ -23,14 +27,74 @@ function err(text: string): CommandResult {
   return { kind: "error", text };
 }
 
+/**
+ * 仪表盘入口的默认端口（headless/core-only profile 拿不到 webServer 服务时的回落值，
+ * 与 README 中 dsh web GUI 的默认端口一致）。
+ */
+const DEFAULT_WEB_PORT = 3080;
+
+/** 从 harness webServer 服务取实际监听端口；服务不在时回落默认端口。 */
+function webBaseUrl(ctx: Context): string {
+  let port = DEFAULT_WEB_PORT;
+  try {
+    const webServer = ctx.get("webServer") as { port?: number } | undefined;
+    if (webServer && typeof webServer.port === "number" && webServer.port > 0)
+      port = webServer.port;
+  } catch {
+    /* 无 webServer 服务（headless profile）：回落默认端口 */
+  }
+  return `http://127.0.0.1:${port}`;
+}
+
+/** cbx 仪表盘是否已挂载：cbx-orch-web 插件激活时 ctx.cbxWeb 服务在。 */
+function webPluginActive(ctx: Context): boolean {
+  try {
+    return Boolean(ctx.get("cbxWeb"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 尝试在系统默认浏览器打开 URL（best-effort，fire-and-forget）。
+ * Windows: `cmd /c start "" <url>`；macOS: `open`；Linux: `xdg-open`。
+ * 无 subprocess 服务或 spawn 失败都静默跳过，调用方回落到"给出链接"。
+ */
+function tryOpenBrowser(ctx: Context, url: string): "opened" | "skipped" {
+  try {
+    const subprocess = ctx.get("subprocess") as
+      | { spawn?: (spec: unknown) => { done?: Promise<unknown>; terminate?: () => void } }
+      | undefined;
+    if (!subprocess || typeof subprocess.spawn !== "function") return "skipped";
+    const argv =
+      process.platform === "win32"
+        ? [process.env.ComSpec ?? "cmd.exe", "/d", "/c", "start", "", url]
+        : process.platform === "darwin"
+          ? ["open", url]
+          : ["xdg-open", url];
+    const handle = subprocess.spawn({
+      argv,
+      cwd: process.cwd(),
+      stdio: { stdin: "ignore", stdout: "inherit", stderr: "inherit" },
+      graceMs: 2_000,
+    });
+    // 不阻塞命令：浏览器启动进程快速退出；失败也不影响命令结果（链接总能点）。
+    void handle?.done?.catch(() => undefined);
+    return "opened";
+  } catch {
+    return "skipped";
+  }
+}
+
 export function registerCbxCommands(service: CbxCommandContext): void {
   const commands = service.ctx.commands;
   const defaults = service.defaults;
   const workspacePolicy = defaults.workspacePolicy ?? new WorkspacePolicy();
   // 默认工作区 = 当前 agent 会话的工作目录（目录委派时设定），回落 process.cwd()。
-  const resolveWorkspace = (invocation?: SessionCwdContext): Promise<string> =>
+  // 可显式传 workspace（如 /cbx-web <path>），同样受白名单约束。
+  const resolveWorkspace = (workspace: string | undefined, invocation?: SessionCwdContext): Promise<string> =>
     workspacePolicy.resolveWorkspace(
-      undefined,
+      workspace,
       invocation?.agent?.session?.header?.cwd,
     );
 
@@ -42,7 +106,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const task = invocation.rawInput.trim();
       if (!task) return err("Usage: /cbx-run <task>");
       try {
-        const ws = await resolveWorkspace(invocation);
+        const ws = await resolveWorkspace(undefined, invocation);
         const config = await loadConfig(ws);
         const merged = mergeConfig(config, {
           review: defaults.review,
@@ -73,16 +137,30 @@ export function registerCbxCommands(service: CbxCommandContext): void {
         await startBackground(ws, created.jobId, "", 0);
         // 会话内可见：注册 harness 原生后台任务，让当前会话能看到执行进度与最终输出
         // （job_output / job_wait / job_kill；tool-jobs 完成通知会投递回会话）。
-        const sessionJobId = bridgeCbxJob(service.ctx, {
+        // 桥失败时返回 reason，提示用户**为什么没接到前台**（修复"委派任务看不见"）。
+        const bridge = bridgeCbxJob(service.ctx, {
           workspace: ws,
           jobId: created.jobId,
           task,
           agent: invocation.agent,
+          logger: (message) => {
+            try {
+              service.ctx.logger("cbx")?.warn(message);
+            } catch {
+              /* logger 缺位不影响桥 */
+            }
+          },
         });
-        const sessionHint = sessionJobId !== undefined
-          ? ` session job ${sessionJobId}（会话内跟踪：job_output / job_kill）`
-          : "";
-        return ok(`job ${created.jobId} queued (executor ${merged.executor ?? defaults.executor ?? "codebuddy"}). Use /cbx-status ${created.jobId} to track it.${sessionHint}`);
+        const sessionHint = bridge.id !== undefined
+          ? ` session job ${bridge.id}（会话内跟踪：job_output / job_kill）`
+          : bridge.reason === "no-agent-context"
+            ? "（未注册会话任务：命令调用场景正常）"
+            : `（未注册会话任务：${bridge.reason}${bridge.detail ? ` ${bridge.detail}` : ""}）`;
+        // 任务清单直接显示在当前会话：回复附上全量 job 表格，不用再单独调 /cbx-list。
+        const taskList = await formatTaskList(await listJobs(ws));
+        return ok(
+          `job ${created.jobId} queued (executor ${merged.executor ?? defaults.executor ?? "codebuddy"}). Use /cbx-status ${created.jobId} to track it.${sessionHint}\n仪表盘：/cbx/?workspace=${encodeURIComponent(ws)}\n\n任务清单:\n${taskList}`,
+        );
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }
@@ -97,7 +175,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-status <job_id>");
       try {
-        const state = await loadState(await resolveWorkspace(invocation), jobId);
+        const state = await loadState(await resolveWorkspace(undefined, invocation), jobId);
         return ok(`[${jobId}] ${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.stage ? ` / stage ${state.stage}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
@@ -114,18 +192,28 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       if (!jobId) return err("Usage: /cbx-continue <job_id> [message]");
       const message = rest.join(" ");
       try {
-        const ws = await resolveWorkspace(invocation);
+        const ws = await resolveWorkspace(undefined, invocation);
         await startBackground(ws, jobId, message, 0);
-        const sessionJobId = bridgeCbxJob(service.ctx, {
+        const bridge = bridgeCbxJob(service.ctx, {
           workspace: ws,
           jobId,
           task: message || "continue",
           agent: invocation.agent,
+          logger: (msg) => {
+            try {
+              service.ctx.logger("cbx")?.warn(msg);
+            } catch {
+              /* logger 缺位不影响桥 */
+            }
+          },
         });
-        const sessionHint = sessionJobId !== undefined
-          ? ` session job ${sessionJobId}（会话内跟踪：job_output / job_kill）`
-          : "";
-        return ok(`job ${jobId} re-queued for continuation.${sessionHint}`);
+        const sessionHint = bridge.id !== undefined
+          ? ` session job ${bridge.id}（会话内跟踪：job_output / job_kill）`
+          : bridge.reason === "no-agent-context"
+            ? "（未注册会话任务：命令调用场景正常）"
+            : `（未注册会话任务：${bridge.reason}${bridge.detail ? ` ${bridge.detail}` : ""}）`;
+        const taskList = await formatTaskList(await listJobs(ws));
+        return ok(`job ${jobId} re-queued for continuation.${sessionHint}\n仪表盘：/cbx/?workspace=${encodeURIComponent(ws)}\n\n任务清单:\n${taskList}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }
@@ -140,7 +228,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-cancel <job_id>");
       try {
-        const state = await cancelJob(await resolveWorkspace(invocation), jobId);
+        const state = await cancelJob(await resolveWorkspace(undefined, invocation), jobId);
         return ok(`[${jobId}] ${state.status}`);
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
@@ -153,7 +241,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
     description: "List cbx jobs in the current workspace.",
     async handler(invocation) {
       try {
-        const jobs = await listJobs(await resolveWorkspace(invocation));
+        const jobs = await listJobs(await resolveWorkspace(undefined, invocation));
         if (jobs.length === 0) return ok("no cbx jobs in this workspace.");
         const lines = jobs.map((job) =>
           `[${job.jobId}] ${job.status}${job.phase ? ` / ${job.phase}` : ""}${job.createdAt ? ` created ${job.createdAt}` : ""}`,
@@ -172,7 +260,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
     async handler(invocation) {
       const action = invocation.rawInput.trim();
       try {
-        const ws = await resolveWorkspace(invocation);
+        const ws = await resolveWorkspace(undefined, invocation);
         if (action === "pause") return ok(JSON.stringify(await pauseQueue(ws)));
         if (action === "resume") return ok(JSON.stringify(await resumeQueue(ws)));
         if (action === "") return ok(JSON.stringify(await listQueue(ws)));
@@ -192,7 +280,45 @@ export function registerCbxCommands(service: CbxCommandContext): void {
       const jobId = invocation.rawInput.trim();
       if (!jobId) return err("Usage: /cbx-result <job_id>");
       try {
-        return ok(await readArtifact(await resolveWorkspace(invocation), jobId, "result.json"));
+        return ok(await readArtifact(await resolveWorkspace(undefined, invocation), jobId, "result.json"));
+      } catch (error) {
+        return err(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  commands.register({
+    name: "cbx-web",
+    description: "开启 cbx 仪表盘（Web 界面）：解析工作区、给出仪表盘链接，并尝试在系统默认浏览器打开。",
+    input: { hint: "[workspace]" },
+    async handler(invocation) {
+      try {
+        const workspaceArg = invocation.rawInput.trim() || undefined;
+        const ws = await resolveWorkspace(workspaceArg, invocation);
+        const base = webBaseUrl(service.ctx);
+        const url = `${base}${CBX_MOUNT}/?workspace=${encodeURIComponent(ws)}`;
+        const webActive = webPluginActive(service.ctx);
+        const launch = tryOpenBrowser(service.ctx, url);
+        const lines: string[] = [];
+        lines.push(`cbx 仪表盘（工作区：${ws}）`);
+        lines.push(`地址：${url}`);
+        lines.push(`打开： [cbx 仪表盘](${url})`);
+        if (launch === "opened") {
+          lines.push("已在系统默认浏览器尝试打开；若未弹出请点击上方链接。");
+        } else {
+          lines.push("未自动打开浏览器（无 subprocess 服务或当前受限）；请手动访问上面的链接。");
+        }
+        if (!webActive) {
+          lines.push(
+            "提示：当前 profile 未加载 cbx-orch-web 插件（headless profile），/cbx 路由尚未挂载；请用含 web 插件的配置（如 dsh --profile web）启动后访问。",
+          );
+        } else {
+          const tokenFile = path.join(ws, ".cbx", "web.token");
+          lines.push(
+            `提示：首次访问需输入 Web token（${existsSync(tokenFile) ? `见 ${tokenFile}` : "需在配置中设置 web.token"}）。`,
+          );
+        }
+        return ok(lines.join("\n"));
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));
       }

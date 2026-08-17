@@ -83,11 +83,15 @@ dsh --profile web
 >
 > **会话内后台任务桥**：`cbx_run` / `cbx_continue` / `/cbx-run` / `/cbx-continue` 在 harness 提供 `ctx.jobs`（dsh-base 的 dsh-jobs-local + agent preset 的 dsh-tool-jobs）时，把委派注册为 `kind: "cbx"` 的原生后台任务——当前会话可实时看到执行进度与最终输出（`job_output` / `job_wait` / `job_kill` 可用，完成后有完成通知），`job_kill` 幂等转发为 `cbx_cancel`。桥不可用时（无 agent 上下文 / 无 jobs 服务 / 并发上限）静默退化为旧行为：cbx job 照常运行，只是不在会话内显示。返回消息中的 `session job <id>` 提示即此桥已启用。
 >
+> **任务清单直接显示在当前会话**：`cbx_run` / `cbx_continue` 的提交响应、`/cbx-run` / `/cbx-continue` 的回复、会话后台任务的 `job_output` 首轮快照以及完成通知，都会直接附上当前工作区的**全量任务清单表格**（Job ID / Status / Phase / Attempt / Updated），不再需要先调 `cbx_list` 或打开仪表盘才能看到编排全局；清单来自落库后的实时快照（`src/format.ts` 的 `formatTaskList` 统一格式化）。
+>
 > **输出上限**：`cbx_result` / `cbx_artifact` 的文本输出截断到 64K 字符（保头尾并标注总长）；`cbx_status` / `cbx_cancel` / `cbx_approve` 等返回 state 的工具对超长字符串字段做深截断（8K）。完整内容仍在磁盘工件里，需要时用 `cbx_logs` 增量读取。
 
 ## 斜杠命令（`ctx.commands`）
 
-`/cbx-run <task>`、`/cbx-status <job_id>`、`/cbx-continue <job_id> [message]`、`/cbx-cancel <job_id>`、`/cbx-list`、`/cbx-queue [pause|resume]`、`/cbx-result <job_id>`。
+`/cbx-run <task>`、`/cbx-status <job_id>`、`/cbx-continue <job_id> [message]`、`/cbx-cancel <job_id>`、`/cbx-list`、`/cbx-queue [pause|resume]`、`/cbx-result <job_id>`、`/cbx-web [workspace]`。
+
+`/cbx-web [workspace]` 开启 cbx 仪表盘：解析当前工作区（或显式指定的 workspace，受白名单约束）后给出 Web 仪表盘链接，并尝试在系统默认浏览器打开；未加载 `cbx-orch-web` 插件的 headless profile 会给出提示。
 
 ## Web API
 

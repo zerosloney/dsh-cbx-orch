@@ -175,3 +175,42 @@ test("显式白名单时工具默认工作区不自作主张：会话 cwd 不在
     ]);
   }
 });
+
+test("cbx_run 结果附工作区任务清单（__taskList）且渲染直接显示在会话", async () => {
+  const ws = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-run-"));
+  try {
+    const tools = registeredTools(new WorkspacePolicy([ws]));
+    const definition = tools.get("cbx_run");
+    const result = await definition.execute({
+      workspace: ws,
+      task: "implement the feature",
+      test: "npm test",
+    });
+    assert.equal(result.status, "queued");
+    assert.equal(typeof result.job_id, "string");
+    // 任务清单随提交响应直接带出：落库后的实时全量 job 列表
+    assert.ok(Array.isArray(result.__taskList));
+    assert.equal(result.__taskList.length, 1);
+    assert.equal(result.__taskList[0].jobId, result.job_id);
+    assert.equal(result.__taskList[0].status, "queued");
+    // 渲染层把任务清单表格直接输出到当前会话（无需再单独调用 cbx_list）
+    const blocks = definition.output.render({ workspace: ws }, result);
+    const text = blocks.map((block) => block.text).join("\n");
+    assert.match(text, /任务清单/);
+    assert.match(text, /1 个 cbx job:/);
+    assert.equal(text.includes(result.job_id), true);
+  } finally {
+    // Windows 瞬态句柄：createJob/入队路径可能在 closeDatabaseConnections 返回后才
+    // 重开连接 → rm 撞 EBUSY。与 git-ops/storage 的 EBUSY 重试模式一致：退避重试并每轮重关连接。
+    for (let attempt = 0; ; attempt += 1) {
+      await closeDatabaseConnections();
+      try {
+        await rm(ws, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (attempt >= 4) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+  }
+});

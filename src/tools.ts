@@ -7,6 +7,7 @@ import {
   listJobs,
   readArtifact,
 } from "./artifacts.js";
+import type { JobState } from "./types.js";
 import { cancelJob, startBackground } from "./lifecycle.js";
 import { createJob } from "./jobs.js";
 import {
@@ -19,7 +20,8 @@ import {
 } from "./queue-api.js";
 import { runReviewGate } from "./review-gate.js";
 import { readAgentLogIncremental } from "./ui.js";
-import { bridgeCbxJob } from "./jobs-bridge.js";
+import { bridgeCbxJob, type CbxBridgeResult } from "./jobs-bridge.js";
+import { formatTaskList } from "./format.js";
 import { forgetJobKeepWorktree, loadConfig, loadState, mergeConfig, purgeJob } from "./state.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
 
@@ -91,11 +93,149 @@ function clampJson(value: unknown): unknown {
   return value;
 }
 
+/**
+ * cbx 仪表盘相对路径。cbx-orch-web 把仪表盘挂在 harness webServer 的 /cbx 前缀
+ * （见 src/web.ts CBX_MOUNT）；端口由 webServer 决定，工具层拿不到，UI 默认打开
+ * 同源 3080 端口。带 workspace query 让仪表盘跳到当前工作区。
+ */
+function dashboardUrl(workspace: string | undefined): string | undefined {
+  if (!workspace) return undefined;
+  return `/cbx/?workspace=${encodeURIComponent(workspace)}`;
+}
+
+/** 把仪表盘链接作为附注追加到工具渲染输出。 */
+function withDashboardFooter(text: string, workspace: string | undefined): string {
+  const url = dashboardUrl(workspace);
+  return url ? `${text}\n\n仪表盘：${url}` : text;
+}
+
+/**
+ * 把会话桥注册结果格式化成一行提示，附到 cbx_run / cbx_continue 的工具渲染文本。
+ * 让用户**看到为什么没接到会话任务总线**——原版静默吞错导致任务"消失"。
+ */
+function bridgeNote(result: CbxBridgeResult): string {
+  if (result.id) {
+    return `已注册为会话后台任务（harness job id: ${result.id}）；可用 job_output / job_wait / job_kill 跟踪进度。`;
+  }
+  switch (result.reason) {
+    case "no-agent-context":
+      return "未注册为会话后台任务（无 agent 上下文——非 chat 场景正常）。请用 cbx_status / cbx_logs 查看进度，或打开仪表盘。";
+    case "no-jobs-service":
+      return "未注册为会话后台任务（ctx.jobs 服务不可用——profile 未挂 dsh-jobs-local 或 agent preset 未挂 dsh-tool-jobs）。请用 cbx_status / cbx_logs 查看进度，或打开仪表盘。";
+    case "registration-rejected":
+      return `未注册为会话后台任务（jobs.start 被拒绝${result.detail ? `：${result.detail}` : ""}——并发上限或 controller 缺失）。请用 cbx_status / cbx_logs 查看进度，或打开仪表盘。`;
+    default:
+      return "未注册为会话后台任务。请用 cbx_status / cbx_logs 查看进度，或打开仪表盘。";
+  }
+}
+
+/**
+ * 把 cbx 状态对象格式化成可读短报告（chat UI 渲染）。
+ * 与 jsonOutput() 不同：这里给 UI 看，state 全量仍是 JSON value 留给模型。
+ */
+function renderJobStatus(args: Record<string, unknown>, value: unknown): ContentBlock[] {
+  const state = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  const ws = typeof args.workspace === "string" ? args.workspace : undefined;
+  const jobId = String(state.jobId ?? args.job_id ?? "—");
+  const status = String(state.status ?? "—");
+  const phase = typeof state.phase === "string" && state.phase ? state.phase : "—";
+  const attempt = typeof state.attempt === "number" ? state.attempt : undefined;
+  const stage = typeof state.stage === "string" && state.stage ? state.stage : undefined;
+  const maxTurns = typeof state.configuredMaxTurns === "number" ? state.configuredMaxTurns : undefined;
+  const executorInvocations = typeof state.executorInvocations === "number" ? state.executorInvocations : undefined;
+  const updatedAt = typeof state.updatedAt === "string" ? state.updatedAt : undefined;
+  const createdAt = typeof state.createdAt === "string" ? state.createdAt : undefined;
+  const error = typeof state.error === "string" ? state.error : undefined;
+  const reviewVerdict = typeof state.reviewVerdict === "string" ? state.reviewVerdict : undefined;
+
+  const lines: string[] = [];
+  lines.push(`cbx ${jobId}`);
+  lines.push(`  status:   ${status}`);
+  if (status === "running") lines.push(`  phase:    ${phase}`);
+  if (stage) lines.push(`  stage:    ${stage}`);
+  if (attempt !== undefined) {
+    const turns = maxTurns !== undefined ? ` (maxTurns ${maxTurns})` : "";
+    lines.push(`  attempt:  ${attempt}${turns}`);
+  }
+  if (typeof executorInvocations === "number") {
+    lines.push(`  execs:    ${executorInvocations} 次调用`);
+  }
+  if (createdAt) lines.push(`  created:  ${createdAt}`);
+  if (updatedAt) lines.push(`  updated:  ${updatedAt}`);
+  if (reviewVerdict) lines.push(`  review:   ${reviewVerdict}`);
+  if (error) lines.push(`  error:    ${error}`);
+  return jsonContent(withDashboardFooter(lines.join("\n"), ws));
+}
+
+/** cbx_list 的可读渲染：任务清单表格 + 仪表盘链接；JSON value 仍是全量 job 列表。 */
+function renderJobList(args: Record<string, unknown>, value: unknown): ContentBlock[] {
+  const ws = typeof args.workspace === "string" ? args.workspace : undefined;
+  const jobs = Array.isArray(value) ? value : [];
+  return jsonContent(withDashboardFooter(formatTaskList(jobs as JobState[]), ws));
+}
+
+/** cbx_queue 的可读渲染：调度状态摘要 + 仪表盘链接。 */
+function renderQueue(args: Record<string, unknown>, value: unknown): ContentBlock[] {
+  const ws = typeof args.workspace === "string" ? args.workspace : undefined;
+  const queue = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  const maxConcurrent = typeof queue.maxConcurrent === "number" ? queue.maxConcurrent : "—";
+  const paused = Boolean(queue.paused);
+  const entries = Array.isArray(queue.entries) ? queue.entries : [];
+  const lines: string[] = [];
+  lines.push(`queue: ${paused ? "paused" : "running"}, maxConcurrent=${maxConcurrent}, entries=${entries.length}`);
+  if (entries.length > 0) {
+    lines.push("");
+    lines.push("| Queue ID           | Job ID              | Status   | Priority | Reclaims |");
+    lines.push("|--------------------|---------------------|----------|----------|----------|");
+    for (const entry of entries) {
+      const e = entry as Record<string, unknown>;
+      const qid = String(e.queueId ?? "—");
+      const jid = String(e.jobId ?? "—");
+      const st = String(e.status ?? "—");
+      const pri = typeof e.priority === "number" ? String(e.priority) : "0";
+      const rec = typeof e.reclaimCount === "number" ? String(e.reclaimCount) : "0";
+      lines.push(`| ${qid.padEnd(18)} | ${jid.padEnd(19)} | ${st.padEnd(8)} | ${pri.padEnd(8)} | ${rec.padEnd(8)} |`);
+    }
+  }
+  return jsonContent(withDashboardFooter(lines.join("\n"), ws));
+}
+
+/**
+ * 构造给 cbx_run / cbx_continue / cbx_watch 用的渲染器。
+ * 把 bridge 结果 + 仪表盘链接附在 JSON value 之外，确保用户**看到**任务在前台的状态；
+ * execute 返回的 `__taskList`（工作区任务清单）也直接渲染进会话，不再需要单独调 cbx_list。
+ */
+function runJobOutput(args: Record<string, unknown>, value: unknown): ContentBlock[] {
+  const v = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  const ws = typeof args.workspace === "string" ? args.workspace : undefined;
+  const bridge = (v.__bridge && typeof v.__bridge === "object" ? v.__bridge : {}) as CbxBridgeResult;
+  const jobId = String(v.job_id ?? "—");
+  const status = String(v.status ?? "queued");
+  const lines: string[] = [];
+  lines.push(`cbx ${jobId} ${status}`);
+  lines.push(bridgeNote(bridge));
+  // 任务清单直接显示在当前会话；列表来自 execute 落库后的实时快照。
+  if (Array.isArray(v.__taskList)) {
+    lines.push("");
+    lines.push(`任务清单（${ws ?? "当前工作区"}）:`);
+    lines.push(formatTaskList(v.__taskList as JobState[]));
+  }
+  return jsonContent(withDashboardFooter(lines.join("\n"), ws));
+}
+
 export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
   const tools = ctx.tools;
   const workspacePolicy = defaults.workspacePolicy ?? new WorkspacePolicy();
   const workspaceOf = (input: string | undefined, exec?: SessionCwdContext): Promise<string> =>
     workspacePolicy.resolveWorkspace(input, sessionCwdOf(exec));
+  // 桥注册失败时打 warning 到 ctx.logger('cbx')，让 "委派任务在前台看不到" 的根因可见。
+  const bridgeLog = (message: string): void => {
+    try {
+      ctx.logger("cbx")?.warn(message);
+    } catch {
+      /* logger 服务缺位时不影响桥本身 */
+    }
+  };
 
   tools.register(defineTool({
     name: "cbx_run",
@@ -119,7 +259,10 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       review_rules: { type: "string", description: "Review focus instructions." },
       review_executor: { type: "string", description: "Executor for the review phase (defaults to executor)." },
     },
-    output: jsonOutput(),
+    output: {
+      schema: { type: "json" },
+      render: runJobOutput,
+    },
     async execute(args, exec) {
       const ws = await workspaceOf(args.workspace, exec);
       const config = await loadConfig(ws);
@@ -164,18 +307,24 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       await startBackground(ws, created.jobId, "", 0);
       // 会话内可见：把委派注册为 harness 原生后台任务（kind=cbx，归属当前 agent）。
       // 当前会话随即能在 UI/工具中看到执行情况（job_output/job_kill/job_wait），
-      // 完成后 tool-jobs 会把最终输出投递回会话。桥不可用时静默退化为纯 cbx。
-      const sessionJobId = bridgeCbxJob(ctx, {
+      // 完成后 tool-jobs 会把最终输出投递回会话。桥不可用时返回 reason，
+      // 渲染层向用户明示**为什么没接到前台**——不再静默吞错。
+      const bridge = bridgeCbxJob(ctx, {
         workspace: ws,
         jobId: created.jobId,
         task: args.task,
-        agent: exec.agent,
+        agent: exec?.agent,
+        logger: bridgeLog,
       });
-      return {
+      // 任务清单直接显示在当前会话：实时读取全量 job 列表附到返回值（渲染层输出表格）。
+      const taskList = clampJson(await listJobs(ws));
+      return toJson({
         job_id: created.jobId,
         status: "queued",
-        ...(sessionJobId !== undefined ? { jobId: sessionJobId } : {}),
-      };
+        __bridge: bridge,
+        __taskList: taskList,
+        ...(bridge.id !== undefined ? { jobId: bridge.id } : {}),
+      });
     },
   }));
 
@@ -186,7 +335,10 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       job_id: { type: "string", required: true, description: "The cbx job id." },
       workspace: { type: "string", description: "Project directory holding the job." },
     },
-    output: jsonOutput(),
+    output: {
+      schema: { type: "json" },
+      render: renderJobStatus,
+    },
     async execute(args, exec) {
       return toJson(clampJson(await loadState(await workspaceOf(args.workspace, exec), args.job_id)));
     },
@@ -198,7 +350,10 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     parameters: {
       workspace: { type: "string", description: "Project directory holding the jobs." },
     },
-    output: jsonOutput(),
+    output: {
+      schema: { type: "json" },
+      render: renderJobList,
+    },
     async execute(args, exec) {
       return toJson(await listJobs(await workspaceOf(args.workspace, exec)));
     },
@@ -210,7 +365,10 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     parameters: {
       workspace: { type: "string", description: "Project directory." },
     },
-    output: jsonOutput(),
+    output: {
+      schema: { type: "json" },
+      render: renderQueue,
+    },
     async execute(args, exec) {
       return toJson(await listQueue(await workspaceOf(args.workspace, exec)));
     },
@@ -262,7 +420,10 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       extra_rounds: { type: "integer", description: "Extra adaptive rounds when waiting at max_rounds." },
       refresh_baseline: { type: "boolean", description: "Refresh the baseline before continuing." },
     },
-    output: jsonOutput(),
+    output: {
+      schema: { type: "json" },
+      render: runJobOutput,
+    },
     async execute(args, exec) {
       const ws = await workspaceOf(args.workspace, exec);
       await startBackground(
@@ -274,17 +435,72 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         args.refresh_baseline === true,
         args.extra_rounds === undefined ? 0 : Number(args.extra_rounds),
       );
-      const sessionJobId = bridgeCbxJob(ctx, {
+      const bridge = bridgeCbxJob(ctx, {
         workspace: ws,
         jobId: args.job_id,
         task: args.message ?? "continue",
-        agent: exec.agent,
+        agent: exec?.agent,
+        logger: bridgeLog,
       });
-      return {
+      const taskList = clampJson(await listJobs(ws));
+      return toJson({
         job_id: args.job_id,
         status: "queued",
-        ...(sessionJobId !== undefined ? { jobId: sessionJobId } : {}),
-      };
+        __bridge: bridge,
+        __taskList: taskList,
+        ...(bridge.id !== undefined ? { jobId: bridge.id } : {}),
+      });
+    },
+  }));
+
+  tools.register(defineTool({
+    name: "cbx_watch",
+    description:
+      "Poll a cbx job until it reaches terminal state (done/failed/review_failed/cancelled/needs_fix) and return the final summary. Streams progress as additional chat context so the user sees status changes during the wait. Use this when no session job id was registered and you want live progress in the chat.",
+    parameters: {
+      job_id: { type: "string", required: true, description: "The cbx job id." },
+      workspace: { type: "string", description: "Project directory holding the job." },
+      poll_ms: { type: "integer", description: "Status poll interval in ms (default 2000)." },
+      timeout_ms: { type: "integer", description: "Max wait in ms (default 600000 = 10 min)." },
+    },
+    output: {
+      schema: { type: "json" },
+      render: renderJobStatus,
+    },
+    async execute(args, exec) {
+      const ws = await workspaceOf(args.workspace, exec);
+      const jobId = args.job_id;
+      const pollMs = args.poll_ms === undefined ? 2000 : Math.max(250, Number(args.poll_ms));
+      const timeoutMs = args.timeout_ms === undefined ? 600_000 : Math.max(1_000, Number(args.timeout_ms));
+      const signal = exec?.signal;
+      const start = Date.now();
+      let lastStatus: string | undefined;
+      // 简单轮询：state.json 是镜像，SQLite 是权威；loadState 内部统一读 SQLite。
+      while (true) {
+        if (signal?.aborted) throw signal.reason;
+        if (Date.now() - start > timeoutMs) {
+          throw new Error(
+            `cbx_watch: 等待 ${jobId} 超过 ${timeoutMs}ms 上限（最后状态：${lastStatus ?? "未知"}）。`,
+          );
+        }
+        let state;
+        try {
+          state = await loadState(ws, jobId);
+        } catch (error) {
+          throw new Error(
+            `cbx_watch: 读取 job 状态失败 — ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        const status = String(state.status ?? "");
+        if (status !== lastStatus) {
+          lastStatus = status;
+        }
+        const TERMINAL = new Set(["done", "failed", "review_failed", "cancelled", "needs_fix"]);
+        if (TERMINAL.has(status)) {
+          return toJson(clampJson(state));
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
     },
   }));
 
@@ -338,7 +554,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     description: "Read a job's result.json: changed files, handback, stages, test/acceptance summary, baseline, human gate.",
     parameters: {
       job_id: { type: "string", required: true, description: "The cbx job id." },
-      workspace: { type: "string", description: "Project directory." },
+      workspace: { type: "string", description: "Project directory holding the job." },
     },
     output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
     async execute(args, exec) {

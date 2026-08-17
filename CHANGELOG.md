@@ -24,6 +24,8 @@
 - 依赖守卫覆盖**新建**依赖文件（事件标注「新增」）；worktree 孤儿目录自愈；未跟踪符号链接/junction 不跟随（含 Windows 祖先链检查）。
 - 测试与冒烟：30 个单测（node:test）+ 端到端冒烟 `smoke/e2e.sh`（24 断言，含三插件合体加载）+ 发布物冒烟 `smoke/pack.sh`（tarball 安装 + native binding 验证，内置 npm ≥11.6 install-scripts 门控兜底）；CI workflow（含 `e2e-mock` job，用 `smoke/mock-executor` 假执行器跑通任务生命周期）。
 - **会话内后台任务桥**：`cbx_run`/`cbx_continue`/`/cbx-run`/`/cbx-continue` 在 harness 提供 `ctx.jobs` 时，把委派注册为 `kind: "cbx"` 的原生后台任务——当前会话可实时看到执行进度与最终输出（`job_output`/`job_wait`/`job_kill` 工具可用，完成后有完成通知），`job_kill` 幂等转发为 `cbx_cancel`；桥不可用时静默退化为旧行为（cbx job 照常运行，只是不在会话内显示）。详见 `docs/alignment.md` §4.2 与 `src/jobs-bridge.ts`。
+- **任务清单直接显示在当前会话**：`cbx_run`/`cbx_continue` 提交响应、`/cbx-run`/`/cbx-continue` 回复、会话后台任务的 `job_output` 首轮快照与完成通知，都直接附上当前工作区**全量任务清单表格**（Job ID/Status/Phase/Attempt/Updated），不用再单独调 `cbx_list`/`/cbx-list` 或开仪表盘才能看到编排全局。统一走新的共享格式化器 `src/format.ts`（`formatTaskList`），`cbx_list` 渲染亦复用之。
+- **新增 `/cbx-web [workspace]` 斜杠命令**：解析当前工作区（或显式 workspace，受白名单约束）后给出 cbx 仪表盘链接并尝试在系统默认浏览器打开（Windows `start` / macOS `open` / Linux `xdg-open`）；从 `ctx.webServer` 读取实际端口构造绝对 URL，未加载 `cbx-orch-web` 的 headless profile 会提示。浏览器唤起是 best-effort，失败回落为输出可点击链接。
 - 设计文档 `docs/alignment.md`：与 harness 原生服务（jobs/schedule/subagents/settings/事件）的边界与互操作决策。
 
 ### Fixed

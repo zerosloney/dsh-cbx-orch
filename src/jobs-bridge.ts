@@ -1,6 +1,8 @@
 import type { Context } from "@deepseek-ai/cordis";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { listJobs } from "./artifacts.js";
+import { formatTaskList } from "./format.js";
 import { cancelJob } from "./lifecycle.js";
 import { jobDir, loadState } from "./state.js";
 import { readArtifact } from "./artifacts.js";
@@ -18,13 +20,18 @@ import { TERMINAL_STATUSES, type JobState } from "./types.js";
  *
  * 本模块把一次 cbx 委派（创建/继续）注册为 `kind: "cbx"` 的原生后台任务：
  * - `label`：`cbx <jobId>: <task 摘要>`；
- * - `readOutput()`：增量返回 agent.log 尾部 + 状态迁移行；
- * - `done`：cbx job 进入终态时 resolve，输出为 result.json/state 摘要；
+ * - `readOutput()`：增量返回 agent.log 尾部 + 状态迁移行 + 任务清单快照；
+ * - `done`：cbx job 进入终态时 resolve，输出为 result.json/state 摘要 + 当前任务清单；
  * - `cancel(reason)`：转发为 `cancelJob`（幂等）。
  *
- * 桥是可选的、best-effort：`ctx.jobs` 不可用、无 agent 上下文、或 `start` 抛错
- * （例如该 agent 的 preset 没挂 tool-jobs，或并发任务数达上限）时静默退化为旧行为
- * ——cbx job 照常运行，只是不在会话内显示。所有错误都不影响 cbx 本身的执行。
+ * 任务清单（工作区全部 job 的状态表格）随首轮快照与最终通知直接显示在当前会话，
+ * 用户不用再单独调 cbx_list 就能看到编排全局。
+ *
+ * 桥是 best-effort：通过 ctx.agents.currentInitiator() 兜底获取发起会话的
+ * agent；ctx.jobs 不可用、无 agent 上下文或 `start` 抛错时返回带 reason 的
+ * 结构化结果，调用方可向会话输出**为什么没接到会话任务总线**——这是修复
+ * "委派任务在前台看不到"的关键：原来静默吞错的三个分支都会产生可见提示。
+ * 桥失败**不影响** cbx 本身的执行（任务照常入队跑，只是会话侧看不到实时进度）。
  */
 
 /**
@@ -58,41 +65,99 @@ export interface JobsRegistryLike {
   }): string;
 }
 
+/** 桥注册结果——结构化返回，让调用方可以告诉用户"为什么没接到会话任务总线"。 */
+export interface CbxBridgeResult {
+  /** Harness 原生 job id（`job_output` / `job_kill` 用），未注册成功时缺省。 */
+  id?: string;
+  /** 失败原因分类；成功时缺省。调用方根据 reason 决定如何在 UI 上提示。 */
+  reason?:
+    | "no-agent-context"
+    | "no-jobs-service"
+    | "registration-rejected";
+  /** 失败细节（异常 message / 错误描述），仅用于诊断日志。 */
+  detail?: string;
+}
+
 /** 桥接入参。 */
 export interface CbxBridgeOptions {
   workspace: string;
   jobId: string;
   task: string;
-  /** 发起委派的 harness agent；缺省（无会话上下文）时不注册。 */
+  /** 发起委派的 harness agent；缺省时通过 ctx.agents.currentInitiator() 兜底。 */
   agent?: unknown;
+  /**
+   * 桥注册失败的诊断日志 logger；缺省不打印（保持工具层的纯函数语义）。
+   * 测试时传 spy，生产传 `ctx.logger('cbx')`。
+   */
+  logger?: (message: string) => void;
 }
 
 /**
- * 把一次 cbx 委派注册为 harness 原生后台任务，返回 harness job id；
- * 桥不可用时返回 undefined（cbx 本身不受影响）。
+ * 解析当前会话的 agent：exec.agent 优先；缺省时回落到 ctx.agents.currentInitiator()
+ * （agent loop 启动的 driver chain 在异步上下文里始终带发起方）。这是修复
+ * "委派任务在前台看不到"的关键兜底——原版只读 exec.agent，而 exec.agent
+ * 在很多上下文里是 undefined，导致桥永远不接。
  */
-export function bridgeCbxJob(ctx: Context, options: CbxBridgeOptions): string | undefined {
-  const { agent } = options;
-  if (!agent) return undefined;
+function resolveAgent(ctx: Context, execAgent: unknown): unknown {
+  if (execAgent) return execAgent;
+  try {
+    const agents = ctx.get("agents") as
+      | { currentInitiator?: () => unknown }
+      | undefined;
+    const initiator = agents?.currentInitiator?.();
+    if (initiator) return initiator;
+  } catch {
+    /* ctx.agents 服务不在（瘦 profile / 命令行调用），静默回落 */
+  }
+  return undefined;
+}
+
+/**
+ * 把一次 cbx 委派注册为 harness 原生后台任务；返回结构化结果（成功带 id，
+ * 失败带 reason）。cbx 本身的执行不受桥影响。
+ */
+export function bridgeCbxJob(
+  ctx: Context,
+  options: CbxBridgeOptions,
+): CbxBridgeResult {
+  const agent = resolveAgent(ctx, options.agent);
+  if (!agent) {
+    const reason = "no-agent-context" as const;
+    options.logger?.(
+      `cbx jobs-bridge: 跳过注册 (${options.jobId}) — 无 agent 上下文（exec.agent 与 ctx.agents.currentInitiator() 都为空；非 chat 场景的命令行/cron 调用预期行为）。`,
+    );
+    return { reason };
+  }
   let jobs: JobsRegistryLike | undefined;
   try {
     jobs = ctx.get("jobs") as JobsRegistryLike | undefined;
   } catch {
     jobs = undefined;
   }
-  if (!jobs || typeof jobs.start !== "function") return undefined;
+  if (!jobs || typeof jobs.start !== "function") {
+    const reason = "no-jobs-service" as const;
+    options.logger?.(
+      `cbx jobs-bridge: 跳过注册 (${options.jobId}) — ctx.jobs 服务不可用（profile 未挂 dsh-jobs-local 或 agent preset 未挂 dsh-tool-jobs）。`,
+    );
+    return { reason };
+  }
   const label = `cbx ${options.jobId}: ${options.task.replace(/\s+/g, " ").trim().slice(0, 80)}`;
   try {
-    return jobs.start({
+    const id = jobs.start({
       kind: "cbx",
       label,
       owner: agent,
       outputLimitBytes: OUTPUT_LIMIT_BYTES,
       run: () => monitorCbxJob(options.workspace, options.jobId),
     });
-  } catch {
-    // 无 controller / 达并发上限 / 注册失败：静默退化为无桥接。
-    return undefined;
+    return { id };
+  } catch (error) {
+    const reason = "registration-rejected" as const;
+    const detail = error instanceof Error ? error.message : String(error);
+    options.logger?.(
+      `cbx jobs-bridge: 注册被拒绝 (${options.jobId}) — ${detail}（并发上限/preset 未挂 controller 等）。`,
+    );
+    return { reason, detail };
   }
 }
 
@@ -118,10 +183,27 @@ function mapOutcomeStatus(state: JobState): "completed" | "killed" | "failed" {
   return "failed";
 }
 
+/**
+ * 任务清单块：状态行之后紧跟当前工作区全量 job 列表（best-effort，失败返回空串）。
+ * 放在摘要头部，保证长 handback 撑满 64K 截断时清单仍保留。
+ */
+async function taskListBlock(workspace: string): Promise<string> {
+  try {
+    const jobs = await listJobs(workspace);
+    if (jobs.length === 0) return "";
+    return `任务清单（${jobs.length} 个 cbx job）:\n${formatTaskList(jobs)}`;
+  } catch {
+    return "";
+  }
+}
+
 /** 从 result.json / state 生成终态摘要（有限长度，供 job_output 与完成通知使用）。 */
 async function buildFinalSummary(workspace: string, jobId: string, state: JobState): Promise<string> {
   const lines: string[] = [];
   lines.push(`[${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}]`);
+  // 终态时直接把任务清单附在状态行之后——完成通知投递到当前会话时，用户能直接看到全量清单。
+  const list = await taskListBlock(workspace);
+  if (list) lines.push(list);
   let result: Record<string, unknown> | undefined;
   try {
     result = JSON.parse(await readArtifact(workspace, jobId, "result.json")) as Record<string, unknown>;
@@ -160,6 +242,7 @@ export function monitorCbxJob(
   let since = 0;
   let lastStatus: string | undefined;
   let cancelled = false;
+  let snapshotted = false;
   let timer: NodeJS.Timeout | undefined;
   let settled = false;
   let resolveDone!: (outcome: { status: "completed" | "killed" | "failed"; detail?: string; output?: string }) => void;
@@ -192,6 +275,12 @@ export function monitorCbxJob(
       state = undefined;
     }
     if (state) {
+      // 首轮快照：任务还在跑时，job_output 里直接看到当前全量任务清单（只打一次）。
+      if (!snapshotted && !BRIDGE_TERMINAL_STATUSES.has(state.status)) {
+        snapshotted = true;
+        const block = await taskListBlock(workspace);
+        if (block) buffer += `${block}\n`;
+      }
       if (state.status !== lastStatus) {
         lastStatus = state.status;
         buffer += `[${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}]\n`;

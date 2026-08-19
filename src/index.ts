@@ -45,7 +45,10 @@ export interface Config {
  * `dsh-cbx-orch/web` entry mounts the dashboard only where webServer exists.
  */
 export default class CbxOrchestrator extends Service {
-  static inject = ["subprocess", "tools", "commands"];
+  static inject = {
+    required: ["subprocess", "tools", "commands"],
+    optional: ["settings"],
+  };
 
   static Config: z<Config> = z.object({
     executor: z.string().default("codebuddy"),
@@ -187,3 +190,7 @@ export default class CbxOrchestrator extends Service {
     }, "cbx.scheduler");
   }
 }
+
+export { CbxOrchestrator };
+export * from "./types.js";
+

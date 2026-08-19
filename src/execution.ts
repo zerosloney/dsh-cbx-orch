@@ -180,7 +180,7 @@ async function executeJobLocked(
     );
   }
   const drift = await evaluateBaselineDrift(context, workspace);
-  if (context.isolated && context.baseDirty) {
+  if (context.isolated && context.baseDirty && !context.carryDirty) {
     const state = await writeState(
       workspace,
       jobId,
@@ -189,7 +189,7 @@ async function executeJobLocked(
         phase: "dirty_baseline",
         dirtyBaselineDrift: false,
         error:
-          "隔离任务无法携带创建时的未提交内容；请先提交或清理工作区后刷新基线。",
+          "隔离任务无法携带创建时的未提交内容；请先提交或清理工作区，或改用 carryDirty 把未提交改动带进 worktree。",
       },
       queueEntryId,
     );
@@ -254,6 +254,7 @@ async function executeJobLocked(
           context.isolated,
           context.autoBranch,
           context.baseCommit ?? "HEAD",
+          Boolean(context.carryDirty),
         );
   const maxAttempts = Math.max(1, context.maxRetries + 1);
   let attempt = Number(initial.attempt ?? 0);

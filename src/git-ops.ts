@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, readdir, rm, rmdir, stat } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -108,7 +108,7 @@ export async function gitDirtyFingerprintTracked(workspace: string): Promise<str
   return createHash("sha256").update(status.stdout).update("\0").update(tracked).digest("hex");
 }
 
-export async function prepareWorktree(workspace: string, directory: string, jobId: string, isolated: boolean, autoBranch = false, baseCommit = "HEAD"): Promise<string> {
+export async function prepareWorktree(workspace: string, directory: string, jobId: string, isolated: boolean, autoBranch = false, baseCommit = "HEAD", carryDirty = false): Promise<string> {
   if (!isolated) return workspace;
   const root = await requireGitRoot(workspace);
   const target = path.join(path.dirname(root), `.${path.basename(root)}.cbx-worktrees`, jobId);
@@ -130,8 +130,63 @@ export async function prepareWorktree(workspace: string, directory: string, jobI
     result = await captureAsync(args, root);
     if (result.code !== 0) throw new Error(`创建 Git worktree 失败：\n${result.stdout.trim()}`);
   }
-  await saveJson(path.join(directory, "worktree.json"), { path: target, branch: autoBranch ? branch : undefined, baseCommit, createdAt: now() });
+  // carryDirty：把主工作区创建时的未提交改动（已跟踪 diff + 未跟踪文件）带进隔离
+  // worktree，让隔离任务也能对"进行中的工作"安全执行，而不必先提交/清理主工作区、
+  // 也不会污染主工作区（执行器只改 worktree）。
+  if (carryDirty) {
+    await carryDirtyIntoWorktree(workspace, target, directory);
+  }
+  await saveJson(path.join(directory, "worktree.json"), { path: target, branch: autoBranch ? branch : undefined, baseCommit, carryDirty, createdAt: now() });
   return target;
+}
+
+/** 复制主工作区未提交/未跟踪改动进隔离 worktree。 */
+async function carryDirtyIntoWorktree(workspace: string, workdir: string, directory: string): Promise<void> {
+  const root = await gitRoot(workspace);
+  if (!root) return;
+  let patchFile: string | undefined;
+  // 1) 已跟踪改动（staged+unstaged）：git diff --binary HEAD → git apply 到 worktree。
+  const diff = await captureAsync(["git", "diff", "--binary", "HEAD", "--", ...CODE_PATHS], root);
+  if (diff.code === 0 && diff.stdout.trim()) {
+    patchFile = path.join(directory, "context.carry.patch");
+    await writeFile(patchFile, diff.stdout, "utf8");
+    const apply = await captureAsync(
+      ["git", "apply", "--whitespace=nowarn", "--binary", patchFile],
+      workdir,
+    );
+    if (apply.code !== 0)
+      throw new Error(
+        `把未提交改动应用到隔离 worktree 失败（task 基线 = HEAD + 当前脏改动）：\n${apply.stdout.trim()}`,
+      );
+  }
+  // 2) 未跟踪文件：复制进 worktree（跳过 .git / node_modules / 符号链接 / 超大文件）。
+  const listed = await captureAsync(
+    ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", ...CODE_PATHS],
+    root,
+  );
+  const paths = listed.stdout.split("\0").filter(Boolean);
+  const rootPrefix = path.resolve(root) + path.sep;
+  const workdirPrefix = path.resolve(workdir) + path.sep;
+  for (const relative of paths) {
+    if (relative.split(/[\\/]/).some((seg) => seg === "node_modules" || seg === ".git"))
+      continue;
+    if (await resolvesThroughSymlink(root, relative)) continue;
+    const srcFile = path.resolve(root, relative);
+    const dstFile = path.resolve(workdir, relative);
+    if (!srcFile.startsWith(rootPrefix) || !dstFile.startsWith(workdirPrefix)) continue;
+    try {
+      const info = await stat(srcFile);
+      if (!info.isFile()) continue;
+      if (info.size > 4_000_000) continue; // 超大记录/倒数产物不携带
+      await mkdir(path.dirname(dstFile), { recursive: true });
+      await writeFile(dstFile, await readFile(srcFile));
+    } catch {
+      /* 并发消失/不可读：跳过该文件，不阻断任务 */
+    }
+  }
+  if (patchFile !== undefined) {
+    await rm(patchFile, { force: true }).catch(() => undefined);
+  }
 }
 
 export async function cleanupRecordedWorktree(workspace: string, directory: string): Promise<boolean> {

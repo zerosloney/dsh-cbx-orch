@@ -12,6 +12,7 @@ test("CbxOrchestrator.Config: 空配置使用部署默认值", () => {
     executor: "codebuddy",
     review: true,
     isolated: true,
+    carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: [] },
   });
@@ -22,6 +23,7 @@ test("CbxOrchestrator.Config: 部分配置补齐默认值", () => {
     executor: "codebuddy",
     review: false,
     isolated: true,
+    carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: [] },
   });
@@ -36,6 +38,7 @@ test("CbxOrchestrator.Config: 完整配置保持覆盖语义", () => {
     executor: "opencode",
     review: false,
     isolated: false,
+    carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: [] },
   });
@@ -47,6 +50,7 @@ test("CbxOrchestrator.Config: 显式 workspace 列表保持覆盖语义", () => 
     executor: "codebuddy",
     review: true,
     isolated: true,
+    carryDirty: false,
     workspaces,
     executors: { envAllowlist: [] },
   });
@@ -57,6 +61,7 @@ test("CbxOrchestrator.Config: executors.envAllowlist 覆盖各自定义", () => 
     executor: "codebuddy",
     review: true,
     isolated: true,
+    carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: ["MY_TOKEN"] },
   });

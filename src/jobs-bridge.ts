@@ -162,7 +162,7 @@ export function bridgeCbxJob(
 }
 
 /** 轮询状态变更 + agent.log 尾部（内存游标，不碰 agent.log.cursor 共享文件）。 */
-async function tailAgentLog(workspace: string, jobId: string, since: number): Promise<{ text: string; next: number }> {
+export async function tailAgentLog(workspace: string, jobId: string, since: number): Promise<{ text: string; next: number }> {
   let raw: Buffer;
   try {
     raw = await readFile(path.join(jobDir(workspace, jobId), "agent.log"));
@@ -197,6 +197,9 @@ async function taskListBlock(workspace: string): Promise<string> {
   }
 }
 
+/** 完成通知中附带的 agent.log 尾部上限：处理消息是原始转录，控制体积避免撑爆 64K 输出。 */
+const LOG_TAIL_MAX_CHARS = 8_000;
+
 /** 从 result.json / state 生成终态摘要（有限长度，供 job_output 与完成通知使用）。 */
 async function buildFinalSummary(workspace: string, jobId: string, state: JobState): Promise<string> {
   const lines: string[] = [];
@@ -222,6 +225,20 @@ async function buildFinalSummary(workspace: string, jobId: string, state: JobSta
   if (Array.isArray(changed)) lines.push(`changed files: ${changed.length}`);
   const handback = pick("handback");
   if (handback) lines.push(`handback:\n${handback}`);
+  // 处理消息：执行器 agent.log 的尾部直接附进完成通知，让当前会话真正看到委派代理
+  // 做了什么（工具调用/推理/文件编辑的原始转录），而不是只有状态行与摘要。
+  try {
+    const log = await tailAgentLog(workspace, jobId, 0);
+    if (log.text) {
+      const tail =
+        log.text.length > LOG_TAIL_MAX_CHARS
+          ? `…（agent.log 共 ${log.text.length} 字符，截断保留尾部）\n${log.text.slice(-LOG_TAIL_MAX_CHARS)}`
+          : log.text;
+      lines.push(`\n处理消息（agent.log）:\n${tail}`);
+    }
+  } catch {
+    /* agent.log 不可读：跳过处理消息，摘要本身仍有效 */
+  }
   return lines.join("\n").slice(0, OUTPUT_LIMIT_BYTES);
 }
 

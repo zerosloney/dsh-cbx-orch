@@ -26,6 +26,11 @@ export interface Config {
   isolated?: boolean;
   /** Explicitly authorized workspace directories; an empty list means cwd only. */
   workspaces?: string[];
+  /** Default policy for carrying uncommitted changes into isolated worktrees.
+   *  true = isolated+dirty tasks that request carryDirty actually carry the dirty
+   *  state into the worktree; false (default) = such tasks fail-fast at creation
+   *  unless the caller opts in. */
+  carryDirty?: boolean;
   /** Opt-in host env allowlist for executor/test child processes. When set (non-empty),
    *  only these vars (plus essential system vars) reach the child; when empty/missing
    *  the host env is inherited as before (intentional: coding CLIs need API credentials). */
@@ -46,6 +51,7 @@ export default class CbxOrchestrator extends Service {
     executor: z.string().default("codebuddy"),
     review: z.boolean().default(true),
     isolated: z.boolean().default(true),
+    carryDirty: z.boolean().default(false),
     workspaces: z.array(z.string()).default([]),
     executors: z.object({
       envAllowlist: z.array(z.string()).default([]),
@@ -59,6 +65,7 @@ export default class CbxOrchestrator extends Service {
       executor: config.executor,
       review: config.review,
       isolated: config.isolated,
+      carryDirty: config.carryDirty,
       workspacePolicy,
     };
     // Route all executor/test/git child processes through the harness
@@ -144,6 +151,12 @@ export default class CbxOrchestrator extends Service {
         return pending;
       };
       void (async () => {
+        // 仅对**显式配置**的工作区在启动时拉起常驻调度器（崩溃重启后无需等下一次
+        // 入队就能续跑遗留任务）。空配置（workspaces: []）时工作区跟随委派目录动态
+        // 解析，没有单一权威目录可常驻——此时不预拉调度器，避免在 process.cwd() 里
+        // 无谓创建 .cbx；这些目录的调度器会在入队/派发时经 ensureScheduler 按需拉起，
+        // 同样会回收死 worker 并续跑遗留任务。
+        if (!workspacePolicy.hasExplicitWorkspaces()) return;
         let workspaces: readonly string[];
         try {
           workspaces = await workspacePolicy.listAllowedWorkspaces();

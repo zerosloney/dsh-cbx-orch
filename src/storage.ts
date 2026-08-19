@@ -47,6 +47,15 @@ export interface RuntimeConfig {
   ci?: { failOnReview?: boolean };
   executor?: string;
   reviewExecutor?: string;
+  /** 执行器路由偏好顺序（内置名/别名）；未知项忽略。缺省 = BUILTIN_EXECUTORS 顺序。 */
+  executorPreference?: string[];
+  /**
+   * 隔离任务携带未提交改动：`isolated: true` 且工作区有未提交内容时，默认 cbx 拒绝
+   * （隔离 worktree 从干净基线创建，带不动脏状态）。`carryDirty: true` 会把当前未提交
+   * 改动（已跟踪 diff + 未跟踪文件）复制进隔离 worktree，让隔离任务也能对"进行中的工作"
+   * 安全执行（不污染主工作区、也无需先提交）。缺省 false。
+   */
+  carryDirty?: boolean;
   templates?: Record<string, TaskTemplate>;
   execution?: { trustMode?: "trusted" | "untrusted" };
   plugins?: {
@@ -162,6 +171,8 @@ export async function loadRuntimeConfig(
     "ci",
     "executor",
     "reviewExecutor",
+    "executorPreference",
+    "carryDirty",
     "execution",
     "plugins",
     "notifications",
@@ -182,11 +193,20 @@ export async function loadRuntimeConfig(
   optionalInteger(config.maxRetries, "maxRetries", 0);
   optionalInteger(config.maxTurns, "maxTurns", 1);
   optionalBoolean(config.keepWorktree, "keepWorktree");
+  optionalBoolean(config.carryDirty, "carryDirty");
   optionalString(config.permissionMode, "permissionMode");
   optionalString(config.reviewRules, "reviewRules");
   optionalInteger(config.maxConcurrent, "maxConcurrent", 1);
   optionalString(config.executor, "executor");
   optionalString(config.reviewExecutor, "reviewExecutor");
+  if (
+    config.executorPreference !== undefined &&
+    (!Array.isArray(config.executorPreference) ||
+      config.executorPreference.some(
+        (item) => typeof item !== "string" || !item.trim(),
+      ))
+  )
+    throw new Error("executorPreference 必须是非空字符串数组。");
   optionalBoolean(config.dependencyGuard, "dependencyGuard");
   if (config.approval !== undefined) {
     const value = object(config.approval, "approval");

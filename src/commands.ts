@@ -8,6 +8,7 @@ import { listJobs, readArtifact } from "./artifacts.js";
 import { formatTaskList } from "./format.js";
 import { loadConfig, loadState, mergeConfig } from "./state.js";
 import { bridgeCbxJob } from "./jobs-bridge.js";
+import { noExecutorError, routeExecutor, type RouteDecision } from "./executor-router.js";
 import type { CbxDefaults, SessionCwdContext } from "./tools.js";
 import type { CommandResult } from "@deepseek-ai/dsh-commands";
 import { WorkspacePolicy } from "./workspace-policy.js";
@@ -112,6 +113,14 @@ export function registerCbxCommands(service: CbxCommandContext): void {
           review: defaults.review,
           isolated: defaults.isolated,
         });
+        // 先探测本机已安装的 agent CLI，再把委派路由到可用执行器（auto/回退）。
+        // 与 tools.ts 的 cbx_run 对齐：请求执行器 = 工作区 config ?? 插件配置默认。
+        // （不能用 merged.executor——它在 mergeConfig 里已被兜底为 config ?? "codebuddy"，
+        //   会丢 defaults.executor 的插件路径/特定内建默认。）
+        const decision: RouteDecision = routeExecutor(config.executor ?? defaults.executor, {
+          preference: config.executorPreference,
+        });
+        if (!decision.executor) throw noExecutorError(decision.available);
         const created = await createJob({
           workspace: ws,
           task,
@@ -128,8 +137,9 @@ export function registerCbxCommands(service: CbxCommandContext): void {
           autoBranch: merged.autoBranch,
           autoCommit: merged.autoCommit,
           commitMessage: merged.commitMessage,
-          executor: merged.executor ?? defaults.executor,
+          executor: decision.executor,
           reviewExecutor: merged.reviewExecutor,
+          carryDirty: config.carryDirty ?? defaults.carryDirty,
           adaptive: merged.adaptive,
           trustMode: merged.trustMode,
           dependencyGuard: merged.dependencyGuard,
@@ -158,8 +168,9 @@ export function registerCbxCommands(service: CbxCommandContext): void {
             : `（未注册会话任务：${bridge.reason}${bridge.detail ? ` ${bridge.detail}` : ""}）`;
         // 任务清单直接显示在当前会话：回复附上全量 job 表格，不用再单独调 /cbx-list。
         const taskList = await formatTaskList(await listJobs(ws));
+        const routedNote = decision.routed ? ` executor 路由：${decision.reason}` : "";
         return ok(
-          `job ${created.jobId} queued (executor ${merged.executor ?? defaults.executor ?? "codebuddy"}). Use /cbx-status ${created.jobId} to track it.${sessionHint}\n仪表盘：/cbx/?workspace=${encodeURIComponent(ws)}\n\n任务清单:\n${taskList}`,
+          `job ${created.jobId} queued (executor ${decision.executor}${routedNote}). Use /cbx-status ${created.jobId} to track it.${sessionHint}\n仪表盘：/cbx/?workspace=${encodeURIComponent(ws)}\n\n任务清单:\n${taskList}`,
         );
       } catch (error) {
         return err(error instanceof Error ? error.message : String(error));

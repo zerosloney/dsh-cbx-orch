@@ -15,6 +15,9 @@
 
 ### Added
 
+- **执行器路由（本机 agent CLI 检测 + 路由）**：`cbx_run`/`/cbx-run`/Web 创建接口在创建任务前探测本机已安装的编码 agent CLI（codebuddy/opencode/omp/cline/qwen）。`executor` 未指定/`"auto"` 时自动选偏好顺序第一个已安装；显式指定但未安装时自动回退到可用 CLI 并注明（`executor_preference` 工具参数 / `.cbx.json` 的 `executorPreference` 可调顺序）；本机一个 CLI 都没有时创建即报错并列出安装指引。`probeAllExecutors` 带短 TTL 缓存与 `resetExecutorProbeCache`。
+- **新增 `cbx_executors` 工具**：探测/列出本机可执行的编码 agent CLI 及其 envVar 覆盖来源（env/path/none）。
+- **委派处理消息流入当前会话**：`cbx_watch` 现在累计状态迁移 + agent.log 尾部（处理消息）并在终态一并返回（`include_log`/`max_log_chars`/`since` 可调）；会话后台任务（jobs-bridge）的完成通知与终态摘要附带 agent.log 处理消息尾部（截断到 8K，完整内容在磁盘）；运行期 `job_output` 可增量读到 agent.log 尾部。
 - `cbx_health` 默认只读（`prune: true` 才应用保留期清理）；`/api/metrics` 同样只读。
 - 工具输出上限：`cbx_result`/`cbx_artifact` 截断 64K（保头尾），state 类工具深截断 8K。
 - 事件回放 SQLite 化（schema v4 `events` 表 + 双写 + 游标查询），SSE 重连不再整读事件文件。
@@ -30,6 +33,7 @@
 
 ### Fixed
 
+- **隔离任务 + 脏基线（委派改进）**：`isolated=true` 且工作区有未提交内容时，此前任务带病入队、执行期才因 `dirty_baseline` 崩溃。现在**创建即报错**并列出三种补救（先提交/stash、`carryDirty: true`、或 `isolated: false`），省去无谓的崩溃循环。新增 **`carryDirty`** 选项（工具参数 `carry_dirty`，`.cbx.json`/插件配置 `carryDirty`）：置真后创建时把未提交改动（已跟踪 diff + 未跟踪文件）带进隔离 worktree，让隔离任务也能对"进行中的工作"安全执行（不污染主工作区、也无需先提交）——覆盖"审查/继续未提交改动"场景。`execution` 的隔离脏基线门同时改为在 `carryDirty` 时放行。
 - **Web 仪表盘默认工作区改为跟随 harness 工作区注册表**：`/cbx/` 默认显示 `ctx.workspaceRegistry`（harness GUI 中打开过的工作区/会话目录），`?workspace=` 可在其中切换；注册表不可用/为空时回落进程 cwd。此前 Web 层只默认进程 cwd，导致「会话目录里用 `/cbx-run` 创建的 job 在仪表盘上完全不可见，显式选择该目录还被 400 拒绝」。
 - **默认工作区跟随目录委派**（行为变更）：`cbx_*` 工具与 `/cbx-*` 命令在未显式传 `workspace` 时，默认工作区从「harness 进程 cwd」改为「当前 agent 会话的 `header.cwd`（目录委派时设定的工作目录）」，回落 `process.cwd()`。空配置（`workspaces: []`）时委派到哪个目录就在哪个目录跑 cbx；显式配置白名单时仍精确匹配列表，会话 cwd 不在列表内同样拒绝并提示配置位置。
 - **"无提示"诊断补齐**：原本只写进 `events.ndjson`、队列只留笼统错误的根因现在直接可见——`isolated=true` 但工作区不是 Git 仓库时，`cbx_run`/Web 创建接口**创建即报错**并给出修复建议（`git init` 或 `isolated: false`），不再让任务带病入队、崩溃 4 次后才以"worker 反复无法恢复"收场；已入队的任务熔断失败时，队列错误会携带最近一条 `worker_crash` 的真实原因。工作区授权被拒时，报错会列出**当前允许的工作区**并指明配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。
@@ -47,6 +51,8 @@
 - 跨工作区同名任务在 job-runtime 注册表串扰（复合键）；校验错误码化（Web 回 400 而非 500）；租约拒绝按错误码判定。
 - `plugin-request.json`（内嵌完整 prompt）用后即删；遥测 span 双层脱敏（键名 + 凭据形状）；投递死信剥 endpoint userinfo。
 - 全部 git 调用异步化（不再阻塞事件循环）；HMR 下 provider/调度器/定时器/连接的属主化与接管。
+- **常驻调度器不再向 `process.cwd()` 无谓落 `.cbx`**：插件启动只在**显式配置**的工作区预拉常驻调度器（崩溃重启后无需等下一次入队即可续跑遗留任务）；空配置（`workspaces: []`，工作区跟随委派目录动态解析）时不再预拉 `process.cwd()` 的调度器——否则会在启动目录创建 `.cbx/`（设备启动目录被污染，且空配置下 `process.cwd()` 并非真实任务目录，预拉不回收任何遗留任务）。这些目录的调度器仍在入队/派发时经 `ensureScheduler` 按需拉起，同样会回收死 worker 并续跑遗留任务。
+- **测试基建修复（Windows 既有 flake）**：`npm test` 全量并行时共享进程 cwd，部分测试有意探测 `process.cwd()` 回落并在共享 cwd 创建 `.cbx`，导致 `commands-workspace` 的 cwd 守卫测试误报。修复：`tools-workspace` 的 cwd 回落探测改在临时 cwd 内进行（不污染仓库 cwd）；`commands-workspace` 在 dispose 前删除委派目录改用 `rmRetry`（每轮重关连接 + 退避重试，消除 Windows 瞬态句柄 EBUSY）。全量 `node --test` 恢复全绿且运行后仓库 cwd 不再残留 `.cbx`。
 
 ### Security
 

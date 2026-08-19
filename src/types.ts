@@ -55,6 +55,8 @@ export interface JobContext {
   baseCommit?: string;
   baseBranch?: string;
   baseDirty?: boolean;
+  /** 是否把创建时的未提交改动带进隔离 worktree（carryDirty）。 */
+  carryDirty?: boolean;
   baseStatus?: string;
   dirtyFingerprint?: string;
   /** 脏指纹算法版本：2 = 仅跟踪文件（消除未跟踪 scratch 的漂移误报）；缺省 = v1。 */

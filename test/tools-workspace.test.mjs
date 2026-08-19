@@ -112,7 +112,12 @@ test("缺失或非目录 workspace 在 health 下游前被拒绝", async () => {
 test("空配置时默认工作区跟随 tool 调用的 agent 会话 cwd（目录委派语义）", async (t) => {
   const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-session-"));
   const unauthorized = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-session-"));
+  // 用临时 cwd 隔离「无 agent 上下文回落 process.cwd()」的探测：避免把 .cbx 写进
+  // 仓库 cwd（node --test 并行运行多个文件共享同一进程 cwd，会污染其他文件的 cwd 断言）。
+  const tempCwd = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-cwd-"));
+  const previousCwd = process.cwd();
   try {
+    process.chdir(tempCwd);
     // 空 allowlist：无显式 workspace 参数时，以 exec.agent.session.header.cwd 为默认工作区。
     const tools = registeredTools(); // WorkspacePolicy() → 空配置
     const lossless = (value) => JSON.parse(JSON.stringify(value));
@@ -136,14 +141,16 @@ test("空配置时默认工作区跟随 tool 调用的 agent 会话 cwd（目录
     } finally {
       await rm(other, { recursive: true, force: true });
     }
-    // 无 agent 上下文（exec 缺省）回落 process.cwd()。
+    // 无 agent 上下文（exec 缺省）回落 process.cwd()（此处为临时 cwd）。
     const cwdResult = await tools.get("cbx_health").execute({});
     assert.equal(lossless(cwdResult).status, "ok");
   } finally {
+    process.chdir(previousCwd);
     await closeDatabaseConnections();
     await Promise.all([
       rm(delegated, { recursive: true, force: true }),
       rm(unauthorized, { recursive: true, force: true }),
+      rm(tempCwd, { recursive: true, force: true }),
     ]);
   }
 });

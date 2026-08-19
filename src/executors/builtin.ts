@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
+import path from "node:path";
 import { syncEnvForChild } from "../subprocess-adapter.js";
 
 // 内置执行器适配层：把 codebuddy / opencode / omp / cline / qwen 等编码 CLI 收敛到统一的调用契约。
@@ -144,4 +146,133 @@ export function findExecutable(spec: BuiltinExecutor): string[] {
     return [candidate];
   }
   throw new Error(`找不到 ${spec.label} (${spec.candidates.join("/")})。请安装 ${spec.label}，或设置 ${spec.envVar}。`);
+}
+
+// ---------------------------------------------------------------------------
+// 本机 agent CLI 检测（路由前置）：probe 是 findExecutable 的非抛错版，返回
+// 「是否可用 + 来源」，供 cbx_executors / cbx_run 的路由层在创建期做决策。
+// 与 findExecutable 的差异：绝不抛错、不把「未安装」当作致命、带短 TTL 缓存。
+// ---------------------------------------------------------------------------
+
+export interface ExecutorProbe {
+  /** 内置执行器注册名（codebuddy/opencode/omp/cline/qwen）。 */
+  name: string;
+  /** 显示名。 */
+  label: string;
+  /** 本机是否可解析出可执行文件（PATH 命中或 envVar 覆盖存在）。 */
+  available: boolean;
+  /** 解析来源：env = envVar 覆盖；path = PATH/Get-Command 命中；none = 未安装。 */
+  source: "env" | "path" | "none";
+  /** 解析出的可执行路径/命令名（available=true 时才有）。 */
+  command?: string;
+  /** source=env 时记录覆盖用的环境变量名。 */
+  envVar?: string;
+}
+
+/** PATH 上按序查找可执行文件（POSIX；Windows 走 Get-Command，扩展名由 PATHEXT 处理）。 */
+function whichOnPath(name: string, env: Readonly<Record<string, string | undefined>>): string | undefined {
+  const pathVar = env.PATH ?? "";
+  for (const dir of pathVar.split(path.delimiter)) {
+    if (!dir) continue;
+    try {
+      const candidate = path.join(dir, name);
+      const st = statSync(candidate);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return candidate;
+    } catch {
+      /* 该 PATH 项无此文件 */
+    }
+  }
+  return undefined;
+}
+
+/** 解析单个候选名（PATH / Get-Command），成功返回可执行路径，失败 undefined。 */
+function resolveCandidateOnSystem(
+  primary: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string | undefined {
+  if (process.platform === "win32") {
+    let resolved = resolvedPathCache.get(primary);
+    if (resolved === undefined) {
+      // 安全：envVar 覆盖的裸名是外部可控值，绝不能拼进 PowerShell 字符串再解析，
+      // 否则值含 `;`、`()`、反引号等即可在本机执行任意命令（命令注入）。
+      // 用单引号字面量包裹 + 内部单引号加倍，使 primary 始终被当作 Get-Command
+      // 的参数名（纯字符串），而非可执行的 PowerShell 代码。
+      const escaped = primary.replace(/'/g, "''");
+      const ps = spawnSync(
+        "powershell.exe",
+        ["-NoProfile", "-Command", `Get-Command -Name '${escaped}' | Select-Object -ExpandProperty Source`],
+        { encoding: "utf8", windowsHide: true, env: syncEnvForChild(process.cwd()) },
+      );
+      resolved = ps.status === 0 ? String(ps.stdout).trim() : "";
+      resolvedPathCache.set(primary, resolved);
+    }
+    return resolved || undefined;
+  }
+  return whichOnPath(primary, env);
+}
+
+/** 单个内置执行器的可用性探测（非抛错）。env 可注入（测试用），缺省 process.env。 */
+export function probeExecutable(
+  spec: BuiltinExecutor,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): ExecutorProbe {
+  const configured = env[spec.envVar];
+  if (configured) {
+    // envVar 覆盖：路径形式直接查存在性；裸名走 PATH/Get-Command。
+    const looksLikePath = configured.includes("/") || configured.includes("\\");
+    const command = looksLikePath
+      ? existsSync(configured)
+        ? configured
+        : undefined
+      : resolveCandidateOnSystem(configured, env);
+    if (command) {
+      return { name: spec.name, label: spec.label, available: true, source: "env", command, envVar: spec.envVar };
+    }
+    return { name: spec.name, label: spec.label, available: false, source: "none", envVar: spec.envVar };
+  }
+  const command = resolveCandidateOnSystem(spec.candidates[0], env);
+  if (command) {
+    return { name: spec.name, label: spec.label, available: true, source: "path", command };
+  }
+  return { name: spec.name, label: spec.label, available: false, source: "none" };
+}
+
+/** 探测缓存 TTL：路由/工具调用不频繁，30s 内安装变更不即时可见（可接受，与文档一致）。 */
+const PROBE_TTL_MS = 30_000;
+
+interface ProbeCacheEntry {
+  fingerprint: string;
+  probes: ExecutorProbe[];
+  at: number;
+}
+let probeCache: ProbeCacheEntry | undefined;
+
+/** 探测缓存指纹：平台 + PATH + 全部覆盖变量。PATH/安装变更会自然失效。 */
+function probeFingerprint(env: Readonly<Record<string, string | undefined>>): string {
+  const parts = [process.platform, env.PATH ?? ""];
+  for (const spec of BUILTIN_EXECUTORS) parts.push(`${spec.envVar}=${env[spec.envVar] ?? ""}`);
+  return parts.join("|");
+}
+
+/** 清理探测缓存（测试用；环境/安装变更后如需立即重新探测可调用）。 */
+export function resetExecutorProbeCache(): void {
+  probeCache = undefined;
+  resolvedPathCache.clear();
+}
+
+/**
+ * 探测本机全部内置 agent CLI 的可用性。结果带短 TTL 缓存（probeFingerprint 变化即失效）。
+ * env 可注入（测试用）。返回顺序与 BUILTIN_EXECUTORS 一致。
+ */
+export function probeAllExecutors(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): ExecutorProbe[] {
+  const fingerprint = probeFingerprint(env);
+  const hit = probeCache;
+  if (hit && hit.fingerprint === fingerprint && Date.now() - hit.at < PROBE_TTL_MS) {
+    return hit.probes;
+  }
+  const probes = BUILTIN_EXECUTORS.map((spec) => probeExecutable(spec, env));
+  probeCache = { fingerprint, probes, at: Date.now() };
+  return probes;
 }

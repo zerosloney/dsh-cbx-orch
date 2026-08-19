@@ -211,6 +211,28 @@ test("monitorCbxJob: 取消保留 reason 并映射为 killed", async () => {
   });
 });
 
+test("monitorCbxJob: 完成通知附带 agent.log 处理消息尾部", async () => {
+  await withJob(async ({ workspace, jobId, dir }) => {
+    await writeState(dir, "running", { phase: "executor" });
+    // 模拟执行器 agent.log：写入一段处理消息（工具调用/推理转录）。
+    await writeFile(
+      path.join(dir, "agent.log"),
+      "reading src/a.ts\nediting src/a.ts: add helper\nrunning test...\nall checks passed\n",
+      "utf8",
+    );
+    await writeState(dir, "done", { phase: null });
+
+    const hooks = monitorCbxJob(workspace, jobId, 30);
+    const outcome = await hooks.done;
+    assert.equal(outcome.status, "completed");
+    // 处理消息直接附在完成通知里，当前会话能看到委派代理做了什么。
+    assert.match(outcome.output ?? "", /处理消息（agent\.log）/);
+    assert.match(outcome.output ?? "", /editing src\/a\.ts: add helper/);
+    const read = hooks.readOutput();
+    assert.match(read, /all checks passed/);
+  });
+});
+
 test("monitorCbxJob: 失败状态映射为 failed 并带错误信息", async () => {
   await withJob(async ({ workspace, jobId, dir }) => {
     await writeState(dir, "failed", { phase: "test", error: "tests failed" });

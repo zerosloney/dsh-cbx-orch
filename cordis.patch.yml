@@ -12,6 +12,11 @@
         review: true
         # Run tasks in an isolated git worktree.
         isolated: true
+        # Carry the workspace's uncommitted changes into the isolated worktree.
+        # true = isolated+dirty tasks that request carryDirty carry the dirty state
+        # into the worktree; false/omitted = creation fails fast with remedies
+        # (commit/clean, carryDirty, or isolated: false). Default false.
+        carryDirty: false
         # Workspace allowlist for cbx tools. Empty/missing = default workspace
         # follows directory delegation (the agent session's working directory,
         # falling back to process.cwd() when there is no session context);

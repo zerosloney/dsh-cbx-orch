@@ -65,6 +65,8 @@ export async function createJob(options: {
   commitMessage?: string;
   executor?: string;
   reviewExecutor?: string;
+  /** 隔离任务携带未提交改动（见 storage.ts RuntimeConfig.carryDirty）。 */
+  carryDirty?: boolean;
   trustMode?: "trusted" | "untrusted";
   contextSnapshot?: string;
   taskContract?: TaskContract;
@@ -147,6 +149,17 @@ export async function createJob(options: {
   if (taskContract)
     await saveJson(path.join(directory, "context-contract.json"), taskContract);
   const baseline = await snapshotGitBaseline(workspace);
+  // 创建期 fail-fast：隔离任务无法携带未提交内容（worktree 从干净基线创建）。
+  // 在创建时立刻给可操作提示，避免任务带病入队、执行期才因 dirty_baseline 崩溃。
+  // carryDirty: true 时才允许——把未提交改动带进隔离 worktree 执行。
+  if (options.isolated && baseline?.dirty && !options.carryDirty) {
+    throw new Error(
+      "隔离任务无法携带创建时的未提交内容。三种处理方式：\n" +
+        "  1) 先提交或清理工作区（git commit / stash）后重试；\n" +
+        "  2) 设 carryDirty: true（工具参数 carry_dirty）——把当前未提交改动带进隔离 worktree，任务在主工作区之外安全执行；\n" +
+        "  3) 设 isolated: false——任务直接在当前工作区（含未提交改动）执行。",
+    );
+  }
   // v2 脏指纹（仅跟踪文件）：未跟踪 scratch 文件不再触发非隔离任务的脏漂移误报。
   const dirtyFingerprint = await gitDirtyFingerprintTracked(workspace);
   const runtimeConfig = await loadConfig(workspace);
@@ -192,6 +205,7 @@ export async function createJob(options: {
     baseCommit: baseline?.commit,
     baseBranch: baseline?.branch,
     baseDirty: baseline?.dirty,
+    carryDirty: options.carryDirty ?? false,
     baseStatus: baseline?.status,
     dirtyFingerprint,
     dirtyFingerprintVersion: 2,

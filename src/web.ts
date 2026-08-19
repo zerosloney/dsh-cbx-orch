@@ -34,6 +34,7 @@ import {
   startBackground,
 } from "./core.js";
 import { isCbxError } from "./errors.js";
+import { noExecutorError, routeExecutor } from "./executor-router.js";
 import {
   AuthRateLimiter,
   HttpError,
@@ -437,6 +438,15 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
             autoCommit: typeof body.auto_commit === "boolean" ? body.auto_commit : undefined,
             commitMessage: typeof body.commit_message === "string" ? body.commit_message : undefined,
           });
+          // 先探测本机已安装的 agent CLI，再把委派路由到可用执行器（auto/回退）。
+          const decision = routeExecutor(defaults.executor, {
+            preference: config.executorPreference,
+          });
+          if (!decision.executor) {
+            const error = noExecutorError(decision.available);
+            json(res, { error: error.message }, 400);
+            return;
+          }
           const created = await createJob({
             workspace: ws,
             task: body.task,
@@ -454,8 +464,12 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
             autoBranch: defaults.autoBranch,
             autoCommit: defaults.autoCommit,
             commitMessage: defaults.commitMessage,
-            executor: defaults.executor,
+            executor: decision.executor,
             reviewExecutor: defaults.reviewExecutor,
+            carryDirty:
+              typeof body.carry_dirty === "boolean"
+                ? body.carry_dirty
+                : config.carryDirty,
             adaptive: defaults.adaptive,
             trustMode: defaults.trustMode,
             dependencyGuard: defaults.dependencyGuard,

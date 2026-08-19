@@ -154,7 +154,9 @@ test("命令默认工作区跟随委派的 agent 会话 cwd（header.cwd），�
       "命令应在委派目录解析工作区（.cbx 落在委派目录）",
     );
     assert.equal(existsSync(cwdCbx), false, "命令不应在进程 cwd 创建 .cbx");
-    await rm(delegated, { recursive: true, force: true });
+    // cbx-list 在委派目录打开过 state.sqlite；dispose 前 rm 会撞 Windows 瞬态句柄。
+    // rmRetry 每轮重关连接并退避重试，避免 EBUSY。
+    await rmRetry(delegated);
   } finally {
     await harness.dispose();
     assert.equal(existsSync(cwdCbx), false, "测试不得在 cwd 留下 .cbx");

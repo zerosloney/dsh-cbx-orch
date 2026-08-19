@@ -20,7 +20,13 @@ import {
 } from "./queue-api.js";
 import { runReviewGate } from "./review-gate.js";
 import { readAgentLogIncremental } from "./ui.js";
-import { bridgeCbxJob, type CbxBridgeResult } from "./jobs-bridge.js";
+import { bridgeCbxJob, tailAgentLog, type CbxBridgeResult } from "./jobs-bridge.js";
+import {
+  noExecutorError,
+  routeExecutor,
+  type RouteDecision,
+} from "./executor-router.js";
+import { probeAllExecutors } from "./executors/builtin.js";
 import { formatTaskList } from "./format.js";
 import { forgetJobKeepWorktree, loadConfig, loadState, mergeConfig, purgeJob } from "./state.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
@@ -30,6 +36,8 @@ export interface CbxDefaults {
   executor?: string;
   review?: boolean;
   isolated?: boolean;
+  /** 隔离任务携带未提交改动（插件配置默认；工具参数 carry_dirty / .cbx.json 覆盖）。 */
+  carryDirty?: boolean;
   /** Reuse a host-owned policy when one is supplied; otherwise only cwd is allowed. */
   workspacePolicy?: WorkspacePolicy;
 }
@@ -200,19 +208,67 @@ function renderQueue(args: Record<string, unknown>, value: unknown): ContentBloc
   return jsonContent(withDashboardFooter(lines.join("\n"), ws));
 }
 
+/** cbx_executors 的可读渲染：本机 agent CLI 探测表格 + 路由提示。 */
+function renderExecutors(_args: Record<string, unknown>, value: unknown): ContentBlock[] {
+  const probes = Array.isArray(value) ? value : [];
+  const lines: string[] = [];
+  lines.push("本机编码 agent CLI（cbx 执行器探测）:");
+  lines.push("");
+  lines.push("| Executor | Available | Source | Command |");
+  lines.push("|----------|-----------|--------|---------|");
+  for (const probe of probes) {
+    const p = (probe && typeof probe === "object" ? probe : {}) as Record<string, unknown>;
+    lines.push(
+      `| ${String(p.name ?? "—").padEnd(8)} | ${String(p.available ? "yes" : "no").padEnd(9)} | ${String(p.source ?? "—").padEnd(6)} | ${String(p.command ?? "—")} |`,
+    );
+  }
+  lines.push("");
+  lines.push("cbx_run 未指定 executor 时自动路由到第一个可用 CLI；显式指定但未安装会自动回退并注明。");
+  return jsonContent(lines.join("\n"));
+}
+
+/** cbx_watch 的可读渲染：状态迁移 + 处理消息（agent.log 尾部）+ 仪表盘链接。 */
+function renderWatchReport(args: Record<string, unknown>, value: unknown): ContentBlock[] {
+  const v = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+  const ws = typeof args.workspace === "string" ? args.workspace : undefined;
+  const state = (v.state && typeof v.state === "object" ? v.state : {}) as Record<string, unknown>;
+  const jobId = String(state.jobId ?? args.job_id ?? "—");
+  const status = String(state.status ?? "—");
+  const lines: string[] = [];
+  lines.push(`cbx ${jobId} ${status}`);
+  const events = Array.isArray(v.status_events) ? v.status_events : [];
+  if (events.length > 0) {
+    lines.push("");
+    lines.push("状态迁移:");
+    for (const event of events.slice(-30)) lines.push(`  ${String(event)}`);
+  }
+  const log = typeof v.log_tail === "string" ? v.log_tail : "";
+  if (log) {
+    lines.push("");
+    lines.push(`处理消息（agent.log 尾部${typeof v.log_chars === "number" ? `，共 ${v.log_chars} 字节` : ""}）:`);
+    lines.push(log);
+  }
+  return jsonContent(withDashboardFooter(lines.join("\n"), ws));
+}
+
 /**
- * 构造给 cbx_run / cbx_continue / cbx_watch 用的渲染器。
- * 把 bridge 结果 + 仪表盘链接附在 JSON value 之外，确保用户**看到**任务在前台的状态；
+ * 构造给 cbx_run / cbx_continue 用的渲染器。
+ * 把 bridge 结果 + 路由决策 + 仪表盘链接附在 JSON value 之外，确保用户**看到**任务在前台的状态；
  * execute 返回的 `__taskList`（工作区任务清单）也直接渲染进会话，不再需要单独调 cbx_list。
  */
 function runJobOutput(args: Record<string, unknown>, value: unknown): ContentBlock[] {
   const v = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
   const ws = typeof args.workspace === "string" ? args.workspace : undefined;
   const bridge = (v.__bridge && typeof v.__bridge === "object" ? v.__bridge : {}) as CbxBridgeResult;
+  const router = (v.__router && typeof v.__router === "object" ? v.__router : {}) as RouteDecision;
   const jobId = String(v.job_id ?? "—");
   const status = String(v.status ?? "queued");
   const lines: string[] = [];
   lines.push(`cbx ${jobId} ${status}`);
+  if (router.executor) {
+    const routed = router.routed ? `（路由：${router.reason}）` : "";
+    lines.push(`  executor: ${router.executor}${routed}`);
+  }
   lines.push(bridgeNote(bridge));
   // 任务清单直接显示在当前会话；列表来自 execute 落库后的实时快照。
   if (Array.isArray(v.__taskList)) {
@@ -244,10 +300,12 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     parameters: {
       task: { type: "string", required: true, description: "The task to delegate to the executor." },
       workspace: { type: "string", description: "Target project directory. Defaults to the invoking directory." },
-      executor: { type: "string", description: "Executor: codebuddy / opencode / omp / cline / qwen, or a plugin path." },
+      executor: { type: "string", description: "Executor: codebuddy / opencode / omp / cline / qwen, a plugin path, or \"auto\" (default: pick the first installed CLI, falling back automatically when the requested one is missing)." },
+      executor_preference: { type: "array", items: { type: "string" }, description: "Router preference order for auto selection/fallback (builtin names or aliases; unknown entries ignored)." },
       test: { type: "string", description: "Test command run after the executor finishes." },
       review: { type: "boolean", description: "Run an independent review phase after tests pass." },
       isolated: { type: "boolean", description: "Run in an isolated git worktree." },
+      carry_dirty: { type: "boolean", description: "Carry the workspace's uncommitted changes into the isolated worktree (isolated=true and the workspace is dirty). Default false — when false an isolated+dirty task fails fast at creation with remedies. Use this to safely run an isolated task on in-progress work without committing or touching the main tree." },
       timeout_ms: { type: "integer", description: "Per-execution timeout in ms." },
       max_retries: { type: "integer", description: "Automatic retry budget." },
       max_turns: { type: "integer", description: "Executor turn budget." },
@@ -266,6 +324,19 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     async execute(args, exec) {
       const ws = await workspaceOf(args.workspace, exec);
       const config = await loadConfig(ws);
+      // 路由：先探测本机已安装的 agent CLI，再把委派路由到可用执行器。
+      // - 未指定 / "auto" → 按 preference 选第一个已安装；
+      // - 显式指定但未安装 → 自动回退到可用 CLI（reason 说明）；
+      // - 插件路径 → 不参与路由；全部不可用 → 创建期报清晰错误。
+      const decision = routeExecutor(args.executor ?? config.executor ?? defaults.executor, {
+        preference: args.executor_preference ?? config.executorPreference,
+      });
+      if (!decision.executor) throw noExecutorError(decision.available);
+      if (decision.routed) {
+        bridgeLog(
+          `cbx 路由：${decision.reason}`,
+        );
+      }
       const merged = mergeConfig(config, {
         testCommand: args.test,
         review: args.review ?? defaults.review,
@@ -278,7 +349,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         approvalBeforeComplete: args.approval_before_complete,
         dependencyGuard: args.dependency_guard,
         keepWorktree: args.keep_worktree,
-        executor: args.executor ?? defaults.executor,
+        executor: decision.executor,
         reviewExecutor: args.review_executor,
       });
       const created = await createJob({
@@ -300,6 +371,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         commitMessage: merged.commitMessage,
         executor: merged.executor,
         reviewExecutor: merged.reviewExecutor,
+        carryDirty: args.carry_dirty ?? config.carryDirty ?? defaults.carryDirty,
         adaptive: merged.adaptive,
         trustMode: merged.trustMode,
         dependencyGuard: merged.dependencyGuard,
@@ -322,6 +394,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         job_id: created.jobId,
         status: "queued",
         __bridge: bridge,
+        __router: decision,
         __taskList: taskList,
         ...(bridge.id !== undefined ? { jobId: bridge.id } : {}),
       });
@@ -399,6 +472,19 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
   }));
 
   tools.register(defineTool({
+    name: "cbx_executors",
+    description: "Detect which coding-agent CLIs (codebuddy/opencode/omp/cline/qwen) are installed and resolvable on this machine for cbx execution, with their env-var overrides (CBX_CODEBUDDY/...). Use it before delegating when you want to confirm availability; cbx_run routes automatically to an available CLI when none is explicitly requested.",
+    parameters: {},
+    output: {
+      schema: { type: "json" },
+      render: renderExecutors,
+    },
+    async execute() {
+      return toJson(clampJson(probeAllExecutors()));
+    },
+  }));
+
+  tools.register(defineTool({
     name: "cbx_dispatch",
     description: "Dispatch the queue: reclaim dead workers and start queued jobs up to maxConcurrent.",
     parameters: {
@@ -456,25 +542,33 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
   tools.register(defineTool({
     name: "cbx_watch",
     description:
-      "Poll a cbx job until it reaches terminal state (done/failed/review_failed/cancelled/needs_fix) and return the final summary. Streams progress as additional chat context so the user sees status changes during the wait. Use this when no session job id was registered and you want live progress in the chat.",
+      "Poll a cbx job until it reaches terminal state (done/failed/review_failed/cancelled/needs_fix). Unlike plain polling, it accumulates the executor's processing messages (agent.log tail) and every status transition observed while waiting, and returns them together with the final state — so the current session sees what the delegated agent actually did, not just the outcome. Use this when no session job id was registered (or you want the transcript inline in the tool result).",
     parameters: {
       job_id: { type: "string", required: true, description: "The cbx job id." },
       workspace: { type: "string", description: "Project directory holding the job." },
       poll_ms: { type: "integer", description: "Status poll interval in ms (default 2000)." },
       timeout_ms: { type: "integer", description: "Max wait in ms (default 600000 = 10 min)." },
+      include_log: { type: "boolean", description: "Accumulate and return the executor agent.log tail (default true)." },
+      max_log_chars: { type: "integer", description: "Cap on the returned log tail in chars (default 16000)." },
+      since: { type: "integer", description: "Initial agent.log byte offset to start reading from (default 0)." },
     },
     output: {
       schema: { type: "json" },
-      render: renderJobStatus,
+      render: renderWatchReport,
     },
     async execute(args, exec) {
       const ws = await workspaceOf(args.workspace, exec);
       const jobId = args.job_id;
       const pollMs = args.poll_ms === undefined ? 2000 : Math.max(250, Number(args.poll_ms));
       const timeoutMs = args.timeout_ms === undefined ? 600_000 : Math.max(1_000, Number(args.timeout_ms));
+      const includeLog = args.include_log !== false;
+      const maxLogChars = args.max_log_chars === undefined ? 16_000 : Math.max(1_000, Math.min(64_000, Number(args.max_log_chars)));
       const signal = exec?.signal;
       const start = Date.now();
       let lastStatus: string | undefined;
+      const statusEvents: string[] = [];
+      let logBuffer = "";
+      let logCursor = args.since === undefined ? 0 : Math.max(0, Number(args.since));
       // 简单轮询：state.json 是镜像，SQLite 是权威；loadState 内部统一读 SQLite。
       while (true) {
         if (signal?.aborted) throw signal.reason;
@@ -494,10 +588,33 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         const status = String(state.status ?? "");
         if (status !== lastStatus) {
           lastStatus = status;
+          statusEvents.push(`[${status}${state.phase ? ` / ${state.phase}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}]`);
+        }
+        // 处理消息：poll 期间增量拉取 agent.log 尾部，保留最近 maxLogChars 字符——
+        // 终态返回时当前会话直接看到委派代理的处理过程（工具调用/推理/文件编辑）。
+        if (includeLog) {
+          try {
+            const chunk = await tailAgentLog(ws, jobId, logCursor);
+            if (chunk.text) {
+              logBuffer += chunk.text;
+              if (logBuffer.length > maxLogChars) {
+                logBuffer = logBuffer.slice(logBuffer.length - maxLogChars);
+              }
+            }
+            logCursor = chunk.next;
+          } catch {
+            /* agent.log 暂不可读：跳过本轮 */
+          }
         }
         const TERMINAL = new Set(["done", "failed", "review_failed", "cancelled", "needs_fix"]);
         if (TERMINAL.has(status)) {
-          return toJson(clampJson(state));
+          return toJson(clampJson({
+            state,
+            status_events: statusEvents.slice(-50),
+            log_tail: includeLog ? logBuffer : undefined,
+            log_chars: includeLog ? logCursor : undefined,
+            since: logCursor,
+          }));
         }
         await new Promise((resolve) => setTimeout(resolve, pollMs));
       }

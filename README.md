@@ -62,7 +62,8 @@ dsh --profile web
 
 | 工具 | 作用 |
 | --- | --- |
-| `cbx_run` | 创建并排队一个任务（task/executor/test/review/isolated/审批门等） |
+| `cbx_run` | 创建并排队一个任务（task/executor/test/review/isolated/carry_dirty/审批门等）；`executor` 缺省/"auto" 时按本机已安装的 agent CLI 自动路由；`carry_dirty` 把未提交改动带进隔离 worktree |
+| `cbx_executors` | 探测本机已安装/可解析的编码 agent CLI（codebuddy/opencode/omp/cline/qwen）及其 envVar 覆盖 |
 | `cbx_status` | 任务状态/阶段/尝试 |
 | `cbx_list` | 列出工作区所有任务 |
 | `cbx_queue` / `cbx_queue_pause` / `cbx_queue_resume` | 队列查看与暂停/恢复 |
@@ -72,18 +73,23 @@ dsh --profile web
 | `cbx_retry` | 重试失败任务 |
 | `cbx_approve` | 批准等待审批的任务 |
 | `cbx_result` / `cbx_artifact` / `cbx_artifacts` / `cbx_logs` | 读 result.json / 任意产物 / 产物列表 / agent.log 增量 |
+| `cbx_watch` | 轮询任务到终态，并**累计返回执行器处理消息（agent.log 尾部）与状态迁移**——让当前会话看到委派代理做了什么，而不只是最终结果 |
 | `cbx_health` | 队列深度、状态计数、失败/重试、死信（不含任务正文）。**默认只读**；`prune: true` 时才应用保留期清理 |
 | `cbx_clean` | forget/purge 任务（含 worktree 清理） |
 | `cbx_list_workspaces` | 列出已授权的工作区（不扫描任意 root 或子目录） |
 | `cbx_review_gate` | 对未提交改动跑独立审查 |
 
-> 工具参数使用 **snake_case**（如 `timeout_ms` / `max_retries` / `max_turns`）；`.cbx.json` 配置键与 Web/命令层使用 **camelCase**（`timeoutMs` / `maxRetries` / `maxTurns`）。二者仅命名风格不同，语义一一对应。
+> **执行器路由（先检测本机 agent CLI，再路由委派）**：`cbx_run` / `/cbx-run` / Web 创建接口在创建任务前先探测本机已安装的编码 agent CLI（codebuddy/opencode/omp/cline/qwen）。`executor` 未指定或为 `"auto"` 时，自动选择**偏好顺序中第一个已安装**的执行器；显式指定某个内置执行器但**未安装**时，默认自动回退到下一个可用 CLI（回退会写入返回信息与日志，`autoFallback` 语义见源码）；插件路径不参与内置路由。本机一个编码 CLI 都没有时**创建即报错**并列出安装指引（取代原先"创建后执行时 spawn 崩溃"的失败模式）。探测结果带短 TTL 缓存，命中即复用；偏好顺序可用工具参数 `executor_preference` 或 `.cbx.json` 的 `executorPreference` 覆盖（缺省 = 内置声明顺序 codebuddy, opencode, omp, cline, qwen）。`cbx_executors` 工具可随时查看当前探测结果。
+>
+> **工具参数使用 snake_case**（如 `timeout_ms` / `max_retries` / `max_turns` / `executor_preference`）；`.cbx.json` 配置键与 Web/命令层使用 camelCase（`timeoutMs` / `maxRetries` / `maxTurns` / `executorPreference`）。二者仅命名风格不同，语义一一对应。
 >
 > **默认工作区**：各工具/命令的 `workspace` 参数可省略，缺省 = 当前 agent 会话的工作目录（目录委派时设定，见「行为语义」）；显式传参必须命中工作区白名单。
 >
 > **会话内后台任务桥**：`cbx_run` / `cbx_continue` / `/cbx-run` / `/cbx-continue` 在 harness 提供 `ctx.jobs`（dsh-base 的 dsh-jobs-local + agent preset 的 dsh-tool-jobs）时，把委派注册为 `kind: "cbx"` 的原生后台任务——当前会话可实时看到执行进度与最终输出（`job_output` / `job_wait` / `job_kill` 可用，完成后有完成通知），`job_kill` 幂等转发为 `cbx_cancel`。桥不可用时（无 agent 上下文 / 无 jobs 服务 / 并发上限）静默退化为旧行为：cbx job 照常运行，只是不在会话内显示。返回消息中的 `session job <id>` 提示即此桥已启用。
 >
 > **任务清单直接显示在当前会话**：`cbx_run` / `cbx_continue` 的提交响应、`/cbx-run` / `/cbx-continue` 的回复、会话后台任务的 `job_output` 首轮快照以及完成通知，都会直接附上当前工作区的**全量任务清单表格**（Job ID / Status / Phase / Attempt / Updated），不再需要先调 `cbx_list` 或打开仪表盘才能看到编排全局；清单来自落库后的实时快照（`src/format.ts` 的 `formatTaskList` 统一格式化）。
+>
+> **委派处理消息流入当前会话**：执行器（外部编码 CLI）的处理过程——工具调用/推理/文件编辑的原始转录（agent.log）与状态迁移——现在会进入当前会话视图：① `cbx_watch` 轮询期间累计状态迁移 + agent.log 尾部，终态时连同最终状态一起返回（`include_log` / `max_log_chars` 可调，`since` 支持续读）；② 会话后台任务的完成通知（jobs-bridge 投递）自带 agent.log 尾部摘要（"处理消息（agent.log）"，截断到 8K 内，完整内容仍在磁盘），因此委派结束当前会话直接看到委派代理做了什么；③ `job_output` 运行期即可增量读到 agent.log 尾部。
 >
 > **输出上限**：`cbx_result` / `cbx_artifact` 的文本输出截断到 64K 字符（保头尾并标注总长）；`cbx_status` / `cbx_cancel` / `cbx_approve` 等返回 state 的工具对超长字符串字段做深截断（8K）。完整内容仍在磁盘工件里，需要时用 `cbx_logs` 增量读取。
 
@@ -118,6 +124,7 @@ dsh --profile web
         executor: codebuddy   # codebuddy / opencode / omp / cline / qwen / 插件路径
         review: true          # 测试通过后跑独立审查
         isolated: true        # git worktree 隔离执行
+        carryDirty: false     # 隔离任务携带未提交改动（缺省 false：isolated+dirty 创建即报错并给补救；true：把未提交改动带进 worktree 执行）
         workspaces: []        # cbx 工具工作区白名单；空/缺省 = 默认工作区跟随目录委派（agent 会话 cwd），显式列表仅精确放行
         executors:
           envAllowlist: []    # 可选硬化：非空时执行器/测试子进程只继承这些环境变量
@@ -152,8 +159,9 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 ## 行为语义
 
 - **重试预算**：`maxRetries` = 首次执行失败后允许的重试次数，总执行次数 = 1 + maxRetries（`maxRetries: 1` 即 2 次执行 + 1 次修复重试）。每个 stage 的预算独立持久化，崩溃重入不重置；用户 resolve Human Gate 或显式 retry 时归零。
-- **默认工作区跟随目录委派**：`cbx_*` 工具与 `/cbx-*` 命令在未显式传 `workspace` 时，默认工作区 = 当前 agent 会话的工作目录（`session.header.cwd`，即目录委派时设定的目录），无 agent 上下文时回落 `process.cwd()`。空配置（`workspaces: []`）时委派到哪个目录就在哪个目录跑；显式白名单仍精确匹配，会话 cwd 不在列表内同样拒绝并提示配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。调度器按工作区动态拉起（入队即 `ensureScheduler`），委派目录无需预先配置即可自动接管队列。
+- **默认工作区跟随目录委派**：`cbx_*` 工具与 `/cbx-*` 命令在未显式传 `workspace` 时，默认工作区 = 当前 agent 会话的工作目录（`session.header.cwd`，即目录委派时设定的目录），无 agent 上下文时回落 `process.cwd()`。空配置（`workspaces: []`）时委派到哪个目录就在哪个目录跑；显式白名单仍精确匹配，会话 cwd 不在列表内同样拒绝并提示配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。调度器按工作区动态拉起（入队即 `ensureScheduler`），委派目录无需预先配置即可自动接管队列。**常驻调度器只在显式配置的工作区于插件启动时预拉**（崩溃重启后无需等下一次入队就能续跑遗留任务）；空配置时工作区跟随委派目录动态解析、没有单一权威目录，故不预拉 `process.cwd()` 的调度器（避免在启动目录凭空创建 `.cbx/`），这些目录的调度器仍在入队/派发时按需拉起并同样续跑遗留任务。
 - **创建期前提校验（省去无谓的崩溃循环）**：`isolated=true` 但工作区不是 Git 仓库时，`cbx_run`/Web 创建接口**创建即报错**，错误信息直接给出修复建议（`git init` 或 `isolated: false`）。已入队的此类任务崩溃熔断时，队列错误的 `最后崩溃原因` 会带出真实的 `worker_crash` 根因，而不是笼统的"worker 反复无法恢复"。工作区授权被拒时，错误会列出当前允许的工作区与配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。
+- **隔离任务 + 工作区脏基线（`carryDirty`）**：`isolated=true` 且工作区有未提交内容时，隔离 worktree 从干净基线创建，带不动脏状态。缺省（`carryDirty` 未设）时 **`cbx_run`/`/cbx-run`/Web 创建即报错**并列出三种补救（先 `git commit`/`stash`、设 `carryDirty: true`、或 `isolated: false`），不再让任务带病入队、执行期才 `dirty_baseline` 崩溃。设 `carryDirty: true`（工具参数 `carry_dirty`，或 `.cbx.json`/插件配置 `carryDirty`）后，创建时会把当前未提交改动（已跟踪 diff + 未跟踪文件）带进隔离 worktree——任务在 worktree 里对"进行中的工作"安全执行，不污染主工作区、也无需先提交；任务结束时 worktree 仍按既有语义清理。适用于"审查/继续未提交的改动"这类场景。
 - **取消语义**：取消先落盘标记再终止子进程；正在收口的 done 遇到取消标记会改按取消收口（state 与队列条目保持一致）。跨进程清理残留执行器时先校验 pid 归属（记录 spawn 时刻，按平台比对进程实际启动时间），pid 已被系统复用时跳过 kill 并落审计事件——宁可留待人工处理，不误杀无关进程树。
 - **审批流**：before_run 审批通过即原子重入队并立即 dispatch；before_complete 审批在 commit 前后各核一次取消标记，证据哈希与 worktree 快照不符则拒绝完成（`completion_evidence_stale`）。
 - **基线漂移（v2 指纹）**：脏指纹只统计已跟踪文件的状态与 diff——工作区里的未跟踪 scratch 文件、其他任务留下的产物不再触发误报。旧任务仍按 v1 比对，显式 `refresh_baseline` 时升级到 v2。

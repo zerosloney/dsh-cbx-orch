@@ -22,6 +22,11 @@ export class WorkspacePolicy {
     this.configured = [...allowedWorkspaces];
   }
 
+  /** 是否显式配置了工作区白名单。空配置时工作区跟随委派目录动态解析，无单一权威目录。 */
+  hasExplicitWorkspaces(): boolean {
+    return this.configured.length > 0;
+  }
+
   /**
    * Resolve an optional request to one of the configured workspaces.
    * Missing input means the caller's context directory (`defaultCwd`),

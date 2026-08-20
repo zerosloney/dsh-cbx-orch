@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import CbxOrchestrator from "../lib/index.js";
@@ -187,9 +187,12 @@ test("/cbx-web 解析会话 cwd 工作区并输出仪表盘链接（无 webServe
       agent: { session: { header: { cwd: delegated } } },
     });
     assert.equal(result.kind, "success");
-    // 会话 cwd 作为工作区；无 webServer 服务时回落默认端口 3080
+    // 会话 cwd 作为工作区；无 webServer 服务时回落默认端口 3080。
+    // 链接里的工作区是 realpath 规范化后的规范形式（CI runner 上 realpath 会展开
+    // 8.3 短名如 RUNNER~1），断言也用规范化后的形式，平台无关。
+    const canonicalDelegated = await realpath(delegated);
     assert.match(result.text, /cbx 仪表盘/);
-    assert.ok(result.text.includes(encodeURIComponent(delegated)), "链接应编码会话 cwd");
+    assert.ok(result.text.includes(encodeURIComponent(canonicalDelegated)), "链接应编码会话 cwd");
     assert.match(result.text, /http:\/\/127\.0\.0\.1:3080\/cbx\/\?workspace=/);
     // headless profile 提示 + 未自动打开浏览器的回落提示
     assert.match(result.text, /未自动打开浏览器/);
@@ -226,7 +229,8 @@ test("/cbx-web 显式 workspace 命中白名单并尝试在系统浏览器打开
     assert.ok(command, "应捕获 cbx-web 命令");
     const result = await command.handler({ rawInput: allowed });
     assert.equal(result.kind, "success");
-    const url = `http://127.0.0.1:3456/cbx/?workspace=${encodeURIComponent(allowed)}`;
+    const canonicalAllowed = await realpath(allowed);
+    const url = `http://127.0.0.1:3456/cbx/?workspace=${encodeURIComponent(canonicalAllowed)}`;
     assert.ok(result.text.includes(url), `回复应包含实际端口的完整 URL：\n${result.text}`);
     // cbx 插件激活：给出 token 提示而不是 headless 提示
     assert.match(result.text, /Web token/);
@@ -257,7 +261,7 @@ test("/cbx-web 越权 workspace 拒绝并提示授权位置", async () => {
     const result = await command.handler({ rawInput: denied });
     assert.equal(result.kind, "error");
     assert.match(result.text, /工作区|workspace/i);
-    assert.equal(result.text.includes(allowed), true, "报错应列出允许的工作区");
+    assert.equal(result.text.includes(await realpath(allowed)), true, "报错应列出允许的工作区");
     assert.equal(existsSync(path.join(allowed, ".cbx")), false, "拒绝时不应创建 .cbx");
     assert.equal(existsSync(path.join(denied, ".cbx")), false, "拒绝时不应创建 .cbx");
   } finally {

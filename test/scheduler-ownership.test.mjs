@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rename, rm, symlink, unlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -33,7 +33,9 @@ test("scheduler ownership: shared generation survives partial release and restar
     const second = await acquireScheduler(path.join(workspace, "."));
     handles.push(second);
 
-    assert.equal(first.workspace, workspace);
+    // CI runner 上 realpath 会展开 8.3 短名（如 RUNNER~1），与 mkdtemp 返回的长名不同：
+    // 以 realpath 规范化后的形式断言，平台无关。
+    assert.equal(first.workspace, await realpath(workspace));
     assert.strictEqual(first.ready, second.ready, "canonical aliases must share one scheduler generation");
     const service = await first.ready;
     assert.ok(service, "the scheduler should start for a temporary workspace");

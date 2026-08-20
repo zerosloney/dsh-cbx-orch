@@ -86,6 +86,9 @@ test("越权 workspace 拒绝且使用稳定 CbxError code", async () => {
 test("越权报错带可操作提示：列出允许的工作区与配置位置", async () => {
   const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-policy-"));
   const denied = await mkdtemp(path.join(os.tmpdir(), "cbx-policy-"));
+  // CI runner 上 realpath 会展开 8.3 短名（如 RUNNER~1），与 mkdtemp 返回的长名不同；
+  // 报错列出的是 realpath 规范化后的允许路径，断言用规范化后的形式（平台无关）。
+  const canonicalAllowed = await realpath(allowed);
   try {
     const policy = new WorkspacePolicy([allowed]);
     await assert.rejects(
@@ -94,7 +97,7 @@ test("越权报错带可操作提示：列出允许的工作区与配置位置",
         assert.equal(isCbxError(error, "E_INVALID_WORKSPACE"), true);
         const message = String(error.message);
         assert.match(message, /当前允许的工作区/);
-        assert.equal(message.includes(allowed), true);
+        assert.equal(message.includes(canonicalAllowed), true);
         assert.match(message, /cordis\.patch\.yml/);
         return true;
       },
@@ -128,6 +131,7 @@ test("listAllowedWorkspaces 返回不可篡改的副本", async () => {
 test("显式白名单优先于调用方目录：会话 cwd 不在白名单时拒绝且提示", async () => {
   const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-policy-"));
   const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-policy-delegated-"));
+  const canonicalAllowed = await realpath(allowed);
   try {
     const policy = new WorkspacePolicy([allowed]);
     // 显式白名单时，会话 cwd 不在列表内 → 拒绝，并列出允许的工作区。
@@ -136,7 +140,7 @@ test("显式白名单优先于调用方目录：会话 cwd 不在白名单时拒
       (error) => {
         assert.equal(isCbxError(error, "E_INVALID_WORKSPACE"), true);
         assert.match(String(error.message), /当前允许的工作区/);
-        assert.equal(String(error.message).includes(allowed), true);
+        assert.equal(String(error.message).includes(canonicalAllowed), true);
         return true;
       },
     );

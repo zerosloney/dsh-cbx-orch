@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { registerCbxTools } from "../lib/tools.js";
 import { isCbxError } from "../lib/errors.js";
 import { closeDatabaseConnections } from "../lib/storage.js";
 import { WorkspacePolicy } from "../lib/workspace-policy.js";
+import { resetExecutorProbeCache } from "../lib/executors/builtin.js";
 
 function registeredTools(policy) {
   const definitions = new Map();
@@ -158,6 +159,9 @@ test("空配置时默认工作区跟随 tool 调用的 agent 会话 cwd（目录
 test("显式白名单时工具默认工作区不自作主张：会话 cwd 不在列表内则拒绝", async (t) => {
   const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-policy-"));
   const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-session-"));
+  // CI runner 上 realpath 会展开 8.3 短名（如 RUNNER~1），与 mkdtemp 返回的长名不同；
+  // 报错列出的是 realpath 规范化后的允许路径，断言用规范化后的形式（平台无关）。
+  const canonicalAllowed = await realpath(allowed);
   try {
     const tools = registeredTools(new WorkspacePolicy([allowed]));
     const execWith = (cwd) => ({
@@ -170,7 +174,7 @@ test("显式白名单时工具默认工作区不自作主张：会话 cwd 不在
       (error) => {
         assert.equal(isCbxError(error, "E_INVALID_WORKSPACE"), true);
         assert.match(String(error.message), /当前允许的工作区/);
-        assert.equal(String(error.message).includes(allowed), true);
+        assert.equal(String(error.message).includes(canonicalAllowed), true);
         return true;
       },
     );
@@ -185,6 +189,15 @@ test("显式白名单时工具默认工作区不自作主张：会话 cwd 不在
 
 test("cbx_run 结果附工作区任务清单（__taskList）且渲染直接显示在会话", async () => {
   const ws = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-run-"));
+  // CI runner 上没有任何真实编码 agent CLI，路由会抛 noExecutorError 导致本测试挂掉。
+  // 用 envVar 覆盖注入一个"存在路径"的假执行器（与 executor-router 测试同模式）：
+  // 路由选到 omp 并正常入队；执行阶段 spawn 该假路径会快速失败，不影响创建期断言。
+  const fakeExecDir = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-exec-"));
+  const fakeExec = path.join(fakeExecDir, "omp-cli");
+  await writeFile(fakeExec, "", "utf8");
+  const previousOmp = process.env.CBX_OMP;
+  process.env.CBX_OMP = fakeExec;
+  resetExecutorProbeCache();
   try {
     const tools = registeredTools(new WorkspacePolicy([ws]));
     const definition = tools.get("cbx_run");
@@ -211,6 +224,10 @@ test("cbx_run 结果附工作区任务清单（__taskList）且渲染直接显�
     assert.match(text, /1 个 cbx job:/);
     assert.equal(text.includes(result.job_id), true);
   } finally {
+    if (previousOmp === undefined) delete process.env.CBX_OMP;
+    else process.env.CBX_OMP = previousOmp;
+    resetExecutorProbeCache();
+    await rm(fakeExecDir, { recursive: true, force: true });
     // Windows 瞬态句柄：createJob/入队路径可能在 closeDatabaseConnections 返回后才
     // 重开连接 → rm 撞 EBUSY。与 git-ops/storage 的 EBUSY 重试模式一致：退避重试并每轮重关连接。
     for (let attempt = 0; ; attempt += 1) {

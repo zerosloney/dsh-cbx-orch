@@ -79,8 +79,10 @@ function sessionCwdOf(exec: SessionCwdContext | undefined): string | undefined {
   return exec?.agent?.session?.header?.cwd;
 }
 
-/** Engine types (some `unknown` fields, no index signature) are real JSON at runtime. */
-const toJson = (value: unknown): JsonValue => value as unknown as JsonValue;
+/** Engine types (some `unknown` fields, no index signature) are real JSON at runtime.
+ *  统一经过 clampJson：剔除 undefined / 非有限数，保证工具返回值是无损 JSON
+ *  （harness 会拒绝任何无法 JSON 无损往返的值，曾导致 cbx_run / cbx_executors 等报错）。 */
+const toJson = (value: unknown): JsonValue => clampJson(value) as unknown as JsonValue;
 
 function jsonOutput() {
   return {
@@ -107,13 +109,18 @@ function clampJson(value: unknown): unknown {
       ? `${value.slice(0, 8_000)}…(${value.length} chars)`
       : value;
   if (Array.isArray(value)) return value.map(clampJson);
-  if (value && typeof value === "object")
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-        key,
-        clampJson(item),
-      ]),
-    );
+  if (value && typeof value === "object") {
+    // 跳过 undefined / NaN / ±Infinity：这些值无法无损 JSON 往返（JSON.stringify
+    // 会丢成 null 或直接丢弃键），harness 工具返回值校验会因此拒绝整个输出。
+    // 集中在此剔除，避免每个工具逐个 `?? null` 补丁。
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (item === undefined) continue;
+      if (typeof item === "number" && !Number.isFinite(item)) continue;
+      out[key] = clampJson(item);
+    }
+    return out;
+  }
   return value;
 }
 

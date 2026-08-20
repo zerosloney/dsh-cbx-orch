@@ -29,26 +29,30 @@
 
 ## 安装
 
-作为一个 bundle 包装进某个 profile：
+插件已发布到 npm registry（`dsh-cbx-orch`，随 `v*` tag 由 CI 自动发布）。在 DeepSeek Harness 中通过 npm 包路径安装——`dsh plugin add` 会安装依赖并自动把包名追加到 profile 的 `dsh.profile.bundles`：
 
 ```sh
-# 发布后
-dsh plugin --profile web add dsh-cbx-orch
-
-# 本地开发（file: 链接）
-# 在 $DSH_HOME/profiles/<name>/package.json 加依赖并安装
+dsh plugin add --profile web dsh-cbx-orch     # web profile（含 web 插件层）
+dsh plugin add --profile dev dsh-cbx-orch     # 任意 profile（仅 core 层）
+dsh --profile web --dump-config              # 确认 cbx-orch / cbx-orch-web 行已组合
 ```
 
-> **npm ≥ 11.6 注意**：install-scripts 门控会跳过 `better-sqlite3` 的 node-gyp 构建（依赖包内声明的 allowScripts 不被认作覆盖），导致启动时报 native binding 缺失。自救：
+> **better-sqlite3 构建门控**：`dsh plugin add` 在 profile 的 `pnpm-workspace.yaml` 中已有 `allowBuilds` 占位（默认 `set this to true or false`，非布尔会导致安装失败）。把占位改为 `true` 后重跑 add 即完成原生构建：
+
+> ```yaml
+> # <profile>/pnpm-workspace.yaml
+> allowBuilds:
+>   better-sqlite3: true
+> ```
+
+> **npm ≥ 11.6 注意**（npm 而非 pnpm 安装时）：install-scripts 门控会跳过 `better-sqlite3` 的 node-gyp 构建（依赖包内声明的 allowScripts 不被认作覆盖），导致启动时报 native binding 缺失。自救：
 >
 > ```sh
 > npm install-scripts approve better-sqlite3
 > npm rebuild better-sqlite3
 > ```
->
-> pnpm 用户在 profile 的 `pnpm-workspace.yaml` 配 `allowBuilds`。`smoke/pack.sh` 已内置该兜底，可作为发布前检查（`npm run smoke:pack`）。
 
-profile 的 `dsh.profile.bundles` 需要包含 `dsh-cbx-orch`（与 `@deepseek-ai/dsh-base` 一起）。core 插件需要 `subprocess`/`tools`/`commands`（base bundle 提供）；web 插件额外需要 `webServer`，只在 web profile 激活。
+profile 的 `dsh.profile.bundles` 需要包含 `dsh-cbx-orch`（与 `@deepseek-ai/dsh-base` 一起），`dsh plugin add` 会自动追加；core 插件需要 `subprocess`/`tools`/`commands`（base bundle 提供）；web 插件额外需要 `webServer`，只在 web profile 激活。升级到新版本：`dsh plugin add --profile web dsh-cbx-orch@latest`。
 
 > 与 harness 原生服务（jobs/schedule/subagents/settings/事件）的边界与互操作设计见 [docs/alignment.md](docs/alignment.md)。
 

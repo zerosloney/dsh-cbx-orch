@@ -33,6 +33,7 @@
 
 ### Fixed
 
+- **`resolveWorktreeWorkspace` 在 POSIX 上失效**：从 worktree 路径反解主工作区时用 `path.resolve(...parentParts, base)` 重建路径，首段空串被锚定到进程 cwd，Linux/macOS 上 `/tmp/...` 变成 `<cwd>/tmp/...`，隔离任务（worktree 内无 jobContext 的进程内调用）无法定位主工作区、工作区级白名单随之失效。改为 `join(path.sep)` 还原父路径后 `resolve`（Windows 多余分隔符由 resolve 归一化，行为不变）。
 - **工具返回值的 JSON 无损性**：`cbx_*` 工具输出统一经 `clampJson` 剔除 `undefined` 与非有限数（NaN/±Infinity）——`JSON.stringify` 会把这些值丢成 `null` 或整键丢弃，导致 harness 拒绝整个工具返回值（`cbx_run`/`cbx_executors` 等报错）。剔除集中在共享函数一处，所有工具一次性受益。
 - **隔离任务 + 脏基线（委派改进）**：`isolated=true` 且工作区有未提交内容时，此前任务带病入队、执行期才因 `dirty_baseline` 崩溃。现在**创建即报错**并列出三种补救（先提交/stash、`carryDirty: true`、或 `isolated: false`），省去无谓的崩溃循环。新增 **`carryDirty`** 选项（工具参数 `carry_dirty`，`.cbx.json`/插件配置 `carryDirty`）：置真后创建时把未提交改动（已跟踪 diff + 未跟踪文件）带进隔离 worktree，让隔离任务也能对"进行中的工作"安全执行（不污染主工作区、也无需先提交）——覆盖"审查/继续未提交改动"场景。`execution` 的隔离脏基线门同时改为在 `carryDirty` 时放行。
 - **Web 仪表盘默认工作区改为跟随 harness 工作区注册表**：`/cbx/` 默认显示 `ctx.workspaceRegistry`（harness GUI 中打开过的工作区/会话目录），`?workspace=` 可在其中切换；注册表不可用/为空时回落进程 cwd。此前 Web 层只默认进程 cwd，导致「会话目录里用 `/cbx-run` 创建的 job 在仪表盘上完全不可见，显式选择该目录还被 400 拒绝」。

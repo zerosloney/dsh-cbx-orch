@@ -111,9 +111,12 @@ export function resolveWorktreeWorkspace(cwd: string): string | undefined {
   const match = /^\.(.+)\.cbx-worktrees$/.exec(parts[markerIndex]!);
   const base = match?.[1];
   if (!base) return undefined;
-  // 构造候选主工作区根：[父目录, `<basename>`]
-  const parentParts = parts.slice(0, markerIndex);
-  const candidate = path.resolve(...parentParts, base);
+  // 构造候选主工作区根：[父目录, `<basename>`]。用 join(path.sep) 还原父路径再 resolve：
+  // 直接 path.resolve(...parentParts, base) 在 POSIX 上会把 split 产生的首段空串
+  // 锚定到进程 cwd（'/tmp/...' 变成 '<cwd>/tmp/...'），Windows 上依赖驱动器相对解析
+  // 才碰巧正确。join 后首段空串天然得到 '/tmp/...'，Windows 多余分隔符由 resolve 归一化。
+  const parentPath = parts.slice(0, markerIndex).join(path.sep);
+  const candidate = path.resolve(parentPath, base);
   try {
     if (statSync(path.join(candidate, ".cbx")).isDirectory()) return candidate;
   } catch { /* 不是 cbx 主工作区 */ }

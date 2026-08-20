@@ -12,6 +12,22 @@ export interface BuildArgsOptions {
   maxTurns: number;
 }
 
+/** 执行器能力声明：路由层据此过滤"不满足任务需求"的执行器（如需要 autoApprove 时排除 omp）。 */
+export interface ExecutorCapabilities {
+  /** 支持非交互式自动放行（auto/dontAsk）。omp 无此 flag，故为 false。 */
+  autoApprove: boolean;
+  /** 支持 plan 模式（仅产出计划不落地改动）。 */
+  planMode: boolean;
+  /** 支持沙箱隔离执行。 */
+  sandbox: boolean;
+  /** 支持无头/JSON 输出（cbx 依赖 stream-json / --format json 解析）。 */
+  headless: boolean;
+  /** 支持轮次预算参数（--max-turns / --max-session-turns）。 */
+  maxTurnsSupport: boolean;
+  /** 支持流式输出（便于实时采集 agent.log）。 */
+  streaming: boolean;
+}
+
 export interface BuiltinExecutor {
   /** 注册名，写入 .cbx.json 的 executor 字段或 --executor */
   name: "codebuddy" | "opencode" | "omp" | "cline" | "qwen";
@@ -23,6 +39,12 @@ export interface BuiltinExecutor {
   envVar: string;
   /** PATH 上依次尝试的二进制名 */
   candidates: string[];
+  /** 能力声明，供路由层做需求匹配与能力打分。 */
+  capabilities: ExecutorCapabilities;
+  /** 成本档位 1(低)~3(高)，供 cost-aware 策略。 */
+  costTier: number;
+  /** 速度档位 1(慢)~3(快)，供 fastest 策略。 */
+  speedTier: number;
   /** 把统一入参翻译成该 CLI 的具体参数序列（不含二进制本身） */
   buildArgs(opts: BuildArgsOptions): string[];
 }
@@ -37,6 +59,9 @@ export const BUILTIN_EXECUTORS: readonly BuiltinExecutor[] = [
     label: "CodeBuddy",
     envVar: "CBX_CODEBUDDY",
     candidates: ["codebuddy", "cbc"],
+    capabilities: { autoApprove: true, planMode: false, sandbox: false, headless: true, maxTurnsSupport: true, streaming: true },
+    costTier: 2,
+    speedTier: 2,
     buildArgs: ({ prompt, permissionMode, maxTurns }) => [
       "-p",
       "--output-format", "stream-json",
@@ -51,6 +76,9 @@ export const BUILTIN_EXECUTORS: readonly BuiltinExecutor[] = [
     label: "OpenCode",
     envVar: "CBX_OPENCODE",
     candidates: ["opencode"],
+    capabilities: { autoApprove: true, planMode: false, sandbox: false, headless: true, maxTurnsSupport: false, streaming: true },
+    costTier: 2,
+    speedTier: 2,
     buildArgs: ({ prompt, permissionMode }) => {
       const args = ["run", "--format", "json", prompt];
       if (AUTO_MODES.has(permissionMode)) args.push("--auto");
@@ -65,6 +93,10 @@ export const BUILTIN_EXECUTORS: readonly BuiltinExecutor[] = [
     candidates: ["omp"],
     // omp 官方 CLI 文档未公开 permission/auto flag；非交互 -p 默认按 omp 自身权限行事。
     // intentional-simple: 不追加 auto flag，缺已知天花板——待 omp 暴露权限 flag 后补 `-a` 类参数。
+    // 能力声明里 autoApprove:false 让路由层在 permission_mode=auto 时主动排除它，避免卡在交互授权。
+    capabilities: { autoApprove: false, planMode: false, sandbox: false, headless: true, maxTurnsSupport: false, streaming: true },
+    costTier: 1,
+    speedTier: 2,
     buildArgs: ({ prompt }) => ["-p", "--mode", "json", prompt],
   },
   {
@@ -73,6 +105,9 @@ export const BUILTIN_EXECUTORS: readonly BuiltinExecutor[] = [
     label: "Cline",
     envVar: "CBX_CLINE",
     candidates: ["cline"],
+    capabilities: { autoApprove: true, planMode: true, sandbox: false, headless: true, maxTurnsSupport: false, streaming: true },
+    costTier: 3,
+    speedTier: 2,
     buildArgs: ({ prompt, permissionMode }) => {
       const args = ["--json", prompt, "--auto-approve", String(AUTO_MODES.has(permissionMode))];
       if (permissionMode === "plan") args.push("--plan");
@@ -90,6 +125,9 @@ export const BUILTIN_EXECUTORS: readonly BuiltinExecutor[] = [
     // - plan → --approval-mode plan；auto/dontAsk → --yolo（auto-approve all）
     // 不传 --sandbox：cbx 需执行器在 worktree 内自由读写，沙箱会阻碍任务执行。
     // 无人值守场景建议在宿主环境设 QWEN_CODE_UNATTENDED_RETRY=1（子进程经 runProcess 继承 process.env）。
+    capabilities: { autoApprove: true, planMode: true, sandbox: false, headless: true, maxTurnsSupport: true, streaming: true },
+    costTier: 2,
+    speedTier: 3,
     buildArgs: ({ prompt, permissionMode, maxTurns }) => {
       const args = ["--prompt", prompt, "--output-format", "stream-json", "--max-session-turns", String(maxTurns)];
       if (permissionMode === "plan") args.push("--approval-mode", "plan");

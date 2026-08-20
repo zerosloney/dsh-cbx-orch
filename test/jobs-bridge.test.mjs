@@ -180,7 +180,7 @@ test("monitorCbxJob: 队列→运行→done 状态迁移与终态摘要", async 
     const outcome = await hooks.done;
     assert.equal(outcome.status, "completed");
     assert.match(outcome.output ?? "", /handback content/);
-    assert.match(outcome.output ?? "", /changed files: 1/);
+    assert.match(outcome.output ?? "", /changed:\s+1 个文件/);
     // 任务清单直接显示：终态摘要跟在状态行之后附上全量 job 表格（不必再单独调 cbx_list）。
     assert.match(outcome.output ?? "", /任务清单/);
     assert.match(outcome.output ?? "", /1 个 cbx job:/);
@@ -239,7 +239,7 @@ test("monitorCbxJob: 失败状态映射为 failed 并带错误信息", async () 
     const hooks = monitorCbxJob(workspace, jobId, 30);
     const outcome = await hooks.done;
     assert.equal(outcome.status, "failed");
-    assert.match(outcome.output ?? "", /error: tests failed/);
+    assert.match(outcome.output ?? "", /error:\s+tests failed/);
   });
 });
 

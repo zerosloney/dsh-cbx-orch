@@ -34,7 +34,8 @@ import {
   startBackground,
 } from "./core.js";
 import { isCbxError } from "./errors.js";
-import { noExecutorError, routeExecutor } from "./executor-router.js";
+import { deriveRequirements, noExecutorError, routeExecutor, type ExecutorStrategy } from "./executor-router.js";
+import { loadHealth } from "./executor-health.js";
 import {
   AuthRateLimiter,
   HttpError,
@@ -438,9 +439,23 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
             autoCommit: typeof body.auto_commit === "boolean" ? body.auto_commit : undefined,
             commitMessage: typeof body.commit_message === "string" ? body.commit_message : undefined,
           });
-          // 先探测本机已安装的 agent CLI，再把委派路由到可用执行器（auto/回退）。
+          // 先探测本机已安装的 agent CLI，再按需求过滤 + 策略打分选最合适的一个。
+          const derived = deriveRequirements({
+            permissionMode: typeof body.permission_mode === "string" ? body.permission_mode : undefined,
+          });
+          const requirements = {
+            ...derived,
+            ...(config.executorRequirements ?? {}),
+            ...((body.executor_requirements && typeof body.executor_requirements === "object")
+              ? body.executor_requirements
+              : {}),
+          };
+          const strategy = (body.routing_strategy ?? config.routingStrategy ?? "first-available") as ExecutorStrategy;
           const decision = routeExecutor(defaults.executor, {
             preference: config.executorPreference,
+            requirements,
+            strategy,
+            health: loadHealth(ws),
           });
           if (!decision.executor) {
             const error = noExecutorError(decision.available);

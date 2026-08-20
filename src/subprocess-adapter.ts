@@ -124,7 +124,8 @@ export function resolveWorktreeWorkspace(cwd: string): string | undefined {
 }
 
 /** 取某 workspace 的工作区级白名单（缓存 + TTL）。失败（读/校验异常）时按"未配置"
- *  回落，绝不因 `.cbx.json` 坏配置让整个 spawn 挂掉——白名单是硬化，不是执行的前置。 */
+ *  回落，绝不因 `.cbx.json` 坏配置让整个 spawn 挂掉——白名单是硬化，不是执行的前置。
+ *  但降级必须可见：operator 依赖白名单收窄暴露面时，坏配置静默放宽会留下隐患，告警提示排查。 */
 async function workspaceAllowlist(
   workspace: string,
 ): Promise<{ configured: boolean; allowlist: string[] | undefined }> {
@@ -135,6 +136,9 @@ async function workspaceAllowlist(
   try {
     result = await loadRuntimeExecutorsAllowlist(workspace);
   } catch (error) {
+    console.warn(
+      `cbx: 工作区 ${workspace} 的 executors.envAllowlist 读取/校验失败，白名单未生效（回落全局配置；全局未配置则完整继承宿主 env）。错误：${error instanceof Error ? error.message : String(error)}`,
+    );
     result = { configured: false, allowlist: undefined };
   }
   workspaceAllowlistCache.set(key, { ...result, at: Date.now() });

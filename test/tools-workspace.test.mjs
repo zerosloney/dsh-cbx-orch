@@ -192,9 +192,13 @@ test("cbx_run 结果附工作区任务清单（__taskList）且渲染直接显�
       workspace: ws,
       task: "implement the feature",
       test: "npm test",
+      // 已知字段必须原样透传到路由决策（schema 收窄后拼错字段会被框架拒绝/告警，不再静默忽略）
+      executor_requirements: { exclude: [] },
     });
     assert.equal(result.status, "queued");
     assert.equal(typeof result.job_id, "string");
+    // executor_requirements 透传：空 exclude 不影响路由，但决策里必须带出该需求
+    assert.deepEqual(result.__router.requirements.exclude, []);
     // 任务清单随提交响应直接带出：落库后的实时全量 job 列表
     assert.ok(Array.isArray(result.__taskList));
     assert.equal(result.__taskList.length, 1);

@@ -22,13 +22,18 @@ import { runReviewGate } from "./review-gate.js";
 import { readAgentLogIncremental } from "./ui.js";
 import { bridgeCbxJob, tailAgentLog, type CbxBridgeResult } from "./jobs-bridge.js";
 import {
+  deriveRequirements,
   noExecutorError,
   routeExecutor,
+  type ExecutorRequirements,
+  type ExecutorStrategy,
   type RouteDecision,
 } from "./executor-router.js";
-import { probeAllExecutors } from "./executors/builtin.js";
+import { loadHealth } from "./executor-health.js";
+import { probeAllExecutors, resolveExecutor } from "./executors/builtin.js";
 import { formatTaskList } from "./format.js";
-import { forgetJobKeepWorktree, loadConfig, loadState, mergeConfig, purgeJob } from "./state.js";
+import { forgetJobKeepWorktree, jobDir, loadConfig, loadState, mergeConfig, purgeJob } from "./state.js";
+import { buildSessionMessage, progressLine } from "./session-message.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
 
 /** Plugin-level defaults that seed jobs when the tool call omits the field. */
@@ -45,6 +50,17 @@ export interface CbxDefaults {
 function jsonContent(value: unknown): ContentBlock[] {
   return [{ type: "text", text: JSON.stringify(value, null, 2) }];
 }
+
+/** executor_requirements 的有效键：拼错的字段必须被显式拒绝/告警，不能静默忽略后按更弱需求路由。 */
+const KNOWN_EXECUTOR_REQUIREMENT_KEYS: ReadonlySet<string> = new Set([
+  "autoApprove",
+  "planMode",
+  "sandbox",
+  "headless",
+  "maxTurnsSupport",
+  "streaming",
+  "exclude",
+]);
 
 /** 工具执行上下文的最小结构：只取 agent 会话的 cwd，避免引入 dsh-agent 类型依赖。 */
 export interface SessionCwdContext {
@@ -144,35 +160,19 @@ function bridgeNote(result: CbxBridgeResult): string {
 function renderJobStatus(args: Record<string, unknown>, value: unknown): ContentBlock[] {
   const state = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
   const ws = typeof args.workspace === "string" ? args.workspace : undefined;
-  const jobId = String(state.jobId ?? args.job_id ?? "—");
-  const status = String(state.status ?? "—");
-  const phase = typeof state.phase === "string" && state.phase ? state.phase : "—";
-  const attempt = typeof state.attempt === "number" ? state.attempt : undefined;
-  const stage = typeof state.stage === "string" && state.stage ? state.stage : undefined;
-  const maxTurns = typeof state.configuredMaxTurns === "number" ? state.configuredMaxTurns : undefined;
-  const executorInvocations = typeof state.executorInvocations === "number" ? state.executorInvocations : undefined;
-  const updatedAt = typeof state.updatedAt === "string" ? state.updatedAt : undefined;
-  const createdAt = typeof state.createdAt === "string" ? state.createdAt : undefined;
-  const error = typeof state.error === "string" ? state.error : undefined;
-  const reviewVerdict = typeof state.reviewVerdict === "string" ? state.reviewVerdict : undefined;
-
-  const lines: string[] = [];
-  lines.push(`cbx ${jobId}`);
-  lines.push(`  status:   ${status}`);
-  if (status === "running") lines.push(`  phase:    ${phase}`);
-  if (stage) lines.push(`  stage:    ${stage}`);
-  if (attempt !== undefined) {
-    const turns = maxTurns !== undefined ? ` (maxTurns ${maxTurns})` : "";
-    lines.push(`  attempt:  ${attempt}${turns}`);
-  }
-  if (typeof executorInvocations === "number") {
-    lines.push(`  execs:    ${executorInvocations} 次调用`);
-  }
-  if (createdAt) lines.push(`  created:  ${createdAt}`);
-  if (updatedAt) lines.push(`  updated:  ${updatedAt}`);
-  if (reviewVerdict) lines.push(`  review:   ${reviewVerdict}`);
-  if (error) lines.push(`  error:    ${error}`);
-  return jsonContent(withDashboardFooter(lines.join("\n"), ws));
+  const text = buildSessionMessage({
+    jobId: String(state.jobId ?? args.job_id ?? "—"),
+    status: String(state.status ?? "—"),
+    phase: typeof state.phase === "string" && state.phase ? state.phase : undefined,
+    attempt: typeof state.attempt === "number" ? state.attempt : undefined,
+    executor: typeof state.__executor === "string" ? state.__executor : undefined,
+    error: typeof state.error === "string" ? state.error : undefined,
+    reviewVerdict: typeof state.reviewVerdict === "string" ? state.reviewVerdict : undefined,
+    changedFilesCount: typeof state.__changedFiles === "number" ? state.__changedFiles : undefined,
+    jobDir: typeof state.__jobDir === "string" ? state.__jobDir : undefined,
+    statusEvents: Array.isArray(state.status_events) ? (state.status_events as string[]) : undefined,
+  });
+  return jsonContent(withDashboardFooter(text, ws));
 }
 
 /** cbx_list 的可读渲染：任务清单表格 + 仪表盘链接；JSON value 仍是全量 job 列表。 */
@@ -208,22 +208,48 @@ function renderQueue(args: Record<string, unknown>, value: unknown): ContentBloc
   return jsonContent(withDashboardFooter(lines.join("\n"), ws));
 }
 
-/** cbx_executors 的可读渲染：本机 agent CLI 探测表格 + 路由提示。 */
+/** 把能力对象压成短标签（仅列出为 true 的能力）。 */
+function capSummary(caps?: Record<string, unknown>): string {
+  if (!caps) return "—";
+  const map: Array<[string, string]> = [
+    ["autoApprove", "auto"],
+    ["planMode", "plan"],
+    ["sandbox", "sbx"],
+    ["headless", "headless"],
+    ["maxTurnsSupport", "turns"],
+    ["streaming", "stream"],
+  ];
+  const on = map.filter(([k]) => caps[k] === true).map(([, short]) => short);
+  return on.length ? on.join(",") : "—";
+}
+
+/** 健康度摘要：successes/failures，连续失败标 !n，附最近延迟。 */
+function healthSummary(h?: Record<string, unknown>): string {
+  if (!h) return "—";
+  const s = Number(h.successes ?? 0);
+  const f = Number(h.failures ?? 0);
+  const cf = Number(h.consecutiveFailures ?? 0);
+  const lat = h.lastLatencyMs != null ? ` ${Math.round(Number(h.lastLatencyMs))}ms` : "";
+  const flag = cf > 0 ? `!${cf}` : "";
+  return `${s}/${f}${flag}${lat}`;
+}
+
+/** cbx_executors 的可读渲染：本机 agent CLI 探测表格（含能力/成本速度/健康度）+ 路由提示。 */
 function renderExecutors(_args: Record<string, unknown>, value: unknown): ContentBlock[] {
   const probes = Array.isArray(value) ? value : [];
   const lines: string[] = [];
   lines.push("本机编码 agent CLI（cbx 执行器探测）:");
   lines.push("");
-  lines.push("| Executor | Available | Source | Command |");
-  lines.push("|----------|-----------|--------|---------|");
+  lines.push("| Executor | Avail | Source | Capabilities | Cost/Spd | Health(s/f) | Command |");
+  lines.push("|----------|-------|--------|--------------|-----------|-------------|---------|");
   for (const probe of probes) {
     const p = (probe && typeof probe === "object" ? probe : {}) as Record<string, unknown>;
     lines.push(
-      `| ${String(p.name ?? "—").padEnd(8)} | ${String(p.available ? "yes" : "no").padEnd(9)} | ${String(p.source ?? "—").padEnd(6)} | ${String(p.command ?? "—")} |`,
+      `| ${String(p.name ?? "—").padEnd(8)} | ${String(p.available ? "yes" : "no").padEnd(5)} | ${String(p.source ?? "—").padEnd(6)} | ${String(capSummary(p.capabilities as Record<string, unknown>)).padEnd(12)} | ${String(`${p.costTier ?? "—"}/${p.speedTier ?? "—"}`).padEnd(9)} | ${String(healthSummary(p.health as Record<string, unknown>)).padEnd(11)} | ${String(p.command ?? "—")} |`,
     );
   }
   lines.push("");
-  lines.push("cbx_run 未指定 executor 时自动路由到第一个可用 CLI；显式指定但未安装会自动回退并注明。");
+  lines.push("cbx_run 未指定 executor 时按策略路由（先过滤不满足需求的执行器，再打分选最优）；显式指定但未安装会自动回退并注明。");
   return jsonContent(lines.join("\n"));
 }
 
@@ -232,23 +258,19 @@ function renderWatchReport(args: Record<string, unknown>, value: unknown): Conte
   const v = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
   const ws = typeof args.workspace === "string" ? args.workspace : undefined;
   const state = (v.state && typeof v.state === "object" ? v.state : {}) as Record<string, unknown>;
-  const jobId = String(state.jobId ?? args.job_id ?? "—");
-  const status = String(state.status ?? "—");
-  const lines: string[] = [];
-  lines.push(`cbx ${jobId} ${status}`);
-  const events = Array.isArray(v.status_events) ? v.status_events : [];
-  if (events.length > 0) {
-    lines.push("");
-    lines.push("状态迁移:");
-    for (const event of events.slice(-30)) lines.push(`  ${String(event)}`);
-  }
-  const log = typeof v.log_tail === "string" ? v.log_tail : "";
-  if (log) {
-    lines.push("");
-    lines.push(`处理消息（agent.log 尾部${typeof v.log_chars === "number" ? `，共 ${v.log_chars} 字节` : ""}）:`);
-    lines.push(log);
-  }
-  return jsonContent(withDashboardFooter(lines.join("\n"), ws));
+  const text = buildSessionMessage({
+    jobId: String(state.jobId ?? args.job_id ?? "—"),
+    status: String(state.status ?? "—"),
+    phase: typeof state.phase === "string" && state.phase ? state.phase : undefined,
+    attempt: typeof state.attempt === "number" ? state.attempt : undefined,
+    error: typeof state.error === "string" ? state.error : undefined,
+    reviewVerdict: typeof state.reviewVerdict === "string" ? state.reviewVerdict : undefined,
+    jobDir: typeof state.__jobDir === "string" ? state.__jobDir : undefined,
+    statusEvents: Array.isArray(v.status_events) ? (v.status_events as string[]) : undefined,
+    logTail: typeof v.log_tail === "string" ? v.log_tail : undefined,
+    logChars: typeof v.log_chars === "number" ? v.log_chars : undefined,
+  });
+  return jsonContent(withDashboardFooter(text, ws));
 }
 
 /**
@@ -261,22 +283,15 @@ function runJobOutput(args: Record<string, unknown>, value: unknown): ContentBlo
   const ws = typeof args.workspace === "string" ? args.workspace : undefined;
   const bridge = (v.__bridge && typeof v.__bridge === "object" ? v.__bridge : {}) as CbxBridgeResult;
   const router = (v.__router && typeof v.__router === "object" ? v.__router : {}) as RouteDecision;
-  const jobId = String(v.job_id ?? "—");
-  const status = String(v.status ?? "queued");
-  const lines: string[] = [];
-  lines.push(`cbx ${jobId} ${status}`);
-  if (router.executor) {
-    const routed = router.routed ? `（路由：${router.reason}）` : "";
-    lines.push(`  executor: ${router.executor}${routed}`);
-  }
-  lines.push(bridgeNote(bridge));
-  // 任务清单直接显示在当前会话；列表来自 execute 落库后的实时快照。
-  if (Array.isArray(v.__taskList)) {
-    lines.push("");
-    lines.push(`任务清单（${ws ?? "当前工作区"}）:`);
-    lines.push(formatTaskList(v.__taskList as JobState[]));
-  }
-  return jsonContent(withDashboardFooter(lines.join("\n"), ws));
+  const text = buildSessionMessage({
+    jobId: String(v.job_id ?? "—"),
+    status: String(v.status ?? "queued"),
+    router,
+    bridgeNote: bridgeNote(bridge),
+    taskList: Array.isArray(v.__taskList) ? (v.__taskList as JobState[]) : undefined,
+    jobDir: typeof v.__jobDir === "string" ? v.__jobDir : undefined,
+  });
+  return jsonContent(withDashboardFooter(text, ws));
 }
 
 export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
@@ -302,6 +317,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       workspace: { type: "string", description: "Target project directory. Defaults to the invoking directory." },
       executor: { type: "string", description: "Executor: codebuddy / opencode / omp / cline / qwen, a plugin path, or \"auto\" (default: pick the first installed CLI, falling back automatically when the requested one is missing)." },
       executor_preference: { type: "array", items: { type: "string" }, description: "Router preference order for auto selection/fallback (builtin names or aliases; unknown entries ignored)." },
+      executor_requirements: { type: "object", additionalProperties: false, properties: { autoApprove: { type: "boolean" }, planMode: { type: "boolean" }, sandbox: { type: "boolean" }, headless: { type: "boolean" }, maxTurnsSupport: { type: "boolean" }, streaming: { type: "boolean" }, exclude: { type: "array", items: { type: "string" } } }, description: "Capabilities the chosen executor must satisfy: { autoApprove?, planMode?, sandbox?, headless?, maxTurnsSupport?, streaming?, exclude?: string[] }. Auto-derived from permission_mode/plan; merged over .cbx.json executorRequirements. Unknown keys are rejected/warned rather than silently ignored." },
+      routing_strategy: { type: "string", description: "Executor selection strategy: first-available (default) / capability-best / cost-aware / fastest / round-robin / least-recently-used. Filters by requirements first, then scores." },
       test: { type: "string", description: "Test command run after the executor finishes." },
       review: { type: "boolean", description: "Run an independent review phase after tests pass." },
       isolated: { type: "boolean", description: "Run in an isolated git worktree." },
@@ -310,6 +327,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       max_retries: { type: "integer", description: "Automatic retry budget." },
       max_turns: { type: "integer", description: "Executor turn budget." },
       permission_mode: { type: "string", description: "default / acceptEdits / auto / dontAsk." },
+      plan: { type: "boolean", description: "Require an executor with planMode capability (auto-derives a planMode executor requirement for routing; equivalent to permission_mode=\"plan\")." },
       approval_before_run: { type: "boolean", description: "Stop for approval before starting the executor." },
       approval_before_complete: { type: "boolean", description: "Stop for approval before landing done." },
       dependency_guard: { type: "boolean", description: "Lockfile hash guard." },
@@ -328,8 +346,34 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       // - 未指定 / "auto" → 按 preference 选第一个已安装；
       // - 显式指定但未安装 → 自动回退到可用 CLI（reason 说明）；
       // - 插件路径 → 不参与路由；全部不可用 → 创建期报清晰错误。
+      // 路由：先探测本机已安装的 agent CLI，再按需求过滤 + 策略打分选最合适的一个。
+      // - 需求从 permission_mode（auto/dontAsk → autoApprove，plan → planMode）自动推导，
+      //   叠加 .cbx.json 的 executorRequirements 与工具参数 executor_requirements（后者优先）；
+      // - 策略 routing_strategy（缺省 first-available，等价于旧行为但叠加需求过滤）。
+      const derived = deriveRequirements({ permissionMode: args.permission_mode, plan: args.plan });
+      const requirements: ExecutorRequirements = {
+        ...derived,
+        ...(config.executorRequirements ?? {}),
+        ...((args.executor_requirements ?? {}) as ExecutorRequirements),
+      };
+      // 拼错的能力名（如 auto_approve）会被 meetRequirements 静默忽略，任务按更弱需求路由——
+      // 显式告警让调用方立即看到字段没生效，而不是事后发现选了行为不符的执行器。
+      const unknownReqKeys = Object.keys(args.executor_requirements ?? {}).filter(
+        (key) => !KNOWN_EXECUTOR_REQUIREMENT_KEYS.has(key),
+      );
+      if (unknownReqKeys.length > 0) {
+        bridgeLog(
+          `executor_requirements 含未知字段（将被忽略）：${unknownReqKeys.join(", ")}。有效键：autoApprove / planMode / sandbox / headless / maxTurnsSupport / streaming / exclude。`,
+        );
+      }
+      const strategy = (args.routing_strategy ??
+        config.routingStrategy ??
+        "first-available") as ExecutorStrategy;
       const decision = routeExecutor(args.executor ?? config.executor ?? defaults.executor, {
         preference: args.executor_preference ?? config.executorPreference,
+        requirements,
+        strategy,
+        health: loadHealth(ws),
       });
       if (!decision.executor) throw noExecutorError(decision.available);
       if (decision.routed) {
@@ -396,6 +440,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         __bridge: bridge,
         __router: decision,
         __taskList: taskList,
+        __jobDir: created.directory,
         ...(bridge.id !== undefined ? { jobId: bridge.id } : {}),
       });
     },
@@ -413,7 +458,21 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       render: renderJobStatus,
     },
     async execute(args, exec) {
-      return toJson(clampJson(await loadState(await workspaceOf(args.workspace, exec), args.job_id)));
+      const ws = await workspaceOf(args.workspace, exec);
+      const state = await loadState(ws, args.job_id);
+      // 富化：尽力读取 result.json 取执行器与改动文件数，附产物目录指针（渲染层输出可行动消息）。
+      let enriched: Record<string, unknown> = { ...state, __jobDir: jobDir(ws, args.job_id) };
+      try {
+        const result = JSON.parse(await readArtifact(ws, args.job_id, "result.json")) as Record<string, unknown>;
+        enriched = {
+          ...enriched,
+          __executor: typeof result.executor === "string" ? result.executor : undefined,
+          __changedFiles: Array.isArray(result.changedFiles) ? result.changedFiles.length : undefined,
+        };
+      } catch {
+        /* result.json 尚未生成（排队/运行中）：富化字段缺省即可 */
+      }
+      return toJson(clampJson(enriched));
     },
   }));
 
@@ -473,14 +532,31 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
 
   tools.register(defineTool({
     name: "cbx_executors",
-    description: "Detect which coding-agent CLIs (codebuddy/opencode/omp/cline/qwen) are installed and resolvable on this machine for cbx execution, with their env-var overrides (CBX_CODEBUDDY/...). Use it before delegating when you want to confirm availability; cbx_run routes automatically to an available CLI when none is explicitly requested.",
-    parameters: {},
+    description: "Detect which coding-agent CLIs (codebuddy/opencode/omp/cline/qwen) are installed and resolvable on this machine for cbx execution, with their env-var overrides (CBX_CODEBUDDY/...) and declared capabilities. Use it before delegating when you want to confirm availability or compare executor capabilities; cbx_run routes automatically (filtered by requirements, scored by strategy) to a suitable CLI when none is explicitly requested.",
+    parameters: {
+      workspace: { type: "string", description: "Project directory; if given, also shows per-executor health (success/failure/latency) recorded for that workspace." },
+    },
     output: {
       schema: { type: "json" },
       render: renderExecutors,
     },
-    async execute() {
-      return toJson(clampJson(probeAllExecutors()));
+    async execute(args, exec) {
+      const ws = args.workspace ? await workspaceOf(args.workspace, exec) : undefined;
+      const probes = probeAllExecutors();
+      const health = ws ? loadHealth(ws) : {};
+      const enriched = probes.map((p) => {
+        const spec = resolveExecutor(p.name);
+        return {
+          ...p,
+          capabilities: spec?.capabilities ?? null,
+          costTier: spec?.costTier ?? null,
+          speedTier: spec?.speedTier ?? null,
+          // 无健康度记录的 workspace 上 health 为 undefined，会导致工具返回值
+          // 不是无损 JSON（harness 拒绝）；用 null 兜底保证可序列化。
+          health: health[p.name] ?? null,
+        };
+      });
+      return toJson(clampJson(enriched));
     },
   }));
 
@@ -534,6 +610,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         status: "queued",
         __bridge: bridge,
         __taskList: taskList,
+        __jobDir: jobDir(ws, args.job_id),
         ...(bridge.id !== undefined ? { jobId: bridge.id } : {}),
       });
     },

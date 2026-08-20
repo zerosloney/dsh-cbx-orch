@@ -6,6 +6,7 @@ import { formatTaskList } from "./format.js";
 import { cancelJob } from "./lifecycle.js";
 import { jobDir, loadState } from "./state.js";
 import { readArtifact } from "./artifacts.js";
+import { buildSessionMessage, progressLine } from "./session-message.js";
 import { TERMINAL_STATUSES, type JobState } from "./types.js";
 
 /**
@@ -187,13 +188,11 @@ function mapOutcomeStatus(state: JobState): "completed" | "killed" | "failed" {
  * 任务清单块：状态行之后紧跟当前工作区全量 job 列表（best-effort，失败返回空串）。
  * 放在摘要头部，保证长 handback 撑满 64K 截断时清单仍保留。
  */
-async function taskListBlock(workspace: string): Promise<string> {
+async function loadTaskList(workspace: string): Promise<JobState[]> {
   try {
-    const jobs = await listJobs(workspace);
-    if (jobs.length === 0) return "";
-    return `任务清单（${jobs.length} 个 cbx job）:\n${formatTaskList(jobs)}`;
+    return await listJobs(workspace);
   } catch {
-    return "";
+    return [];
   }
 }
 
@@ -202,44 +201,50 @@ const LOG_TAIL_MAX_CHARS = 8_000;
 
 /** 从 result.json / state 生成终态摘要（有限长度，供 job_output 与完成通知使用）。 */
 async function buildFinalSummary(workspace: string, jobId: string, state: JobState): Promise<string> {
-  const lines: string[] = [];
-  lines.push(`[${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}]`);
-  // 终态时直接把任务清单附在状态行之后——完成通知投递到当前会话时，用户能直接看到全量清单。
-  const list = await taskListBlock(workspace);
-  if (list) lines.push(list);
-  let result: Record<string, unknown> | undefined;
+  // 统一消息：状态 + 阶段人话 + 下一步行动 + 执行器 + 产物指针 + 全量任务清单 + agent.log 处理消息。
+  let executor: string | undefined;
+  let error: string | undefined;
+  let reviewVerdict: string | undefined;
+  let changedFilesCount: number | undefined;
+  let handback: string | undefined;
   try {
-    result = JSON.parse(await readArtifact(workspace, jobId, "result.json")) as Record<string, unknown>;
+    const result = JSON.parse(await readArtifact(workspace, jobId, "result.json")) as Record<string, unknown>;
+    executor = typeof result.executor === "string" ? result.executor : undefined;
+    error = typeof result.error === "string" && result.error ? result.error : undefined;
+    reviewVerdict = typeof result.reviewVerdict === "string" && result.reviewVerdict ? result.reviewVerdict : undefined;
+    changedFilesCount = Array.isArray(result.changedFiles) ? result.changedFiles.length : undefined;
+    handback = typeof result.handback === "string" && result.handback ? result.handback : undefined;
   } catch {
-    result = undefined;
+    /* result.json 未就绪 */
   }
-  const pick = (key: string): string | undefined => {
-    const value = result?.[key];
-    return typeof value === "string" && value ? value : undefined;
-  };
-  const error = pick("error") ?? (typeof state.error === "string" ? state.error : undefined);
-  if (error) lines.push(`error: ${error}`);
-  const verdict = pick("reviewVerdict") ?? (typeof state.reviewVerdict === "string" ? state.reviewVerdict : undefined);
-  if (verdict) lines.push(`review: ${verdict}`);
-  const changed = result?.changedFiles;
-  if (Array.isArray(changed)) lines.push(`changed files: ${changed.length}`);
-  const handback = pick("handback");
-  if (handback) lines.push(`handback:\n${handback}`);
-  // 处理消息：执行器 agent.log 的尾部直接附进完成通知，让当前会话真正看到委派代理
-  // 做了什么（工具调用/推理/文件编辑的原始转录），而不是只有状态行与摘要。
+  const errorMsg = error ?? (typeof state.error === "string" ? state.error : undefined);
+  const taskList = await loadTaskList(workspace);
+  let logTail = "";
   try {
     const log = await tailAgentLog(workspace, jobId, 0);
     if (log.text) {
-      const tail =
+      logTail =
         log.text.length > LOG_TAIL_MAX_CHARS
           ? `…（agent.log 共 ${log.text.length} 字符，截断保留尾部）\n${log.text.slice(-LOG_TAIL_MAX_CHARS)}`
           : log.text;
-      lines.push(`\n处理消息（agent.log）:\n${tail}`);
     }
   } catch {
     /* agent.log 不可读：跳过处理消息，摘要本身仍有效 */
   }
-  return lines.join("\n").slice(0, OUTPUT_LIMIT_BYTES);
+  return buildSessionMessage({
+    jobId,
+    status: state.status,
+    phase: state.phase,
+    attempt: state.attempt,
+    executor,
+    error: errorMsg,
+    reviewVerdict,
+    changedFilesCount,
+    handback,
+    jobDir: jobDir(workspace, jobId),
+    taskList,
+    logTail,
+  }).slice(0, OUTPUT_LIMIT_BYTES);
 }
 
 /**
@@ -257,6 +262,7 @@ export function monitorCbxJob(
 } {
   let buffer = "";
   let since = 0;
+  let executor: string | undefined;
   let lastStatus: string | undefined;
   let cancelled = false;
   let snapshotted = false;
@@ -292,15 +298,23 @@ export function monitorCbxJob(
       state = undefined;
     }
     if (state) {
-      // 首轮快照：任务还在跑时，job_output 里直接看到当前全量任务清单（只打一次）。
+      // 首轮快照：任务还在跑时，job_output 里直接看到执行器与当前全量任务清单（只打一次）。
       if (!snapshotted && !BRIDGE_TERMINAL_STATUSES.has(state.status)) {
         snapshotted = true;
-        const block = await taskListBlock(workspace);
-        if (block) buffer += `${block}\n`;
+        if (!executor) {
+          try {
+            const ctx = JSON.parse(await readFile(path.join(jobDir(workspace, jobId), "context.json"), "utf8")) as { executor?: string };
+            executor = typeof ctx.executor === "string" ? ctx.executor : undefined;
+          } catch {
+            /* context 未就绪 */
+          }
+        }
+        const jobs = await loadTaskList(workspace);
+        if (jobs.length > 0) buffer += `任务清单（${jobs.length} 个 cbx job）:\n${formatTaskList(jobs)}\n`;
       }
       if (state.status !== lastStatus) {
         lastStatus = state.status;
-        buffer += `[${state.status}${state.phase ? ` / ${state.phase}` : ""}${state.attempt !== undefined ? ` (attempt ${state.attempt})` : ""}]\n`;
+        buffer += `${progressLine({ status: state.status, phase: state.phase, attempt: state.attempt, executor })}\n`;
       }
       if (BRIDGE_TERMINAL_STATUSES.has(state.status)) {
         const output = await buildFinalSummary(workspace, jobId, state).catch(() => `[${state.status}]`);

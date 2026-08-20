@@ -8,7 +8,8 @@ import { listJobs, readArtifact } from "./artifacts.js";
 import { formatTaskList } from "./format.js";
 import { loadConfig, loadState, mergeConfig } from "./state.js";
 import { bridgeCbxJob } from "./jobs-bridge.js";
-import { noExecutorError, routeExecutor, type RouteDecision } from "./executor-router.js";
+import { deriveRequirements, noExecutorError, routeExecutor, type ExecutorStrategy, type RouteDecision } from "./executor-router.js";
+import { loadHealth } from "./executor-health.js";
 import type { CbxDefaults, SessionCwdContext } from "./tools.js";
 import type { CommandResult } from "@deepseek-ai/dsh-commands";
 import { WorkspacePolicy } from "./workspace-policy.js";
@@ -113,12 +114,15 @@ export function registerCbxCommands(service: CbxCommandContext): void {
           review: defaults.review,
           isolated: defaults.isolated,
         });
-        // 先探测本机已安装的 agent CLI，再把委派路由到可用执行器（auto/回退）。
+        // 先探测本机已安装的 agent CLI，再按需求过滤 + 策略打分选最合适的一个。
         // 与 tools.ts 的 cbx_run 对齐：请求执行器 = 工作区 config ?? 插件配置默认。
         // （不能用 merged.executor——它在 mergeConfig 里已被兜底为 config ?? "codebuddy"，
         //   会丢 defaults.executor 的插件路径/特定内建默认。）
         const decision: RouteDecision = routeExecutor(config.executor ?? defaults.executor, {
           preference: config.executorPreference,
+          requirements: deriveRequirements({ permissionMode: merged.permissionMode }),
+          strategy: config.routingStrategy ?? "first-available",
+          health: loadHealth(ws),
         });
         if (!decision.executor) throw noExecutorError(decision.available);
         const created = await createJob({

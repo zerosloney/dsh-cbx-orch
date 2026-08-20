@@ -49,6 +49,10 @@ export interface RuntimeConfig {
   reviewExecutor?: string;
   /** 执行器路由偏好顺序（内置名/别名）；未知项忽略。缺省 = BUILTIN_EXECUTORS 顺序。 */
   executorPreference?: string[];
+  /** 执行器需求：路由层先过滤不满足的执行器（如需要 autoApprove 时排除 omp）。见 executor-router。 */
+  executorRequirements?: import("./executor-router.js").ExecutorRequirements;
+  /** 执行器路由策略（first-available / capability-best / cost-aware / fastest / round-robin / least-recently-used）。 */
+  routingStrategy?: import("./executor-router.js").ExecutorStrategy;
   /**
    * 隔离任务携带未提交改动：`isolated: true` 且工作区有未提交内容时，默认 cbx 拒绝
    * （隔离 worktree 从干净基线创建，带不动脏状态）。`carryDirty: true` 会把当前未提交
@@ -172,6 +176,8 @@ export async function loadRuntimeConfig(
     "executor",
     "reviewExecutor",
     "executorPreference",
+    "executorRequirements",
+    "routingStrategy",
     "carryDirty",
     "execution",
     "plugins",
@@ -207,6 +213,45 @@ export async function loadRuntimeConfig(
       ))
   )
     throw new Error("executorPreference 必须是非空字符串数组。");
+  if (config.executorRequirements !== undefined) {
+    const v = object(config.executorRequirements, "executorRequirements");
+    known(v, "executorRequirements", [
+      "autoApprove",
+      "planMode",
+      "sandbox",
+      "headless",
+      "maxTurnsSupport",
+      "streaming",
+      "exclude",
+    ]);
+    for (const key of [
+      "autoApprove",
+      "planMode",
+      "sandbox",
+      "headless",
+      "maxTurnsSupport",
+      "streaming",
+    ] as const)
+      optionalBoolean(v[key], `executorRequirements.${key}`);
+    if (
+      v.exclude !== undefined &&
+      (!Array.isArray(v.exclude) ||
+        v.exclude.some((item: unknown) => typeof item !== "string" || !String(item).trim()))
+    )
+      throw new Error("executorRequirements.exclude 必须是非空字符串数组。");
+  }
+  if (config.routingStrategy !== undefined) {
+    const allowed = [
+      "first-available",
+      "capability-best",
+      "cost-aware",
+      "fastest",
+      "round-robin",
+      "least-recently-used",
+    ];
+    if (typeof config.routingStrategy !== "string" || !allowed.includes(config.routingStrategy))
+      throw new Error(`routingStrategy 必须是以下之一：${allowed.join(", ")}。`);
+  }
   optionalBoolean(config.dependencyGuard, "dependencyGuard");
   if (config.approval !== undefined) {
     const value = object(config.approval, "approval");

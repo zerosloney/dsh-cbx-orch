@@ -263,7 +263,7 @@ export function mergeConfig(
 > &
   Pick<
     CbxConfig,
-    "testCommand" | "reviewRules" | "executor" | "reviewExecutor"
+    "testCommand" | "reviewRules" | "executor" | "reviewExecutor" | "executorRequirements" | "routingStrategy"
   > & {
     approvalBeforeRun: boolean;
     approvalBeforeComplete: boolean;
@@ -302,6 +302,8 @@ export function mergeConfig(
       "chore(cbx): apply task",
     executor: overrides.executor ?? config.executor ?? "codebuddy",
     reviewExecutor: overrides.reviewExecutor ?? config.reviewExecutor,
+    executorRequirements: overrides.executorRequirements ?? config.executorRequirements,
+    routingStrategy: overrides.routingStrategy ?? config.routingStrategy,
     trustMode: overrides.trustMode ?? config.execution?.trustMode ?? "trusted",
     dependencyGuard:
       overrides.dependencyGuard ?? config.dependencyGuard ?? false,

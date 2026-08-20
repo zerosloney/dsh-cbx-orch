@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inspectExecutorPlugin, type ExecutorResult, type ExecutorRequest } from "./executor.js";
 import { findExecutable, resolveExecutor } from "./executors/builtin.js";
+import { recordExecutorOutcome } from "./executor-health.js";
 import { bumpInvocationCount, loadConfig } from "./state.js";
 import { validateTestCommand } from "./validation.js";
 import { runProcess, runShell, type ProcessResult } from "./process-runner.js";
@@ -170,9 +171,10 @@ export async function invokeExecutor(
 ): Promise<ProcessResult> {
   const jobSignal = jobContext.getStore()?.controller.signal;
   const combined = combineAbortSignals(callerSignal, jobSignal);
+  const start = Date.now();
   try {
     throwIfAborted(callerSignal, jobSignal);
-    return await invokeExecutorCore(
+    const result = await invokeExecutorCore(
       executor,
       workspace,
       directory,
@@ -184,6 +186,16 @@ export async function invokeExecutor(
       invocationMeta,
       combined.signal,
     );
+    // 回写健康度：成功/失败 + 延迟，供路由层降权 / LRU / round-robin 使用。
+    try {
+      recordExecutorOutcome(workspace, executor, {
+        success: result.code === 0 && !result.timedOut,
+        latencyMs: Date.now() - start,
+      });
+    } catch {
+      /* 健康度记录失败不影响主流程 */
+    }
+    return result;
   } catch (error) {
     rethrowPreferredAbort(error, callerSignal, jobSignal);
   } finally {

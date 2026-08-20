@@ -62,8 +62,8 @@ dsh --profile web
 
 | 工具 | 作用 |
 | --- | --- |
-| `cbx_run` | 创建并排队一个任务（task/executor/test/review/isolated/carry_dirty/审批门等）；`executor` 缺省/"auto" 时按本机已安装的 agent CLI 自动路由；`carry_dirty` 把未提交改动带进隔离 worktree |
-| `cbx_executors` | 探测本机已安装/可解析的编码 agent CLI（codebuddy/opencode/omp/cline/qwen）及其 envVar 覆盖 |
+| `cbx_run` | 创建并排队一个任务（task/executor/executor_preference/executor_requirements/routing_strategy/test/review/isolated/carry_dirty/审批门等）；`executor` 缺省/"auto" 时按本机已安装的 agent CLI 自动路由（能力感知 + 策略打分）；`executor_requirements` 表达任务需求（自动从 permission_mode/plan 推导）；`routing_strategy` 选策略（first-available/capability-best/cost-aware/fastest/round-robin/least-recently-used）；`carry_dirty` 把未提交改动带进隔离 worktree |
+| `cbx_executors` | 探测本机已安装/可解析的编码 agent CLI（codebuddy/opencode/omp/cline/qwen）及其 envVar 覆盖；给定 workspace 时额外显示每个执行器的**能力声明与健康度**（成功/失败/延迟） |
 | `cbx_status` | 任务状态/阶段/尝试 |
 | `cbx_list` | 列出工作区所有任务 |
 | `cbx_queue` / `cbx_queue_pause` / `cbx_queue_resume` | 队列查看与暂停/恢复 |
@@ -79,7 +79,11 @@ dsh --profile web
 | `cbx_list_workspaces` | 列出已授权的工作区（不扫描任意 root 或子目录） |
 | `cbx_review_gate` | 对未提交改动跑独立审查 |
 
-> **执行器路由（先检测本机 agent CLI，再路由委派）**：`cbx_run` / `/cbx-run` / Web 创建接口在创建任务前先探测本机已安装的编码 agent CLI（codebuddy/opencode/omp/cline/qwen）。`executor` 未指定或为 `"auto"` 时，自动选择**偏好顺序中第一个已安装**的执行器；显式指定某个内置执行器但**未安装**时，默认自动回退到下一个可用 CLI（回退会写入返回信息与日志，`autoFallback` 语义见源码）；插件路径不参与内置路由。本机一个编码 CLI 都没有时**创建即报错**并列出安装指引（取代原先"创建后执行时 spawn 崩溃"的失败模式）。探测结果带短 TTL 缓存，命中即复用；偏好顺序可用工具参数 `executor_preference` 或 `.cbx.json` 的 `executorPreference` 覆盖（缺省 = 内置声明顺序 codebuddy, opencode, omp, cline, qwen）。`cbx_executors` 工具可随时查看当前探测结果。
+> **执行器路由（能力感知 + 多因子决策）**：`cbx_run` / `/cbx-run` / Web 创建接口在创建任务前先探测本机已安装的编码 agent CLI（codebuddy/opencode/omp/cline/qwen），然后**按需求过滤 + 策略打分**选出最合适的一个。内置执行器声明 `capabilities`（autoApprove / planMode / sandbox / headless / maxTurnsSupport / streaming）与成本/速度档位（costTier / speedTier）：
+> - **需求过滤**：任务可表达 `executor_requirements`（工具参数，或 `.cbx.json` 的 `executorRequirements`）；路由层**先剔除不满足需求的执行器**。`permission_mode`/`plan` 会自动推导需求——`auto`/`dontAsk` → 需要 `autoApprove`（例如此时自动排除 **omp**，它没有 auto-approve flag，会卡在交互授权）；`plan` → 需要 `planMode`。
+> - **策略打分**：在满足需求的候选中按 `routing_strategy`（工具参数，或 `.cbx.json` 的 `routingStrategy`）打分选最优：`first-available`（缺省，按偏好顺序，等价旧行为但叠加需求过滤）/ `capability-best`（能力最多优先）/ `cost-aware`（成本最低优先）/ `fastest`（速度最高优先）/ `round-robin` / `least-recently-used`（最久未用优先）。分数综合偏好顺序 + 能力 + **健康度** + 策略项。
+> - **健康度追踪**：每次执行器调用后把成功/失败/延迟/最近使用回写到 `<workspace>/.cbx/executor-health.json`（进程内即时生效，最佳努力异步落盘）。路由据此对**连续失败的执行器降权**，并为 LRU / round-robin 提供"最近使用"依据。`cbx_executors`（给定 workspace）可查看每个执行器的能力与健康度。
+> - **兼容旧语义**：`executor` 未指定或 `"auto"` 时自动选择；显式指定但**未安装**默认回退到满足需求的可用 CLI（回退原因写进返回信息与日志，`autoFallback:false` 可关闭）；**插件路径不参与内置路由**（原样返回）。本机一个可用（且满足需求）的编码 CLI 都没有时**创建即报错**并给出安装/需求提示。探测结果带短 TTL 缓存；偏好顺序可用 `executor_preference` 或 `.cbx.json` 的 `executorPreference` 覆盖（缺省 = 内置声明顺序 codebuddy, opencode, omp, cline, qwen）。
 >
 > **工具参数使用 snake_case**（如 `timeout_ms` / `max_retries` / `max_turns` / `executor_preference`）；`.cbx.json` 配置键与 Web/命令层使用 camelCase（`timeoutMs` / `maxRetries` / `maxTurns` / `executorPreference`）。二者仅命名风格不同，语义一一对应。
 >
@@ -90,6 +94,8 @@ dsh --profile web
 > **任务清单直接显示在当前会话**：`cbx_run` / `cbx_continue` 的提交响应、`/cbx-run` / `/cbx-continue` 的回复、会话后台任务的 `job_output` 首轮快照以及完成通知，都会直接附上当前工作区的**全量任务清单表格**（Job ID / Status / Phase / Attempt / Updated），不再需要先调 `cbx_list` 或打开仪表盘才能看到编排全局；清单来自落库后的实时快照（`src/format.ts` 的 `formatTaskList` 统一格式化）。
 >
 > **委派处理消息流入当前会话**：执行器（外部编码 CLI）的处理过程——工具调用/推理/文件编辑的原始转录（agent.log）与状态迁移——现在会进入当前会话视图：① `cbx_watch` 轮询期间累计状态迁移 + agent.log 尾部，终态时连同最终状态一起返回（`include_log` / `max_log_chars` 可调，`since` 支持续读）；② 会话后台任务的完成通知（jobs-bridge 投递）自带 agent.log 尾部摘要（"处理消息（agent.log）"，截断到 8K 内，完整内容仍在磁盘），因此委派结束当前会话直接看到委派代理做了什么；③ `job_output` 运行期即可增量读到 agent.log 尾部。
+>
+> **统一的会话消息（`src/session-message.ts`）**：`cbx_run` / `cbx_continue` / `cbx_status` / `cbx_watch` 与会话后台任务桥的终态摘要，全部收敛到同一套富化消息，讲话一致、可行动：**状态 + 阶段人话说明**（如 `needs_fix（等待补充说明）`、`awaiting_approval（执行前等待审批）`）+ **执行器/路由决策** + **任务清单** + **产物目录指针（job dir）** + **处理消息（agent.log）**。每条消息按状态给出**下一步行动**（`下一步: 批准 cbx_approve <id>` / `按失败原因修复续跑 cbx_continue <id> <指令>` / `跟踪进度 cbx_watch <id>` / 完成时 `读结果 cbx_result <id>`），让当前会话（代理）一眼知道自己该调哪个工具。状态迁移行统一为 `[status / phase (attempt N) · executor]`（桥的实时进度带上执行器名）。
 >
 > **输出上限**：`cbx_result` / `cbx_artifact` 的文本输出截断到 64K 字符（保头尾并标注总长）；`cbx_status` / `cbx_cancel` / `cbx_approve` 等返回 state 的工具对超长字符串字段做深截断（8K）。完整内容仍在磁盘工件里，需要时用 `cbx_logs` 增量读取。
 
@@ -154,7 +160,7 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 
 ### 工作区配置（`.cbx.json`，与 cbx-orch 相同）
 
-`executor`、`testCommand`、`review`、`isolated`、`timeoutMs`、`maxRetries`、`maxTurns`、`maxConcurrent`、`reviewRules`、`approval`、`git`、`reviewGate`（`enabled`、`failOpen`）、`notifications`（webhook/OTLP outbox）、`governance`（retention/redact）、`telemetry`、`ui.token`、`executors`（`envAllowlist`，工作区级环境白名单，见「配置」节）等，见 cbx-orch 文档。
+`executor`、`executorPreference`、`executorRequirements`（如 `{ autoApprove: true, exclude: ["omp"] }`）、`routingStrategy`（`first-available`/`capability-best`/`cost-aware`/`fastest`/`round-robin`/`least-recently-used`）、`testCommand`、`review`、`isolated`、`timeoutMs`、`maxRetries`、`maxTurns`、`maxConcurrent`、`reviewRules`、`approval`、`git`、`reviewGate`（`enabled`、`failOpen`）、`notifications`（webhook/OTLP outbox）、`governance`（retention/redact）、`telemetry`、`ui.token`、`executors`（`envAllowlist`，工作区级环境白名单，见「配置」节）等，见 cbx-orch 文档。
 
 ## 行为语义
 
@@ -202,6 +208,15 @@ npm run typecheck
 npm test             # build + node --test（纯函数单测：校验/pid 归属/审计/证据门/上下文包/存储）
 npm run smoke:e2e    # 端到端冒烟：起 dsh profile → 静态面/鉴权/SSE/任务生命周期 21 项断言
 ```
+
+`npm test` 顶层汇总里的 **`skipped` 是指测试在运行时被「条件性」主动跳过**（`t.skip(...)`），不是失败也不是遗漏——是测试作者写好的**安全护栏**：当环境不满足"安全/有代表性"的运行条件时就跳过，避免误报失败或触碰真实数据。目前有 4 处会按环境命中：
+
+| # | 条件触发的跳过点 | 触发条件 | 意图 |
+|---|---|---|---|
+| 1-3 | `test/commands-workspace.test.mjs`（3 处） | **当前工作目录已存在 `.cbx/`** 时 | 避免测试在你真实数据上乱动 |
+| 4 | `test/scheduler-ownership.test.mjs` | **本机无法创建 Windows junction** 时 | 环境不支持 junction 即跳过该子测试 |
+
+因此在本仓库目录（自带 `.cbx/`）里跑 `npm test` 会看到 `skipped 4`（3 处 cwd 已存在 `.cbx` + 1 处 junction 不可建）。这是预期行为；`pass / fail` 才是有效结果（例如当前为 146 pass / 0 fail）。想让那 3 处真正运行，可换到无 `.cbx/` 的目录跑——但可能又触发其他环境相关的跳过。
 
 ### 冒烟测试
 

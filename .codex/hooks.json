@@ -1,0 +1,45 @@
+{
+  "description": "Minimal quality gates for dsh-cbx-orch.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/quality-gate.mjs\" session-start",
+            "commandWindows": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/quality-gate.mjs\" session-start",
+            "timeout": 5,
+            "statusMessage": "Capturing workspace baseline"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/quality-gate.mjs\" stop",
+            "commandWindows": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/quality-gate.mjs\" stop",
+            "timeout": 300,
+            "statusMessage": "Running changed-code checks"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/quality-gate.mjs\" pre-commit",
+            "commandWindows": "node \"$(git rev-parse --show-toplevel)/.codex/hooks/quality-gate.mjs\" pre-commit",
+            "timeout": 300,
+            "statusMessage": "Checking commit validation"
+          }
+        ]
+      }
+    ]
+  }
+}

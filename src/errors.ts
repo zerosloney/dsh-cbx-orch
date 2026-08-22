@@ -10,6 +10,7 @@ export type CbxErrorCode =
   | "E_INVALID_CONTEXT"
   | "E_LOCK_BUSY"
   | "E_QUEUE_BUSY"
+  | "E_BACKEND_UNAVAILABLE"
   | "E_NOT_FOUND";
 
 export class CbxError extends Error {

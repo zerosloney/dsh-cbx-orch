@@ -29,7 +29,7 @@ function fakeContext(sessions, agents) {
 }
 
 /** 假 session store：prepare/enter/announce + 记录 append 的假 Session。 */
-function fakeSessionsStore() {
+function fakeSessionsStore({ announceError, flushError } = {}) {
   const sessions = [];
   const store = {
     sessions,
@@ -50,11 +50,18 @@ function fakeSessionsStore() {
       session.detached = false;
       store.sessions.push(session);
       return () => {
+        session.detachedAfterFlush = session.flushed === true;
         session.detached = true;
       };
     },
     announce(session) {
+      if (announceError) throw announceError;
       session.announced = true;
+    },
+    async flush(session) {
+      session.flushed = true;
+      if (flushError) throw flushError;
+      return true;
     },
   };
   return store;
@@ -138,6 +145,15 @@ test("publishCbxFacade: 无 sessions 服务时不发布（reason=no-sessions-ser
   assert.equal(result.reason, "no-sessions-service");
 });
 
+test("publishCbxFacade: announce 失败时回滚已 enter 的会话", () => {
+  const store = fakeSessionsStore({ announceError: new Error("observer failed") });
+  const ctx = fakeContext(store, { currentInitiator: () => ({ id: "parent-1" }) });
+  const result = publishCbxFacade(ctx, { workspace: "C:/ws", jobId: "j1", task: "t" });
+  assert.equal(result.reason, "registration-rejected");
+  assert.equal(store.sessions[0].detached, true);
+  assert.deepEqual(liveFacadeIds(ctx), []);
+});
+
 test("publishCbxFacade: 发布成功——初始事件齐备、镜像启动、enter/announce 调用", async () => {
   await withJob(async ({ workspace, jobId, dir }) => {
     await writeState(dir, "queued");
@@ -197,6 +213,8 @@ test("publishCbxFacade: 终态时结算——追加摘要与 turn/end、detach�
     // 任务进入终态 → 镜像结算。
     await writeState(dir, "done", { phase: "done" });
     await waitFor(() => session.detached === true);
+    assert.equal(session.flushed, true);
+    assert.equal(session.detachedAfterFlush, true);
     const types = session.events.map((e) => e.type);
     assert.ok(types.includes("turn/end"));
     const finals = session.events.filter((e) => e.type === "assistant/message");

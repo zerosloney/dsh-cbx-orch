@@ -117,6 +117,8 @@ export interface CbxFacadeOptions {
 interface FacadeHandle {
   id: SessionId;
   session: Session;
+  /** 会话 store：终态 detach 前必须经它完成 durability checkpoint。 */
+  sessions: SessionStore;
   /** enter() 返回的 detach disposer：移除 live store 并触发 session/disposed 收尾。 */
   detach: () => void;
   /** 所属 registry（settle 时精确删除自身条目）。 */
@@ -132,6 +134,8 @@ interface FacadeHandle {
   /** 已镜像字符数（MIRROR_CHARS_CAP 上限）。 */
   mirrored: number;
   settled: boolean;
+  /** 终态收尾中的单飞 promise，防止并发轮询重复 flush/detach。 */
+  settling?: Promise<void>;
 }
 
 /** 每个 context 一份存活 registry（会话 id → 外观句柄），随 context 生命周期清理。 */
@@ -214,6 +218,7 @@ export function publishCbxFacade(
     .session?.header?.delegationDepth;
   const delegationDepth = typeof parentDepth === "number" ? parentDepth + 1 : undefined;
 
+  let detach: (() => void) | undefined;
   try {
     const session = sessions.prepare(id, {
       meta: {
@@ -223,13 +228,15 @@ export function publishCbxFacade(
         ...(delegationDepth === undefined ? {} : { delegationDepth }),
       },
     });
-    const detach = sessions.enter(session);
+    // `enter()` 后立即保留 detach：`announce()` 或初始 append 失败时必须回滚 live session。
+    detach = sessions.enter(session);
     sessions.announce(session);
 
     const handle: FacadeHandle = {
       id,
       session,
       detach,
+      sessions,
       registry,
       executor: options.executor,
       router: options.router,
@@ -263,6 +270,7 @@ export function publishCbxFacade(
     handle.timer = scheduleMirror(options, handle, options.pollMs ?? POLL_MS);
     return { sessionId: id };
   } catch (error) {
+    detach?.();
     const reason = "registration-rejected" as const;
     const detail = error instanceof Error ? error.message : String(error);
     options.logger?.(
@@ -274,22 +282,22 @@ export function publishCbxFacade(
 
 /** 用 setTimeout 链跑镜像轮询（与 jobs-bridge 一致：不绑调用 fiber）。 */
 function scheduleMirror(options: CbxFacadeOptions, handle: FacadeHandle, pollMs: number): NodeJS.Timeout {
-  return setTimeout(function loop() {
+  const loop = async (): Promise<void> => {
     if (handle.settled) return;
-    void (async () => {
-      try {
-        await mirrorOnce(options, handle);
-      } catch (error) {
-        // 契约：镜像循环永不抛出——意外错误收口为提示 + 结算。
-        appendAssistant(
-          handle,
-          `[cbx ${options.jobId}] 镜像轮询异常：${error instanceof Error ? error.message : String(error)}`,
-        );
-        settleFacade(options, handle);
-      }
-    })();
-    if (!handle.settled) handle.timer = setTimeout(loop, pollMs);
-  }, pollMs);
+    try {
+      await mirrorOnce(options, handle);
+    } catch (error) {
+      // 契约：镜像循环永不抛出——意外错误收口为提示 + 结算。
+      appendAssistant(
+        handle,
+        `[cbx ${options.jobId}] 镜像轮询异常：${error instanceof Error ? error.message : String(error)}`,
+      );
+      await settleFacade(options, handle);
+    }
+    // 仅在本轮异步读取完成后安排下一轮，避免并发读取同一 since 游标。
+    if (!handle.settled) handle.timer = setTimeout(() => void loop(), pollMs);
+  };
+  return setTimeout(() => void loop(), pollMs);
 }
 
 /** 单轮镜像：状态迁移 + agent.log 增量 → 事件；终态 → 摘要 + 结算。 */
@@ -304,7 +312,7 @@ async function mirrorOnce(options: CbxFacadeOptions, handle: FacadeHandle): Prom
   if (state === undefined) {
     // job 目录消失（forget/purge）：视为已终止。
     appendAssistant(handle, `[cbx ${jobId}] job 目录已移除，前台镜像结束。`);
-    settleFacade(options, handle);
+    await settleFacade(options, handle);
     return;
   }
 
@@ -340,7 +348,7 @@ async function mirrorOnce(options: CbxFacadeOptions, handle: FacadeHandle): Prom
 
   if (terminal) {
     appendAssistant(handle, await finalSummary(options, state));
-    settleFacade(options, handle);
+    await settleFacade(options, handle);
   }
 }
 
@@ -369,19 +377,30 @@ async function finalSummary(options: CbxFacadeOptions, state: JobState): Promise
   }).slice(0, FINAL_SUMMARY_MAX);
 }
 
-/** 结算：追加大写 turn/end，detach 会话并从 registry 移除。 */
-function settleFacade(options: CbxFacadeOptions, handle: FacadeHandle): void {
+/** 结算：追加 turn/end，完成 durability checkpoint 后 detach 会话并移除 registry。 */
+async function settleFacade(options: CbxFacadeOptions, handle: FacadeHandle): Promise<void> {
   if (handle.settled) return;
-  handle.settled = true;
+  if (handle.settling) return handle.settling;
   if (handle.timer !== undefined) clearTimeout(handle.timer);
-  try {
-    handle.session.append("turn/end", { turn: 0, reason: { kind: "completed" } });
-  } catch {
-    /* 日志已损坏/已结算：跳过收尾事件 */
-  }
-  disposeFacade(handle);
-  handle.registry.delete(handle.id);
-  options.logger?.(`cbx subagent-facade: 前台镜像结束 (${options.jobId})。`);
+  handle.settling = (async () => {
+    try {
+      handle.session.append("turn/end", { turn: 0, reason: { kind: "completed" } });
+    } catch {
+      /* 日志已损坏/已结算：仍尝试 flush 已写入事件。 */
+    }
+    try {
+      await handle.sessions.flush(handle.session);
+    } catch (error) {
+      // 持久化失败不能让 front-end session 永久滞留；日志供宿主排查。
+      options.logger?.(
+        `cbx subagent-facade: 持久化收尾失败 (${options.jobId}) — ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    disposeFacade(handle);
+    handle.registry.delete(handle.id);
+    options.logger?.(`cbx subagent-facade: 前台镜像结束 (${options.jobId})。`);
+  })();
+  return handle.settling;
 }
 
 /** detach 会话（live store 移除 + session/disposed 持久化收尾），幂等；同时停镜像定时器。 */

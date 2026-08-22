@@ -1,0 +1,5 @@
+# This repository builds TypeScript into lib/ and installs Node dependencies.
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true

@@ -251,3 +251,48 @@ test("monitorCbxJob: job 目录消失视为 killed", async () => {
     assert.equal(outcome.status, "killed");
   });
 });
+
+test("monitorCbxJob: 路由决策在首轮快照与终态摘要可见（委派给了谁、为什么）", async () => {
+  await withJob(async ({ workspace, jobId, dir }) => {
+    await writeState(dir, "running", { phase: "executor" });
+    const hooks = monitorCbxJob(workspace, jobId, 30, {
+      executor: "opencode",
+      routed: true,
+      reason: "codebuddy（未安装，已回退到可用执行器 opencode）",
+    });
+    await writeFile(
+      path.join(dir, "result.json"),
+      JSON.stringify({ status: "done", handback: "ok" }),
+      "utf8",
+    );
+    await writeState(dir, "done", { phase: null });
+
+    const outcome = await hooks.done;
+    assert.equal(outcome.status, "completed");
+    // 终态摘要保留路由原因：完成通知仍能看到"当初为什么是这个执行器"。
+    assert.match(outcome.output ?? "", /executor: opencode（路由：codebuddy/);
+
+    const read = hooks.readOutput();
+    // 首轮快照直接给出路由决策，不等终态。
+    assert.match(read, /已自动路由到执行器 opencode/);
+  });
+});
+
+test("monitorCbxJob: 无 router 时首轮快照回落 context.json 执行器（旧行为不变）", async () => {
+  await withJob(async ({ workspace, jobId, dir }) => {
+    await writeFile(
+      path.join(dir, "context.json"),
+      JSON.stringify({ executor: "qwen" }),
+      "utf8",
+    );
+    await writeState(dir, "running", { phase: "executor" });
+    const hooks = monitorCbxJob(workspace, jobId, 30);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const read = hooks.readOutput();
+    assert.match(read, /\[running \/ executor \(attempt 0\) · qwen\]/);
+    // 无 router → 不输出路由行
+    assert.doesNotMatch(read, /已自动路由到执行器|已委派给执行器/);
+    await writeState(dir, "cancelled", { phase: null });
+    await hooks.done;
+  });
+});

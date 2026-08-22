@@ -39,6 +39,8 @@ export interface SessionMessageInput {
   jobDir?: string;
   /** 桥注册提示（已渲染成一行）或其余外部提示。 */
   bridgeNote?: string;
+  /** 前台子代理外观层提示（已渲染成一行）。 */
+  facadeNote?: string;
   /** 工作区全量任务清单（由本模块统一 formatTaskList）。 */
   taskList?: readonly JobState[];
   /** 运行中经历的状态迁移行（终态前的事件回放）。 */
@@ -126,6 +128,24 @@ export function progressLine(state: {
   return parts.join("");
 }
 
+/**
+ * 路由决策一行摘要（委派时刻的"委派给了谁、为什么"）：
+ * - 自动路由/回退（routed=true）：「已自动路由到执行器 X（reason）」
+ * - 显式指定：                    「已委派给执行器 X（reason）」
+ * 无 executor 时返回 undefined（调用方跳过该行）。
+ *
+ * 供 jobs-bridge 首轮快照与 subagent-facade 发布首条消息复用——工具渲染
+ * （runJobOutput）之外的两个"前台"通道也要在委派那一刻看到路由决策，
+ * 而不是等终态摘要才知道选了哪个执行器。
+ */
+export function routeNote(router?: RouterInfoLike): string | undefined {
+  if (!router?.executor) return undefined;
+  const reason = router.reason ? `（${router.reason}）` : "";
+  return router.routed
+    ? `已自动路由到执行器 ${router.executor}${reason}`
+    : `已委派给执行器 ${router.executor}${reason}`;
+}
+
 /** 统一构建一段会话消息。 */
 export function buildSessionMessage(input: SessionMessageInput): string {
   const lines: string[] = [];
@@ -151,6 +171,7 @@ export function buildSessionMessage(input: SessionMessageInput): string {
   const hints = nextActionHint(status, input.phase, jobId);
   if (hints.length > 0) lines.push(`  下一步:   ${hints.join("；")}`);
   if (input.bridgeNote) lines.push(`  ${input.bridgeNote}`);
+  if (input.facadeNote) lines.push(`  ${input.facadeNote}`);
 
   if (input.statusEvents && input.statusEvents.length > 0) {
     lines.push("");

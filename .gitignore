@@ -5,3 +5,4 @@ dist/
 .cbx/
 .env
 .smoke-ws/
+.pnpm-store/

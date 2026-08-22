@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased (0.1.0)
+## 0.2.0 (2026-08-22)
+
+自 npm 0.1.0（tag `v0.1.0`）以来的增量。
+
+### Added
+
+- **前台子代理外观层（subagent facade，`src/subagent-facade.ts`）**：把 cbx 委派发布为 harness 子代理镜像会话——Web「任务管理」页的子代理树（前台）里像子代理一样显示卡片，点击可实时查看执行输出（状态迁移 + agent.log 增量镜像）；终态追加摘要后 detach。新增 peerDependency `@deepseek-ai/dsh-session`。
+- **路由决策前台可见（委派时刻）**：`cbx_run` 创建时的执行器路由决策（选了谁、是否自动路由/回退、原因）贯穿全部前台通道——后台任务桥的首轮 `job_output` 快照与完成通知、前台子代理镜像的首条消息与终态摘要都显示「已（自动路由到）委派给执行器 X（原因）」。新增共享格式化器 `routeNote()`；`bridgeCbxJob`/`publishCbxFacade` 新增 `router` 选项，无 router 时回落旧行为。
+- **`/cbx-run` 显式执行器覆盖**：支持 `--executor <name>` / `--executor=<name>`（任意位置，解析后从任务剔除，也接受插件路径）与前导 `@<name>` 简写（仅命中内置注册名/别名才剥离）；优先级与工具对齐（显式覆盖 > 工作区 config > 插件默认），回复文案统一用 `routeNote()`。新增 `extractExecutorOverride` 导出与单测。
+
+### Docs
+
+- README：执行器覆盖语法、前台通道路由可见性、斜杠命令签名同步；`docs/alignment.md` §4.3 从「暂不做」更新为「已实现（外观层）」。
+
+## 0.1.0
 
 首次发布前的完整加固轮（安全审计 + 六轮修复 + 工程化）。
 
@@ -30,6 +44,8 @@
 - **任务清单直接显示在当前会话**：`cbx_run`/`cbx_continue` 提交响应、`/cbx-run`/`/cbx-continue` 回复、会话后台任务的 `job_output` 首轮快照与完成通知，都直接附上当前工作区**全量任务清单表格**（Job ID/Status/Phase/Attempt/Updated），不用再单独调 `cbx_list`/`/cbx-list` 或开仪表盘才能看到编排全局。统一走新的共享格式化器 `src/format.ts`（`formatTaskList`），`cbx_list` 渲染亦复用之。
 - **新增 `/cbx-web [workspace]` 斜杠命令**：解析当前工作区（或显式 workspace，受白名单约束）后给出 cbx 仪表盘链接并尝试在系统默认浏览器打开（Windows `start` / macOS `open` / Linux `xdg-open`）；从 `ctx.webServer` 读取实际端口构造绝对 URL，未加载 `cbx-orch-web` 的 headless profile 会提示。浏览器唤起是 best-effort，失败回落为输出可点击链接。
 - 设计文档 `docs/alignment.md`：与 harness 原生服务（jobs/schedule/subagents/settings/事件）的边界与互操作决策。
+- **路由决策前台可见（委派时刻）**：`cbx_run` 创建时的执行器路由决策（选了谁、是否自动路由/回退、原因）现在贯穿全部前台通道——后台任务桥的首轮 `job_output` 快照与完成通知、前台子代理镜像的首条消息与终态摘要都会显示「已（自动路由到）委派给执行器 X（原因）」，不再只在工具渲染文本里可见、也不再等终态才知道选了哪个执行器。新增共享格式化器 `routeNote()`（session-message）；`cbx_run` 经 `bridgeCbxJob`/`publishCbxFacade` 的新 `router` 选项传递（RouteDecision 最小视图），无 router 时回落旧行为（context.json 执行器、无路由行）。
+- **`/cbx-run` 支持显式执行器覆盖 + 路由决策同款可见**：斜杠命令此前没有 executor 参数（整行输入都是任务文本）。现在支持 `--executor <name>` / `--executor=<name>`（任意位置，解析后从任务剔除，也接受插件路径）与前导 `@<name>` 简写（仅当命中内置执行器注册名/别名才剥离，不误伤以 @ 开头的普通任务）；优先级与工具对齐（显式覆盖 > 工作区 config > 插件默认）。`/cbx-run` 创建路径同样把路由决策传给桥与外观层（`router` 选项 + facade `executor`），回复文案改用 `routeNote()`（自动路由显示「已自动路由到」，显式指定显示「已委派给」）。新增 `extractExecutorOverride` 导出与单测。
 
 ### Fixed
 

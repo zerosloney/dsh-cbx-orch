@@ -5,6 +5,7 @@ import {
   phaseExplanation,
   nextActionHint,
   progressLine,
+  routeNote,
 } from "../lib/session-message.js";
 
 test("phaseExplanation: 状态+阶段 → 人话", () => {
@@ -71,4 +72,28 @@ test("buildSessionMessage: 完成态带下一步行读产物", () => {
   assert.match(text, /changed:  3 个文件/);
   assert.match(text, /review:   PASS/);
   assert.match(text, /下一步:.*cbx_result j9/);
+});
+
+test("routeNote: 路由决策一行摘要（自动路由/显式指定/缺省）", () => {
+  assert.equal(
+    routeNote({ executor: "opencode", routed: true, reason: "codebuddy（未安装，已回退到可用执行器 opencode）" }),
+    "已自动路由到执行器 opencode（codebuddy（未安装，已回退到可用执行器 opencode））",
+  );
+  assert.equal(
+    routeNote({ executor: "opencode", routed: false, reason: "OpenCode（opencode）已安装，直接使用。" }),
+    "已委派给执行器 opencode（OpenCode（opencode）已安装，直接使用。）",
+  );
+  assert.equal(routeNote({ executor: "qwen" }), "已委派给执行器 qwen");
+  assert.equal(routeNote(undefined), undefined);
+  assert.equal(routeNote({ routed: true }), undefined);
+});
+
+test("buildSessionMessage: router 分支优先渲染路由原因", () => {
+  const text = buildSessionMessage({
+    jobId: "j1",
+    status: "queued",
+    executor: "fallback-name",
+    router: { executor: "opencode", routed: true, reason: "自动选择" },
+  });
+  assert.match(text, /executor: opencode（路由：自动选择）/);
 });

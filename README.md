@@ -88,12 +88,15 @@ dsh --profile web
 > - **策略打分**：在满足需求的候选中按 `routing_strategy`（工具参数，或 `.cbx.json` 的 `routingStrategy`）打分选最优：`first-available`（缺省，按偏好顺序，等价旧行为但叠加需求过滤）/ `capability-best`（能力最多优先）/ `cost-aware`（成本最低优先）/ `fastest`（速度最高优先）/ `round-robin` / `least-recently-used`（最久未用优先）。分数综合偏好顺序 + 能力 + **健康度** + 策略项。
 > - **健康度追踪**：每次执行器调用后把成功/失败/延迟/最近使用回写到 `<workspace>/.cbx/executor-health.json`（进程内即时生效，最佳努力异步落盘）。路由据此对**连续失败的执行器降权**，并为 LRU / round-robin 提供"最近使用"依据。`cbx_executors`（给定 workspace）可查看每个执行器的能力与健康度。
 > - **兼容旧语义**：`executor` 未指定或 `"auto"` 时自动选择；显式指定但**未安装**默认回退到满足需求的可用 CLI（回退原因写进返回信息与日志，`autoFallback:false` 可关闭）；**插件路径不参与内置路由**（原样返回）。本机一个可用（且满足需求）的编码 CLI 都没有时**创建即报错**并给出安装/需求提示。探测结果带短 TTL 缓存；偏好顺序可用 `executor_preference` 或 `.cbx.json` 的 `executorPreference` 覆盖（缺省 = 内置声明顺序 codebuddy, opencode, omp, cline, qwen）。
+> - **命令层显式覆盖（`/cbx-run`）**：斜杠命令没有结构化 `executor` 参数，用输入语法覆盖——`--executor <name>` / `--executor=<name>`（任意位置，解析后从任务文本剔除，也接受插件路径）或前导 `@<name>` 简写（仅当命中内置注册名/别名才剥离，不误伤以 @ 开头的普通任务）。优先级与工具对齐：显式覆盖 > `.cbx.json` `executor` > 插件配置默认。
 >
 > **工具参数使用 snake_case**（如 `timeout_ms` / `max_retries` / `max_turns` / `executor_preference`）；`.cbx.json` 配置键与 Web/命令层使用 camelCase（`timeoutMs` / `maxRetries` / `maxTurns` / `executorPreference`）。二者仅命名风格不同，语义一一对应。
 >
 > **默认工作区**：各工具/命令的 `workspace` 参数可省略，缺省 = 当前 agent 会话的工作目录（目录委派时设定，见「行为语义」）；显式传参必须命中工作区白名单。
 >
-> **会话内后台任务桥**：`cbx_run` / `cbx_continue` / `/cbx-run` / `/cbx-continue` 在 harness 提供 `ctx.jobs`（dsh-base 的 dsh-jobs-local + agent preset 的 dsh-tool-jobs）时，把委派注册为 `kind: "cbx"` 的原生后台任务——当前会话可实时看到执行进度与最终输出（`job_output` / `job_wait` / `job_kill` 可用，完成后有完成通知），`job_kill` 幂等转发为 `cbx_cancel`。桥不可用时（无 agent 上下文 / 无 jobs 服务 / 并发上限）静默退化为旧行为：cbx job 照常运行，只是不在会话内显示。返回消息中的 `session job <id>` 提示即此桥已启用。
+> **会话内后台任务桥**：`cbx_run` / `cbx_continue` / `/cbx-run` / `/cbx-continue` 在 harness 提供 `ctx.jobs`（dsh-base 的 dsh-jobs-local + agent preset 的 dsh-tool-jobs）时，把委派注册为 `kind: "cbx"` 的原生后台任务——当前会话可实时看到执行进度与最终输出（`job_output` / `job_wait` / `job_kill` 可用，完成后有完成通知），`job_kill` 幂等转发为 `cbx_cancel`。委派时的**路由决策**（选了谁、是否自动路由/回退、原因）在 `job_output` 首轮快照与完成通知中直接可见（「已（自动路由到）委派给执行器 X（原因）」）。桥不可用时（无 agent 上下文 / 无 jobs 服务 / 并发上限）静默退化为旧行为：cbx job 照常运行，只是不在会话内显示。返回消息中的 `session job <id>` 提示即此桥已启用。
+>
+> **前台子代理外观层（subagent facade）**：同一批委派还会在 harness 提供 `ctx.sessions` 时发布为**子代理镜像会话**（`src/subagent-facade.ts`）——在 Web 侧边栏「任务管理」页的**子代理树（前台）**里像子代理一样显示一张卡片（`cbx <jobId>: <任务摘要>`，provider=cbx），点击卡片即可实时查看执行器输出（agent.log 增量镜像为 transcript，含状态迁移行）；镜像**首条 assistant 消息**即声明执行器与路由原因（与桥的首轮快照同款文案），终态摘要保留路由决策。cbx job 进入终态后追加结果摘要并 detach，卡片转为 inactive 的已完成子代理（无会话持久化时消失）。与后台任务桥是两条并存通道：桥接「后台任务」，外观层接「前台子代理树」，任一失败都不影响 cbx 本体执行。已知边界：镜像会话没有真实 harness agent，因此不可冷恢复/续跑（one-shot 镜像），运行期状态灯按 harness 对 live 子会话的统一规则标 running。发布失败（无 agent 上下文 / 无 sessions 服务 / 会话创建被拒）会在返回消息中说明原因。
 >
 > **任务清单直接显示在当前会话**：`cbx_run` / `cbx_continue` 的提交响应、`/cbx-run` / `/cbx-continue` 的回复、会话后台任务的 `job_output` 首轮快照以及完成通知，都会直接附上当前工作区的**全量任务清单表格**（Job ID / Status / Phase / Attempt / Updated），不再需要先调 `cbx_list` 或打开仪表盘才能看到编排全局；清单来自落库后的实时快照（`src/format.ts` 的 `formatTaskList` 统一格式化）。
 >
@@ -105,7 +108,7 @@ dsh --profile web
 
 ## 斜杠命令（`ctx.commands`）
 
-`/cbx-run <task>`、`/cbx-status <job_id>`、`/cbx-continue <job_id> [message]`、`/cbx-cancel <job_id>`、`/cbx-list`、`/cbx-queue [pause|resume]`、`/cbx-result <job_id>`、`/cbx-web [workspace]`。
+`/cbx-run [--executor <name>|@<name>] <task>`（执行器覆盖语法见「执行器路由」节）、`/cbx-status <job_id>`、`/cbx-continue <job_id> [message]`、`/cbx-cancel <job_id>`、`/cbx-list`、`/cbx-queue [pause|resume]`、`/cbx-result <job_id>`、`/cbx-web [workspace]`。
 
 `/cbx-web [workspace]` 开启 cbx 仪表盘：解析当前工作区（或显式指定的 workspace，受白名单约束）后给出 Web 仪表盘链接，并尝试在系统默认浏览器打开；未加载 `cbx-orch-web` 插件的 headless profile 会给出提示。
 

@@ -6,7 +6,7 @@ import { formatTaskList } from "./format.js";
 import { cancelJob } from "./lifecycle.js";
 import { jobDir, loadState } from "./state.js";
 import { readArtifact } from "./artifacts.js";
-import { buildSessionMessage, progressLine } from "./session-message.js";
+import { buildSessionMessage, progressLine, routeNote, type RouterInfoLike } from "./session-message.js";
 import { TERMINAL_STATUSES, type JobState } from "./types.js";
 
 /**
@@ -87,6 +87,11 @@ export interface CbxBridgeOptions {
   /** 发起委派的 harness agent；缺省时通过 ctx.agents.currentInitiator() 兜底。 */
   agent?: unknown;
   /**
+   * 创建时的路由决策（RouteDecision 的最小视图）：首轮快照与终态摘要据此显示
+   * 「委派给了哪个执行器、为什么」——委派那一刻前台可见，不再只在工具渲染里。
+   */
+  router?: RouterInfoLike;
+  /**
    * 桥注册失败的诊断日志 logger；缺省不打印（保持工具层的纯函数语义）。
    * 测试时传 spy，生产传 `ctx.logger('cbx')`。
    */
@@ -98,8 +103,9 @@ export interface CbxBridgeOptions {
  * （agent loop 启动的 driver chain 在异步上下文里始终带发起方）。这是修复
  * "委派任务在前台看不到"的关键兜底——原版只读 exec.agent，而 exec.agent
  * 在很多上下文里是 undefined，导致桥永远不接。
+ * 供 jobs-bridge 与 subagent-facade 共用（单一解析语义）。
  */
-function resolveAgent(ctx: Context, execAgent: unknown): unknown {
+export function resolveAgent(ctx: Context, execAgent: unknown): unknown {
   if (execAgent) return execAgent;
   try {
     const agents = ctx.get("agents") as
@@ -149,7 +155,7 @@ export function bridgeCbxJob(
       label,
       owner: agent,
       outputLimitBytes: OUTPUT_LIMIT_BYTES,
-      run: () => monitorCbxJob(options.workspace, options.jobId),
+      run: () => monitorCbxJob(options.workspace, options.jobId, POLL_MS, options.router),
     });
     return { id };
   } catch (error) {
@@ -200,7 +206,12 @@ async function loadTaskList(workspace: string): Promise<JobState[]> {
 const LOG_TAIL_MAX_CHARS = 8_000;
 
 /** 从 result.json / state 生成终态摘要（有限长度，供 job_output 与完成通知使用）。 */
-async function buildFinalSummary(workspace: string, jobId: string, state: JobState): Promise<string> {
+async function buildFinalSummary(
+  workspace: string,
+  jobId: string,
+  state: JobState,
+  router?: RouterInfoLike,
+): Promise<string> {
   // 统一消息：状态 + 阶段人话 + 下一步行动 + 执行器 + 产物指针 + 全量任务清单 + agent.log 处理消息。
   let executor: string | undefined;
   let error: string | undefined;
@@ -237,6 +248,9 @@ async function buildFinalSummary(workspace: string, jobId: string, state: JobSta
     phase: state.phase,
     attempt: state.attempt,
     executor,
+    // 路由决策随终态保留：完成通知仍能看到"当初为什么是这个执行器"
+    // （builder 优先渲染 router 分支，result.json 的 executor 作兜底）。
+    router: router?.executor ? router : undefined,
     error: errorMsg,
     reviewVerdict,
     changedFilesCount,
@@ -249,12 +263,14 @@ async function buildFinalSummary(workspace: string, jobId: string, state: JobSta
 
 /**
  * 注册后的监视器：轮询 cbx 状态与 agent.log，直到终态。
- * `pollMs` 可注入（测试用），生产默认 POLL_MS。
+ * `pollMs` 可注入（测试用），生产默认 POLL_MS；`router` 为创建时的路由决策，
+ * 首轮快照据此输出「委派给了谁、为什么」。
  */
 export function monitorCbxJob(
   workspace: string,
   jobId: string,
   pollMs = POLL_MS,
+  router?: RouterInfoLike,
 ): {
   cancel(reason?: string): void;
   done: Promise<{ status: "completed" | "killed" | "failed"; detail?: string; output?: string }>;
@@ -301,7 +317,10 @@ export function monitorCbxJob(
       // 首轮快照：任务还在跑时，job_output 里直接看到执行器与当前全量任务清单（只打一次）。
       if (!snapshotted && !BRIDGE_TERMINAL_STATUSES.has(state.status)) {
         snapshotted = true;
-        if (!executor) {
+        // 执行器来源优先级：创建时的路由决策 > context.json（旧任务/无 router 兜底）。
+        if (!executor && router?.executor) {
+          executor = router.executor;
+        } else if (!executor) {
           try {
             const ctx = JSON.parse(await readFile(path.join(jobDir(workspace, jobId), "context.json"), "utf8")) as { executor?: string };
             executor = typeof ctx.executor === "string" ? ctx.executor : undefined;
@@ -309,6 +328,10 @@ export function monitorCbxJob(
             /* context 未就绪 */
           }
         }
+        // 委派那一刻的路由可见性：首轮输出直接给出「委派给了谁、为什么」，
+        // 不再等终态摘要才知道选了哪个执行器（修复"自动路由是黑盒"）。
+        const note = routeNote(router);
+        if (note) buffer += `${note}\n`;
         const jobs = await loadTaskList(workspace);
         if (jobs.length > 0) buffer += `任务清单（${jobs.length} 个 cbx job）:\n${formatTaskList(jobs)}\n`;
       }
@@ -317,7 +340,7 @@ export function monitorCbxJob(
         buffer += `${progressLine({ status: state.status, phase: state.phase, attempt: state.attempt, executor })}\n`;
       }
       if (BRIDGE_TERMINAL_STATUSES.has(state.status)) {
-        const output = await buildFinalSummary(workspace, jobId, state).catch(() => `[${state.status}]`);
+        const output = await buildFinalSummary(workspace, jobId, state, router).catch(() => `[${state.status}]`);
         buffer += output;
         settle({
           status: mapOutcomeStatus(state),

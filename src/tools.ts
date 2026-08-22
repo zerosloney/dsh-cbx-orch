@@ -21,6 +21,7 @@ import {
 import { runReviewGate } from "./review-gate.js";
 import { readAgentLogIncremental } from "./ui.js";
 import { bridgeCbxJob, tailAgentLog, type CbxBridgeResult } from "./jobs-bridge.js";
+import { publishCbxFacade, type CbxFacadeResult } from "./subagent-facade.js";
 import {
   deriveRequirements,
   noExecutorError,
@@ -281,6 +282,27 @@ function renderWatchReport(args: Record<string, unknown>, value: unknown): Conte
 }
 
 /**
+ * 把前台子代理外观层结果格式化成一行提示，附到 cbx_run / cbx_continue 的渲染文本。
+ * 成功时告诉用户去「任务管理」页的子代理树（前台）查看；失败时说明为什么没接到前台。
+ */
+function facadeNote(result: CbxFacadeResult): string {
+  if (result.sessionId) {
+    const extra = result.existing ? "（复用既有前台镜像）" : "";
+    return `已在前台子代理区显示（子代理会话 ${result.sessionId}${extra}；点击卡片可实时查看执行输出）。`;
+  }
+  switch (result.reason) {
+    case "no-agent-context":
+      return "未在前台子代理区显示（无 agent 上下文——命令行/定时调用正常）。";
+    case "no-sessions-service":
+      return "未在前台子代理区显示（ctx.sessions 服务不可用——profile 未挂 dsh-session）。";
+    case "registration-rejected":
+      return `未在前台子代理区显示（会话创建被拒${result.detail ? `：${result.detail}` : ""}）。`;
+    default:
+      return "未在前台子代理区显示。";
+  }
+}
+
+/**
  * 构造给 cbx_run / cbx_continue 用的渲染器。
  * 把 bridge 结果 + 路由决策 + 仪表盘链接附在 JSON value 之外，确保用户**看到**任务在前台的状态；
  * execute 返回的 `__taskList`（工作区任务清单）也直接渲染进会话，不再需要单独调 cbx_list。
@@ -289,12 +311,14 @@ function runJobOutput(args: Record<string, unknown>, value: unknown): ContentBlo
   const v = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
   const ws = typeof args.workspace === "string" ? args.workspace : undefined;
   const bridge = (v.__bridge && typeof v.__bridge === "object" ? v.__bridge : {}) as CbxBridgeResult;
+  const facade = (v.__facade && typeof v.__facade === "object" ? v.__facade : {}) as CbxFacadeResult;
   const router = (v.__router && typeof v.__router === "object" ? v.__router : {}) as RouteDecision;
   const text = buildSessionMessage({
     jobId: String(v.job_id ?? "—"),
     status: String(v.status ?? "queued"),
     router,
     bridgeNote: bridgeNote(bridge),
+    facadeNote: facadeNote(facade),
     taskList: Array.isArray(v.__taskList) ? (v.__taskList as JobState[]) : undefined,
     jobDir: typeof v.__jobDir === "string" ? v.__jobDir : undefined,
   });
@@ -428,6 +452,14 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         dependencyGuard: merged.dependencyGuard,
       });
       await startBackground(ws, created.jobId, "", 0);
+      // 创建时的路由决策视图（RouteDecision 的最小 JSON 视图）：桥首轮快照/终态摘要
+      // 与前台子代理镜像首条消息都据此显示「委派给了谁、为什么」——路由决策不再
+      // 只活在工具渲染里，委派那一刻所有前台通道可见。
+      const routerView = {
+        executor: decision.executor,
+        routed: decision.routed,
+        reason: decision.reason,
+      };
       // 会话内可见：把委派注册为 harness 原生后台任务（kind=cbx，归属当前 agent）。
       // 当前会话随即能在 UI/工具中看到执行情况（job_output/job_kill/job_wait），
       // 完成后 tool-jobs 会把最终输出投递回会话。桥不可用时返回 reason，
@@ -438,6 +470,19 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         task: args.task,
         agent: exec?.agent,
         logger: bridgeLog,
+        router: routerView,
+      });
+      // 前台子代理外观层：把同一委派发布为 harness 子代理镜像会话，任务即出现在
+      // 「任务管理」页的子代理树（前台），点击卡片可实时查看执行输出（与 jobs-bridge
+      // 的「后台任务」通道并存；失败不影响 cbx 执行，渲染层会说明原因）。
+      const facade = publishCbxFacade(ctx, {
+        workspace: ws,
+        jobId: created.jobId,
+        task: args.task,
+        agent: exec?.agent,
+        executor: decision.executor,
+        router: routerView,
+        logger: bridgeLog,
       });
       // 任务清单直接显示在当前会话：实时读取全量 job 列表附到返回值（渲染层输出表格）。
       const taskList = clampJson(await listJobs(ws));
@@ -445,6 +490,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         job_id: created.jobId,
         status: "queued",
         __bridge: bridge,
+        __facade: facade,
         __router: decision,
         __taskList: taskList,
         __jobDir: created.directory,
@@ -611,11 +657,20 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         agent: exec?.agent,
         logger: bridgeLog,
       });
+      // 续跑场景：复用/刷新前台子代理镜像（同 job 已有存活外观会话时复用）。
+      const facade = publishCbxFacade(ctx, {
+        workspace: ws,
+        jobId: args.job_id,
+        task: args.message ?? "continue",
+        agent: exec?.agent,
+        logger: bridgeLog,
+      });
       const taskList = clampJson(await listJobs(ws));
       return toJson({
         job_id: args.job_id,
         status: "queued",
         __bridge: bridge,
+        __facade: facade,
         __taskList: taskList,
         __jobDir: jobDir(ws, args.job_id),
         ...(bridge.id !== undefined ? { jobId: bridge.id } : {}),

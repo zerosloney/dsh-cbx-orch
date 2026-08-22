@@ -51,8 +51,11 @@ cbx 配置现在只读 `.cbx.json`（工作区级）。可加一层"harness sett
 ### 4.2 事件桥（可选，按需做）
 cbx 事件（`job.state_changed` 等）目前走自有事件流 + SQLite 回放，不进 harness 的 `session/event`。桥接的价值：harness 的 Trajectory/Web UI 能看到 cbx 任务流转。代价：cbx 事件没有 session 归属（job 独立于会话），需要定义"桥到哪个 session"（可桥到发起 job 的 session，job 记录里可存 initiator）。建议在"跨会话恢复"场景出现需求时再做。
 
-### 4.3 子代理面（暂不做）
-把 cbx 执行器包装成 `ctx.subagents` provider 看起来诱人（统一子代理管理），但 cbx 执行器是外部 CLI、非 harness 进程内代理，强行包装会损失 cbx 的退出码/超时/审查语义。保持边界。
+### 4.3 子代理面（已实现：外观层，非 provider 包装）
+
+2026-08 实现：**`src/subagent-facade.ts`** 把 cbx 委派发布为 harness 子代理**镜像会话**（`origin:'subagent'` + `subagent/descriptor` 事件 + `parentSession=发起 agent`），让任务在 Web「任务管理」页的子代理树（前台）里像子代理一样显示。做法是创建会话而非包装 provider（不是把 cbx 执行器注册为 `ctx.subagents` 的 provider），因此**不损失**退出码/超时/审查语义——cbx 的完整状态机仍由 `state.json` + 队列 + 网关驱动，mirror 只镜像**状态变更**和 **agent.log 增量**到 transcript。与后台任务桥（`jobs-bridge.ts`）共存：桥接「后台任务」（`ctx.jobs`），外观层接「前台子代理树」（`ctx.sessions`），任一失败不影响 cbx 本体执行。
+
+已知边界（沿用原 §4.3 的权衡）：镜像会话没有真实 harness agent，因此不可冷恢复/续跑（one-shot 镜像）；运行期间的状态灯由服务端目录对 live 子会话统一标 `running`，终态后靠 detach 转 `inactive`；无会话持久化时卡片随 detach 消失。
 
 ### 4.4 长期：引擎内核抽取
 ralph 的"失败→反思→学习"、cbx 的"失败→review→lessons"、state-graph 的图路由本质同族。长期可把"带反思的循环执行"抽象为 state-graph 上的一个模式（`ReflectiveLoopNode`），ralph 退化为该模式的实例，cbx 的 stage 循环也可声明式表达。这是一次"三合一"重构，收益是心智模型统一，风险是需要动 ralph/cbx 两套成熟状态机——建议在所有短期项清完后单独评估。

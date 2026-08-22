@@ -1,14 +1,38 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import CbxOrchestrator from "../lib/index.js";
 import { closeDatabaseConnections } from "../lib/storage.js";
 import { extractExecutorOverride } from "../lib/commands.js";
+import { resetExecutorProbeCache } from "../lib/executors/builtin.js";
 import { cancelJob } from "../lib/lifecycle.js";
 import { loadState } from "../lib/state.js";
 import { stopScheduler } from "../lib/queue-api.js";
+
+/**
+ * CI runner 上没有任何真实编码 agent CLI，路由会因"无可用执行器"报错。
+ * 与 tools-workspace.test.mjs 同模式：用 envVar 注入一个"存在路径"的假执行器，
+ * 让 opencode 探测命中（source=env 只查存在性）；测试后恢复环境并重置探测缓存。
+ */
+async function withFakeOpenCode(callback) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "cbx-fake-opencode-"));
+  const fakeExec = path.join(dir, "opencode-cli");
+  await writeFile(fakeExec, "", "utf8");
+  const previous = process.env.CBX_OPENCODE;
+  process.env.CBX_OPENCODE = fakeExec;
+  resetExecutorProbeCache();
+  try {
+    return await callback();
+  } finally {
+    if (previous === undefined) delete process.env.CBX_OPENCODE;
+    else process.env.CBX_OPENCODE = previous;
+    resetExecutorProbeCache();
+    await closeDatabaseConnections();
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 // ---- extractExecutorOverride：纯函数单测 ----
 
@@ -165,55 +189,59 @@ async function cleanupRun(harness, delegated, result) {
 }
 
 test("/cbx-run --executor 显式指定：路由到该执行器，回复带「已委派给」路由行", async () => {
-  const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-command-run-"));
-  const harness = fakeHarness();
-  let result;
-  try {
-    new CbxOrchestrator(harness.context, {
-      executor: "codebuddy",
-      review: false,
-      isolated: false,
-      workspaces: [],
-    });
-    const command = harness.commands.get("cbx-run");
-    assert.ok(command, "应捕获 cbx-run 命令");
-    result = await command.handler({
-      rawInput: "--executor opencode 审查这个项目",
-      agent: { session: { header: { cwd: delegated }, id: "parent-x" } },
-    });
-    assert.equal(result.kind, "success");
-    // 任务文本剔除 flag；显式指定已装执行器 → 「已委派给」+ 执行器名
-    assert.match(result.text, /job \S+ queued\. 已委派给执行器 opencode/);
-    assert.doesNotMatch(result.text, /--executor/);
-    // 桥/外观层的 router 透传已在 jobs-bridge/subagent-facade 单测覆盖；
-    // 这里只验证命令入口的解析与回复文案。
-  } finally {
-    await cleanupRun(harness, delegated, result);
-    await rmRetry(delegated);
-  }
+  await withFakeOpenCode(async () => {
+    const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-command-run-"));
+    const harness = fakeHarness();
+    let result;
+    try {
+      new CbxOrchestrator(harness.context, {
+        executor: "codebuddy",
+        review: false,
+        isolated: false,
+        workspaces: [],
+      });
+      const command = harness.commands.get("cbx-run");
+      assert.ok(command, "应捕获 cbx-run 命令");
+      result = await command.handler({
+        rawInput: "--executor opencode 审查这个项目",
+        agent: { session: { header: { cwd: delegated }, id: "parent-x" } },
+      });
+      assert.equal(result.kind, "success");
+      // 任务文本剔除 flag；显式指定已装执行器 → 「已委派给」+ 执行器名
+      assert.match(result.text, /job \S+ queued\. 已委派给执行器 opencode/);
+      assert.doesNotMatch(result.text, /--executor/);
+      // 桥/外观层的 router 透传已在 jobs-bridge/subagent-facade 单测覆盖；
+      // 这里只验证命令入口的解析与回复文案。
+    } finally {
+      await cleanupRun(harness, delegated, result);
+      await rmRetry(delegated);
+    }
+  });
 });
 
 test("/cbx-run @name 前导简写同样生效且剥离前缀", async () => {
-  const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-command-run2-"));
-  const harness = fakeHarness();
-  let result;
-  try {
-    new CbxOrchestrator(harness.context, {
-      executor: "auto",
-      review: false,
-      isolated: false,
-      workspaces: [],
-    });
-    const command = harness.commands.get("cbx-run");
-    result = await command.handler({
-      rawInput: "@opencode 审查这个项目",
-      agent: { session: { header: { cwd: delegated }, id: "parent-y" } },
-    });
-    assert.equal(result.kind, "success");
-    assert.match(result.text, /已委派给执行器 opencode/);
-    assert.doesNotMatch(result.text, /@opencode/);
-  } finally {
-    await cleanupRun(harness, delegated, result);
-    await rmRetry(delegated);
-  }
+  await withFakeOpenCode(async () => {
+    const delegated = await mkdtemp(path.join(os.tmpdir(), "cbx-command-run2-"));
+    const harness = fakeHarness();
+    let result;
+    try {
+      new CbxOrchestrator(harness.context, {
+        executor: "auto",
+        review: false,
+        isolated: false,
+        workspaces: [],
+      });
+      const command = harness.commands.get("cbx-run");
+      result = await command.handler({
+        rawInput: "@opencode 审查这个项目",
+        agent: { session: { header: { cwd: delegated }, id: "parent-y" } },
+      });
+      assert.equal(result.kind, "success");
+      assert.match(result.text, /已委派给执行器 opencode/);
+      assert.doesNotMatch(result.text, /@opencode/);
+    } finally {
+      await cleanupRun(harness, delegated, result);
+      await rmRetry(delegated);
+    }
+  });
 });

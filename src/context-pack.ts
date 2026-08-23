@@ -529,7 +529,7 @@ async function materialize(
 ): Promise<{ pack: RoleContextPack; path: string }> {
   const validated = parseContextPack(pack);
   const file = path.join(directory, FILES[pack.role]);
-  await saveJson(file, validated);
+  await saveJson(file, validated, { fsync: false });
   return { pack: validated, path: file };
 }
 

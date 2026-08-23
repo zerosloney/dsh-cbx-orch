@@ -9,6 +9,8 @@ import {
   persistedMetrics,
   prunePersistedData,
   withFileLock,
+  listPersistedStates,
+  verifyJobAudit,
 } from "./storage.js";
 import {
   loadConfig,
@@ -32,7 +34,10 @@ async function saveStateAndQueue(
   const previousStatus = (await loadState(workspace, jobId)).status;
   await savePersistedStateAndQueue(workspace, jobId, state, queueFile);
   try {
-    await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state);
+    // state.json 是 SQLite 镜像：进程崩溃后可重建，无需 fsync。
+    await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state, {
+      fsync: false,
+    });
   } catch (error) {
     // state.json 是镜像（权威在 SQLite）：镜像失败只落事件，不让已提交的
     // 状态+队列事务向上抛错。
@@ -206,6 +211,7 @@ export async function health(
 ): Promise<{
   status: "ok";
   metrics: Awaited<ReturnType<typeof persistedMetrics>>;
+  audit?: { checked: number; tampered: number };
 }> {
   const workspace = path.resolve(workspaceInput);
   // prune 含全表扫描 + 目录删除；公开探针（/healthz）应传 { prune: false } 只读指标，
@@ -214,7 +220,35 @@ export async function health(
     const config = await loadConfig(workspace);
     await prunePersistedData(workspace, config.governance?.retentionDays);
   }
-  return { status: "ok", metrics: await persistedMetrics(workspace) };
+  const metrics = await persistedMetrics(workspace);
+  // 审计完整性扫描：对终态 job 验证 events.ndjson 与 SQLite 镜像是否一致（检测执行器
+  // 篡改）。best-effort：验证失败不计入（旧任务无镜像锚点）。开销受 job 数量限制，
+  // 每 job 一次 SQLite 查询 + 一次文件读。
+  let checked = 0;
+  let tampered = 0;
+  try {
+    const states = await listPersistedStates<{ jobId?: string; status?: string }>(workspace);
+    const TERMINAL: ReadonlySet<string> = new Set(["done", "failed", "review_failed", "cancelled"]);
+    for (const state of states) {
+      if (!state.jobId || !TERMINAL.has(String(state.status ?? ""))) continue;
+      try {
+        const result = await verifyJobAudit(workspace, state.jobId);
+        if (result.sqliteCount && result.sqliteCount > 0) {
+          checked += 1;
+          if (result.tampered) tampered += 1;
+        }
+      } catch {
+        /* 单 job 验证失败跳过 */
+      }
+    }
+  } catch {
+    /* 扫描失败不影响健康状态 */
+  }
+  return {
+    status: "ok",
+    metrics,
+    ...(checked > 0 || tampered > 0 ? { audit: { checked, tampered } } : {}),
+  };
 }
 
 export async function serveQueue(

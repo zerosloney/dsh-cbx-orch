@@ -6,6 +6,8 @@ import { loadJson } from "./storage.js";
 import { snapshotDiff, collectDiff } from "./git-ops.js";
 import { loadState, writeState, logJobEvent } from "./state.js";
 import { invokeExecutor, promptFor, runTest } from "./runner.js";
+import { deriveRequirements, resolveInvokableExecutor } from "./executor-router.js";
+import { loadHealth } from "./executor-health.js";
 import {
   createExecutorContextPack,
   createAuditorContextPack,
@@ -25,6 +27,7 @@ import {
   type VerifiedProgress,
 } from "./progress.js";
 import { evidenceHashes, structuredAuditRequested } from "./evidence.js";
+import { ExecutorCostLimitError } from "./errors.js";
 import { createHumanGate } from "./human-gate.js";
 import { resolveExecutor } from "./executors/builtin.js";
 import { contextArtifacts, AUDIT_CANDIDATE } from "./artifacts.js";
@@ -95,8 +98,17 @@ export async function requestAdaptiveAction(params: {
   let result: ProcessResult | undefined;
   let invocationError: unknown;
   try {
-    result = await invokeExecutor(
+    // Manager 执行器同样执行期解析：managerExecutor 是配置值，可能未安装；
+    // 解析失败（无可用者）经 invocationError 走既有的 ManagerInvocationError 通道。
+    const managerRoute = resolveInvokableExecutor(
       adaptive.managerExecutor ?? context.executor,
+      {
+        requirements: deriveRequirements({ permissionMode: context.permissionMode }),
+        health: loadHealth(workspace),
+      },
+    );
+    result = await invokeExecutor(
+      managerRoute.name,
       workspace,
       directory,
       workdir,
@@ -107,6 +119,8 @@ export async function requestAdaptiveAction(params: {
       { role: "manager", jobId: context.jobId },
     );
   } catch (error) {
+    // 成本硬闸原样穿透：由 execution.ts 的 adaptive 循环 catch 转 needs_fix + human gate。
+    if (error instanceof ExecutorCostLimitError) throw error;
     invocationError = error;
   }
   const after = await snapshotDiff(workdir);
@@ -272,6 +286,8 @@ export async function runStage(params: {
     }
   }
 
+  // 执行期路由解析出的实际执行器名：report 与事件流都以此为准（契约里的名字只表达意图）。
+  let resolvedStageExecutor = stage.executor;
   // intentional-simple: 闭包内构造辅助。report.name/executor/attempts 与 attempt/attemptExtra 在所有 16 个返回点取值相同，
   // 仅 terminal/state/exitCode/testExitCode/reviewVerdict 因分支而异；闭包按引用读取重试预算变量，useXxxRetry 后自动累加。
   const outcome = (
@@ -285,7 +301,7 @@ export async function runStage(params: {
     state,
     report: {
       name: stage.name,
-      executor: stage.executor,
+      executor: resolvedStageExecutor,
       exitCode,
       testExitCode,
       reviewVerdict,
@@ -345,9 +361,27 @@ export async function runStage(params: {
     });
     if (existsSync(cancelMarker)) return await cancelOutcome(-1, null);
     let agent: ProcessResult;
+    // 执行期路由：契约里的 stage.executor 只表达意图，真正调用前按本机可用性 +
+    // permissionMode 推导的需求解析一次——未安装的执行器回退到最优可用者，而不是
+    // 等 spawn 抛"找不到命令"烧掉一次 attempt；重试时健康度降权会把连败的执行让位
+    // 给更健康的候选。无任何可用者时 fail-fast（缺装无法靠 retry 修复）。
+    const stageRoute = resolveInvokableExecutor(stage.executor, {
+      requirements: deriveRequirements({ permissionMode: context.permissionMode }),
+      health: loadHealth(workspace),
+    });
+    resolvedStageExecutor = stageRoute.name;
+    if (stageRoute.routed) {
+      logJobEvent(workspace, jobId, "stage_executor_routed", {
+        stage: stage.name,
+        stageIndex,
+        requested: stage.executor,
+        resolved: stageRoute.name,
+        reason: stageRoute.reason,
+      });
+    }
     try {
       agent = await invokeExecutor(
-        stage.executor,
+        stageRoute.name,
         workspace,
         directory,
         workdir,
@@ -363,6 +397,21 @@ export async function runStage(params: {
         { role: "stage", jobId, stageIndex },
       );
     } catch (error) {
+      // 成本硬闸：已达 maxExecutorInvocations 上限——转 needs_fix + human gate，
+      // 绝不走重试（重试只会继续烧配额）。取消竞态检查仍优先。
+      if (error instanceof ExecutorCostLimitError) {
+        const state = await finish({
+          status: "needs_fix",
+          phase: "cost_limit",
+          stage: stage.name,
+          error: error.message,
+          humanGate: createHumanGate("needs_input", {
+            detail: error.message,
+            questions: ["提高 max_executor_invocations 后继续，或取消任务。"],
+          }),
+        });
+        return outcome(true, state, -1, null, null);
+      }
       lastError = String(error);
       // 取消竞态防御：cancelJob 先 abort 再写标记，被终止的执行器在此抛错；
       // 若先走 retry 写回，会把 cancelled 覆写成 retrying（进程恰好此时崩溃则永久卡住）。
@@ -524,8 +573,24 @@ export async function runStage(params: {
       : "";
     const reviewExtra = `只审查上下文包 artifacts 中列出的证据，不要修改代码。将结果写入 ${path.join(directory, "review.md")}。第一行必须是 VERDICT: PASS 或 VERDICT: FAIL。若失败源于需求歧义、公共契约冲突或基线问题，第二行写 CLASSIFICATION: SEMANTIC；普通代码缺陷无需 classification。按严重程度列出问题、文件和行号。${structuredAuditExtra}`;
     let reviewAgent: ProcessResult;
-    const reviewExecutor =
+    const requestedReviewExecutor =
       stage.reviewExecutor ?? context.reviewExecutor ?? stage.executor;
+    // 审查代理同样执行期解析：reviewExecutor 可能指向未安装的 CLI（创建期只路由了
+    // 主 executor），审查阶段失败会把整个 stage 打成 review_failed——先解析再调用。
+    const reviewRoute = resolveInvokableExecutor(requestedReviewExecutor, {
+      requirements: deriveRequirements({ permissionMode: context.permissionMode }),
+      health: loadHealth(workspace),
+    });
+    if (reviewRoute.routed) {
+      logJobEvent(workspace, jobId, "review_executor_routed", {
+        stage: stage.name,
+        stageIndex,
+        requested: requestedReviewExecutor,
+        resolved: reviewRoute.name,
+        reason: reviewRoute.reason,
+      });
+    }
+    const reviewExecutor = reviewRoute.name;
     const reviewLabel = resolveExecutor(reviewExecutor)?.label ?? "审查代理";
     const auditCandidate = path.join(directory, AUDIT_CANDIDATE);
     if (existsSync(auditCandidate)) await unlink(auditCandidate);
@@ -583,6 +648,20 @@ export async function runStage(params: {
         { role: "review", jobId, stageIndex },
       );
     } catch (error) {
+      // 成本硬闸：已达上限转 needs_fix（审查也计入同一调用预算），不走 retry。
+      if (error instanceof ExecutorCostLimitError) {
+        const state = await finish({
+          status: "needs_fix",
+          phase: "cost_limit",
+          stage: stage.name,
+          error: error.message,
+          humanGate: createHumanGate("needs_input", {
+            detail: error.message,
+            questions: ["提高 max_executor_invocations 后继续，或取消任务。"],
+          }),
+        });
+        return outcome(true, state, 0, 0, null);
+      }
       lastError = String(error);
       // 同执行器 catch：取消优先于 review 重试写回（见上方注释）。
       if (existsSync(cancelMarker)) return await cancelOutcome(0, 0);

@@ -66,6 +66,8 @@ export interface JobContext {
   adaptive?: AdaptiveOptions;
   dependencyGuard?: boolean;
   contextBudget?: ContextBudget;
+  /** 创建时通过工具/Web 参数指定的成本上限（per-job 覆盖 `.cbx.json` 的 cost）。 */
+  cost?: { maxExecutorInvocations?: number };
 }
 
 export type TaskStage = TaskStageType;

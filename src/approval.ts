@@ -31,6 +31,7 @@ import {
 import { snapshotDiff, commitWorktree } from "./git-ops.js";
 import { cleanupWorktree } from "./worktree.js";
 import { dispatchQueue } from "./queue-api.js";
+import { CbxError } from "./errors.js";
 import type { JobState, Json } from "./types.js";
 
 async function approveJobLocked(
@@ -41,12 +42,13 @@ async function approveJobLocked(
   const state = await loadState(workspace, jobId);
   // 审批与取消不共享 run.lock（取消走 abortRunningJob 而非持锁），入口先核一次
   // 取消标记与状态；写盘前还有二次核验（见各 writeApprovalState 前）。
+  // 业务校验错误统一为 E_INVALID_STATE（HTTP 层映射 409 冲突）。
   if (state.status === "cancelled")
-    throw new Error(`任务已取消，不能批准：${jobId}`);
+    throw new CbxError("E_INVALID_STATE", `任务已取消，不能批准：${jobId}`);
   if (state.status !== "awaiting_approval")
-    throw new Error(`任务当前不需要批准：${jobId}`);
+    throw new CbxError("E_INVALID_STATE", `任务当前不需要批准：${jobId}`);
   if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
-    throw new Error(`任务已取消，不能批准：${jobId}`);
+    throw new CbxError("E_INVALID_STATE", `任务已取消，不能批准：${jobId}`);
   const gate = state.humanGate
     ? parseHumanGate(state.humanGate)
     : state.phase === "before_run"
@@ -54,10 +56,10 @@ async function approveJobLocked(
       : state.phase === "before_complete"
         ? createHumanGate("completion", { detail: "等待完成审批。" })
         : (() => {
-            throw new Error("等待审批的任务缺少 Human Gate。");
+            throw new CbxError("E_INVALID_STATE", "等待审批的任务缺少 Human Gate。");
           })();
   if (gate.status !== "waiting")
-    throw new Error("Human Gate 已解决，不能重复批准。");
+    throw new CbxError("E_INVALID_STATE", "Human Gate 已解决，不能重复批准。");
   const config = await loadConfig(workspace);
   const redact = contextRedactor(config.governance);
   if (state.phase === "before_run" && gate.reason === "before_run") {

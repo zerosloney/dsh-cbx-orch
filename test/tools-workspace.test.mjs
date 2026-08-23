@@ -9,6 +9,7 @@ import { isCbxError } from "../lib/errors.js";
 import { closeDatabaseConnections } from "../lib/storage.js";
 import { WorkspacePolicy } from "../lib/workspace-policy.js";
 import { resetExecutorProbeCache } from "../lib/executors/builtin.js";
+import { stopScheduler } from "../lib/queue-api.js";
 
 function registeredTools(policy) {
   const definitions = new Map();
@@ -205,6 +206,9 @@ test("cbx_run 结果附工作区任务清单（__taskList）且渲染直接显�
       workspace: ws,
       task: "implement the feature",
       test: "npm test",
+      // 停在执行前审批门：不触发真实执行器 spawn/重试循环（测试只断言创建期）。
+      // 空文件假执行器若被 spawn 会失败并进入重试，拖住全量测试进程。
+      approval_before_run: true,
       // 已知字段必须原样透传到路由决策（schema 收窄后拼错字段会被框架拒绝/告警，不再静默忽略）
       executor_requirements: { exclude: [] },
     });
@@ -216,7 +220,11 @@ test("cbx_run 结果附工作区任务清单（__taskList）且渲染直接显�
     assert.ok(Array.isArray(result.__taskList));
     assert.equal(result.__taskList.length, 1);
     assert.equal(result.__taskList[0].jobId, result.job_id);
-    assert.equal(result.__taskList[0].status, "queued");
+    // 创建后立即快照：queued（调度器异步拉起 worker，可能已到 awaiting_approval 门）
+    assert.ok(
+      ["queued", "awaiting_approval", "running"].includes(result.__taskList[0].status),
+      `任务初始状态应为 queued 或门状态，实际 ${result.__taskList[0].status}`,
+    );
     // 渲染层把任务清单表格直接输出到当前会话（无需再单独调用 cbx_list）
     const blocks = definition.output.render({ workspace: ws }, result);
     const text = blocks.map((block) => block.text).join("\n");
@@ -228,6 +236,13 @@ test("cbx_run 结果附工作区任务清单（__taskList）且渲染直接显�
     else process.env.CBX_OMP = previousOmp;
     resetExecutorProbeCache();
     await rm(fakeExecDir, { recursive: true, force: true });
+    // 停掉 cbx_run 入队拉起的常驻调度器（30s 定时器 + 可能的重试循环），
+    // 否则它会持有 SQLite 连接并持续跑，拖住全量测试进程（偶发 300s 超时根因）。
+    try {
+      await stopScheduler(ws);
+    } catch {
+      /* 调度器未启动或已停止 */
+    }
     // Windows 瞬态句柄：createJob/入队路径可能在 closeDatabaseConnections 返回后才
     // 重开连接 → rm 撞 EBUSY。与 git-ops/storage 的 EBUSY 重试模式一致：退避重试并每轮重关连接。
     for (let attempt = 0; ; attempt += 1) {

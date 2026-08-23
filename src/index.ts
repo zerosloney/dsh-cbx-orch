@@ -3,6 +3,8 @@ import z from "@deepseek-ai/schemastery";
 import { setProcessSpawnProvider } from "./process-runner.js";
 import { createSubprocessProvider, setExecutorEnvAllowlist } from "./subprocess-adapter.js";
 import { closeDatabaseConnections } from "./storage.js";
+import { flushJobEventMirrors } from "./state.js";
+import { resetHealthStore } from "./executor-health.js";
 import { disposeObservability } from "./observability.js";
 import { registerCbxTools, type CbxDefaults } from "./tools.js";
 import { registerCbxCommands } from "./commands.js";
@@ -94,9 +96,20 @@ export default class CbxOrchestrator extends Service {
             disposeEnvAllowlist();
           } finally {
             try {
-              await closeDatabaseConnections();
+              // 先排空 job 事件 SQLite 镜像（fire-and-forget 在途写入），
+              // 再关数据库连接，避免审计记录因连接关闭而丢失。
+              await flushJobEventMirrors();
             } finally {
-              disposeObservability();
+              try {
+                // 清理健康度防抖定时器与内存缓存（进程退出，落盘 best-effort）。
+                resetHealthStore();
+              } finally {
+                try {
+                  await closeDatabaseConnections();
+                } finally {
+                  disposeObservability();
+                }
+              }
             }
           }
         }

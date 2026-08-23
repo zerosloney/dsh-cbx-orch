@@ -8,9 +8,12 @@ import { jobDir, loadState } from "./state.js";
 import { readArtifact } from "./artifacts.js";
 import { buildSessionMessage, progressLine, routeNote, type RouterInfoLike } from "./session-message.js";
 import { TERMINAL_STATUSES, type JobState } from "./types.js";
+import { tailAgentLog } from "./log-tail.js";
+
+export { tailAgentLog };
 
 /**
- * 会话内后台任务桥（docs/alignment.md §4.2 事件桥的实现）。
+ * 会话内后台任务桥（把 cbx 委派桥接进 harness 原生 `ctx.jobs` 后台任务面）。
  *
  * 背景：cbx 任务在自有 SQLite/状态文件体系里运行，此前 `cbx_run`/`/cbx-run`
  * 只返回一行 "job queued"，执行过程与结果都不进 harness 的会话视图——当前会话
@@ -166,21 +169,6 @@ export function bridgeCbxJob(
     );
     return { reason, detail };
   }
-}
-
-/** 轮询状态变更 + agent.log 尾部（内存游标，不碰 agent.log.cursor 共享文件）。 */
-export async function tailAgentLog(workspace: string, jobId: string, since: number): Promise<{ text: string; next: number }> {
-  let raw: Buffer;
-  try {
-    raw = await readFile(path.join(jobDir(workspace, jobId), "agent.log"));
-  } catch {
-    return { text: "", next: since };
-  }
-  // 旋转/截断自愈：文件比游标短说明被重建，回到文件头重新对齐。
-  let start = since;
-  if (start > raw.length) start = 0;
-  const text = raw.subarray(start).toString("utf8");
-  return { text, next: raw.length };
 }
 
 /** 终态 → harness outcome 状态映射。 */

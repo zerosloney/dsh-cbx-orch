@@ -5,7 +5,8 @@ import {
   type BuiltinExecutor,
   type ExecutorProbe,
 } from "./executors/builtin.js";
-import type { HealthSnapshot } from "./executor-health.js";
+import { windowStats, HEALTH_WINDOW_SIZE, type HealthSnapshot } from "./executor-health.js";
+import { tierSourcesNote, type TierCatalog, type TierSource } from "./executor-catalog.js";
 
 /**
  * 本机 agent CLI 路由（"先检测本机有哪些 harness agent CLI，再把委派路由到最合适的一个"）。
@@ -66,6 +67,8 @@ export interface RouterOptions {
   strategy?: ExecutorStrategy;
   /** 健康度快照（按 workspace 加载），用于降权 / LRU / round-robin。 */
   health?: HealthSnapshot;
+  /** 有效档位目录（实测校准 + 人工覆盖 + 出处标注），供 cost-aware/fastest 使用；缺省退回声明档位。 */
+  tierCatalog?: TierCatalog;
   /** 当前时间戳（ms），用于 LRU/round-robin 打分；测试可注入。 */
   now?: number;
 }
@@ -85,6 +88,8 @@ export interface RouteDecision {
   strategy?: ExecutorStrategy;
   /** 实际生效的需求。 */
   requirements?: ExecutorRequirements;
+  /** 提供了 tierCatalog 时的档位出处表（measured/configured/declared），供 UI 与测试断言。 */
+  tierSources?: Record<string, { speed: TierSource; cost: TierSource }>;
 }
 
 /** 缺省偏好顺序：与 BUILTIN_EXECUTORS 声明一致。 */
@@ -184,7 +189,17 @@ interface ScoreContext {
   preference: string[];
   strategy: ExecutorStrategy;
   health?: HealthSnapshot;
+  tierCatalog?: TierCatalog;
   now: number;
+}
+
+/** 执行器的有效档位：有目录（实测/覆盖）用目录，否则退回声明值。 */
+function effectiveTiers(spec: BuiltinExecutor, ctx: ScoreContext): { costTier: number; speedTier: number } {
+  const tv = ctx.tierCatalog?.[spec.name];
+  return {
+    costTier: tv?.costTier ?? spec.costTier,
+    speedTier: tv?.speedTier ?? spec.speedTier,
+  };
 }
 
 /** 多因子打分：偏好顺序 + 能力 + 健康度 + 策略项。分数越高越优先。 */
@@ -197,16 +212,26 @@ function scoreExecutor(spec: BuiltinExecutor, ctx: ScoreContext): number {
   s += cap * 2; // 能力越多略加分
   const h = ctx.health?.[spec.name];
   if (h) {
-    s -= (h.consecutiveFailures ?? 0) * 15; // 连续失败重罚
-    if (h.lastLatencyMs != null) s -= Math.min(h.lastLatencyMs / 1000, 30) * 0.3; // 延迟轻罚
-    s += Math.min(h.successes ?? 0, 30) * 0.15; // 成功轻奖
+    // 一律走滑动窗口口径（windowStats 对旧格式记录自动回退累计字段）：
+    // - 连败从窗口尾部推导，随新证据老化——一个月前的连败不再永久托底；
+    // - 延迟用窗口均值（单次 last 值噪声太大），窗口无观测时回退 lastLatencyMs；
+    // - 成功奖按窗口内成功计数，历史功劳不能抵消近期失败。
+    const stats = windowStats(h);
+    // 失败语义细分：崩溃（非零退出/启动失败）×15，fail-fast 且通常意味着执行器
+    // 坏了/配置错；超时 ×9——每次烧满 timeoutMs 预算但可能是任务过大而非执行器坏。
+    s -= stats.crashStreak * 15; // 连续崩溃重罚
+    s -= stats.timeoutStreak * 9; // 连续超时中罚
+    const avgLatencyMs =
+      stats.latencySamples > 0 ? stats.totalLatencyMs / stats.latencySamples : h.lastLatencyMs;
+    if (avgLatencyMs != null) s -= Math.min(avgLatencyMs / 1000, 30) * 0.3; // 延迟轻罚（窗口均值）
+    s += Math.min(stats.successes, HEALTH_WINDOW_SIZE) * 0.15; // 成功轻奖（窗口内）
   }
   switch (ctx.strategy) {
     case "cost-aware":
-      s += (4 - spec.costTier) * 30; // 成本越低分越高
+      s += (4 - effectiveTiers(spec, ctx).costTier) * 30; // 成本越低分越高（实测不可得：声明或人工覆盖）
       break;
     case "fastest":
-      s += spec.speedTier * 30; // 速度越快分越高
+      s += effectiveTiers(spec, ctx).speedTier * 30; // 速度越快分越高（有目录时为实测校准值）
       break;
     case "capability-best":
       s += cap * 20; // 能力主导
@@ -255,13 +280,25 @@ export function routeExecutor(
   const health = options.health;
   const now = options.now ?? Date.now();
   const autoFallback = options.autoFallback !== false;
-  const ctx: ScoreContext = { preference, strategy, health, now };
+  const ctx: ScoreContext = { preference, strategy, health, tierCatalog: options.tierCatalog, now };
+  // 档位出处表：仅在调用方提供目录时附加（保持决策对象最小），供 UI/测试断言。
+  const tierExtra = options.tierCatalog
+    ? {
+        tierSources: Object.fromEntries(
+          Object.entries(options.tierCatalog).map(([name, v]) => [
+            name,
+            { speed: v.speedSource, cost: v.costSource },
+          ]),
+        ),
+      }
+    : {};
 
   // 插件路径 / 未知执行器：不参与内置路由（原样返回，执行期再按插件路径处理）。
   if (requested && requested !== "auto") {
     const spec = resolveExecutor(requested);
     if (!spec) {
       return {
+        ...tierExtra,
         executor: requested,
         requested,
         routed: false,
@@ -278,6 +315,7 @@ export function routeExecutor(
         ? `${spec.label}（${spec.name}）已安装，直接使用。`
         : `${spec.label}（${spec.name}）已安装，但不满足需求（${unmetList(spec, reqs)}），仍按显式指定使用——可能行为不符预期。`;
       return {
+        ...tierExtra,
         executor: spec.name,
         requested: spec.name,
         routed: false,
@@ -295,17 +333,22 @@ export function routeExecutor(
         .filter((s) => meetsRequirements(s, reqs));
       const fallback = available.length ? selectBest(available, ctx) : undefined;
       if (fallback) {
+        const fallbackNote = strategy === "fastest" || strategy === "cost-aware"
+          ? tierSourcesNote(options.tierCatalog, fallback.name)
+          : "";
         return {
+          ...tierExtra,
           executor: fallback.name,
           requested: spec.name,
           routed: true,
-          reason: `${spec.label}（${spec.name}）未安装，已回退到可用执行器 ${fallback.name}（可用：${availableNames(probes)}）。`,
+          reason: `${spec.label}（${spec.name}）未安装，已回退到可用执行器 ${fallback.name}（可用：${availableNames(probes)}）。${fallbackNote}`,
           available: probes,
           strategy,
           requirements: reqs,
         };
       }
       return {
+        ...tierExtra,
         executor: undefined,
         requested: spec.name,
         routed: false,
@@ -316,6 +359,7 @@ export function routeExecutor(
       };
     }
     return {
+      ...tierExtra,
       executor: spec.name,
       requested: spec.name,
       routed: false,
@@ -333,6 +377,7 @@ export function routeExecutor(
     .filter((s) => meetsRequirements(s, reqs));
   if (available.length === 0) {
     return {
+      ...tierExtra,
       executor: undefined,
       requested: undefined,
       routed: false,
@@ -344,13 +389,57 @@ export function routeExecutor(
   }
   const picked = selectBest(available, ctx)!;
   const why = strategy === "first-available" ? "自动路由到可用执行器" : `按策略 ${strategy} 选中`;
+  // tier 驱动的策略在理由里标注档位出处——估值冒充实测正是这层要消灭的静默错配。
+  const pickedNote = strategy === "fastest" || strategy === "cost-aware"
+    ? tierSourcesNote(options.tierCatalog, picked.name)
+    : "";
   return {
+    ...tierExtra,
     executor: picked.name,
     requested: undefined,
     routed: true,
-    reason: `${why} ${picked.name}（满足需求；可用：${availableNames(probes)}）。`,
+    reason: `${why} ${picked.name}（满足需求；可用：${availableNames(probes)}）。${pickedNote}`,
     available: probes,
     strategy,
     requirements: reqs,
+  };
+}
+
+export interface InvokableResolution {
+  /** 实际可调用的执行器名（原值、回退值或插件路径）。 */
+  name: string;
+  /** 是否发生了自动挑选/回退（false = 原名直用，含别名归一）。 */
+  routed: boolean;
+  /** 发生回退时的人类可读原因；未路由时 undefined。 */
+  reason?: string;
+}
+
+/**
+ * 执行期单次解析：把契约/配置里的执行器名解析为"现在真的能调用"的执行器。
+ * 与 routeExecutor 同一套语义（插件路径原样放行、显式已安装直用、未安装按需求
+ * 回退到最优可用者），供 stage / review / manager 调用前使用——多阶段任务不再
+ * 等到执行期 spawn 才发现执行器不可用，且重试时健康度降权能把连败的执行让给
+ * 更健康的候选。无任何可用执行器时抛错（重试无法修复缺装，应 fail-fast）。
+ */
+export function resolveInvokableExecutor(
+  requested: string,
+  options: RouterOptions = {},
+): InvokableResolution {
+  const decision = routeExecutor(requested, options);
+  if (!decision.executor) {
+    const reqNote = decision.requirements && Object.keys(decision.requirements).length > 0
+      ? `（需求：${Object.entries(decision.requirements)
+          .filter(([, v]) => v !== undefined)
+          .map(([k, v]) => (k === "exclude" ? `排除 ${(v as string[]).join("/")}` : `${k}=${v}`))
+          .join(", ")}）`
+      : "";
+    throw new Error(
+      `执行器 ${requested} 不可用${reqNote}，且本机无满足需求的可用编码 agent CLI（可用：${availableNames(decision.available)}）。请安装对应 CLI 或设置其覆盖环境变量后重试。`,
+    );
+  }
+  return {
+    name: decision.executor,
+    routed: decision.routed,
+    reason: decision.routed ? decision.reason : undefined,
   };
 }

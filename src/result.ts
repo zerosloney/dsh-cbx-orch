@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { saveJson, loadJobContext, now } from "./storage.js";
+import { saveJson, loadJobContext, now, verifyJobAudit } from "./storage.js";
 import { jobDir } from "./state.js";
 import { listArtifacts } from "./artifacts.js";
 import { criterionDefinitions, reconcileVerifiedProgress, type StructuredAudit, type VerifiedProgress } from "./progress.js";
@@ -12,8 +12,10 @@ import type { JobState } from "./types.js";
 
 export async function writeResult(workspace: string, jobId: string, state: JobState): Promise<void> {
   const directory = jobDir(workspace, jobId);
-  if (state.audit) await saveJson(path.join(directory, "audit.json"), state.audit);
-  if (state.verifiedProgress) await saveJson(path.join(directory, "verified-progress.json"), state.verifiedProgress);
+  // result/audit/verified-progress 是终态汇总镜像（权威在 SQLite state），进程崩溃后可
+  // 由终态路径重建，无需承担 fsync 写放大。
+  if (state.audit) await saveJson(path.join(directory, "audit.json"), state.audit, { fsync: false });
+  if (state.verifiedProgress) await saveJson(path.join(directory, "verified-progress.json"), state.verifiedProgress, { fsync: false });
   const files = await listArtifacts(workspace, jobId);
   const context = await loadJobContext(directory);
   const text = async (name: string): Promise<string | null> => existsSync(path.join(directory, name)) ? readFile(path.join(directory, name), "utf8") : null;
@@ -39,6 +41,14 @@ export async function writeResult(workspace: string, jobId: string, state: JobSt
     const verified = structuredAuditRequested(context) ? judgement?.status === "verified" : true;
     return { criterion, status: evidenceAvailable && verified ? "evidence_available" : "unverified", artifacts: judgement?.evidence.map(item => item.artifact) ?? evidenceArtifacts };
   });
+  // 审计完整性验证（终态时对 events.ndjson vs SQLite 镜像做一致性检查，检测执行器
+  // 篡改）。best-effort：旧任务无 SQLite 镜像时返回"无法验证"，不影响 result 落盘。
+  let auditIntegrity: import("./storage.js").JobAuditVerification | null = null;
+  try {
+    auditIntegrity = await verifyJobAudit(workspace, jobId);
+  } catch {
+    auditIntegrity = null;
+  }
   await saveJson(path.join(directory, "result.json"), {
     jobId, status: state.status, phase: state.phase, attempt: state.attempt,
     estimatedTokens,
@@ -53,6 +63,8 @@ export async function writeResult(workspace: string, jobId: string, state: JobSt
     configuredMaxTurns: state.configuredMaxTurns ?? context.maxTurns ?? null,
     executorInvocations: state.executorInvocations ?? 0,
     stageInvocations: state.stageInvocations ?? {},
+    // 审计完整性：events.ndjson 与 SQLite 镜像的一致性验证结果（检测执行器篡改）。
+    auditIntegrity,
     updatedAt: now(),
-  });
+  }, { fsync: false });
 }

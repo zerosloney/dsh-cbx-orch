@@ -8,12 +8,12 @@ import {
   buildTimeline,
   isAuthorized,
   parseCursors,
-  readAgentLogIncremental,
   readExecutorStatus,
   replayEvents,
   startEventTailer,
   summarizeWorkspace,
 } from "./ui.js";
+import { readAgentLogIncremental } from "./log-tail.js";
 import {
   approveJob,
   cancelJob,
@@ -22,6 +22,7 @@ import {
   health,
   listArtifacts,
   listJobs,
+  listJobsWithAudit,
   listQueue,
   loadConfig,
   loadState,
@@ -35,6 +36,13 @@ import {
 } from "./core.js";
 import { isCbxError } from "./errors.js";
 import { deriveRequirements, noExecutorError, routeExecutor, type ExecutorStrategy } from "./executor-router.js";
+import { buildTierCatalog } from "./executor-catalog.js";
+import {
+  abortIdempotentCreate,
+  beginIdempotentCreate,
+  commitIdempotentCreate,
+  hashIdempotentRequest,
+} from "./idempotency.js";
 import { loadHealth } from "./executor-health.js";
 import {
   AuthRateLimiter,
@@ -91,6 +99,7 @@ function errorStatus(error: unknown): number {
   if (code === "EBIG") return 413;
   if (isCbxError(error, "E_NOT_FOUND")) return 404;
   if (isCbxError(error, "E_ARTIFACT_FORBIDDEN")) return 403;
+  if (isCbxError(error, "E_INVALID_STATE")) return 409;
   if (
     isCbxError(error, "E_INVALID_JOB_ID") ||
     isCbxError(error, "E_INVALID_WORKSPACE") ||
@@ -365,7 +374,8 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
       }
       const ws = await resolveWorkspace(url);
       if (pathname === "/api/jobs" && req.method === "GET") {
-        json(res, await listJobs(ws));
+        // 富化审计完整性（终态 job 附 __audit），供仪表盘展示篡改检测状态。
+        json(res, await listJobsWithAudit(ws));
         return;
       }
       if (pathname === "/api/queue") {
@@ -451,18 +461,32 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
               : {}),
           };
           const strategy = (body.routing_strategy ?? config.routingStrategy ?? "first-available") as ExecutorStrategy;
+          // 档位目录：实测校准 + executorTiers 覆盖；未知名告警进响应（HTTP 入口无 bridgeLog）。
+          const { catalog: tierCatalog, warnings: tierWarnings } =
+            buildTierCatalog(loadHealth(ws), config.executorTiers);
           const decision = routeExecutor(defaults.executor, {
             preference: config.executorPreference,
             requirements,
             strategy,
             health: loadHealth(ws),
+            tierCatalog,
           });
           if (!decision.executor) {
             const error = noExecutorError(decision.available);
-            json(res, { error: error.message }, 400);
+            json(res, { error: error.message, ...(tierWarnings.length ? { tierWarnings } : {}) }, 400);
             return;
           }
-          const created = await createJob({
+          if (tierWarnings.length > 0 && decision.routed) {
+            console.error(`[cbx] 档位目录：${tierWarnings.join("；")}`);
+          }
+          // 幂等键（可选，与 cbx_run 工具同语义）：预留→创建→提交；失败释放。
+          const idempotencyKey =
+            typeof body.idempotency_key === "string" ? body.idempotency_key.trim() : undefined;
+          if (body.idempotency_key !== undefined && !idempotencyKey) {
+            json(res, { error: "idempotency_key 提供时必须是非空字符串。" }, 400);
+            return;
+          }
+          const jobOptions = {
             workspace: ws,
             task: body.task,
             contextSnapshot: typeof body.context_snapshot === "string" ? body.context_snapshot : undefined,
@@ -489,7 +513,46 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
             trustMode: defaults.trustMode,
             dependencyGuard: defaults.dependencyGuard,
             allowUnsafePermissions: body.allow_unsafe_permissions === true,
-          });
+            cost: body.max_executor_invocations === undefined
+              ? undefined
+              : { maxExecutorInvocations: parseNumberField(body, "max_executor_invocations", { integer: true, min: 1, max: 1_000_000 })! },
+          };
+          if (idempotencyKey) {
+            const outcome = await beginIdempotentCreate(
+              ws,
+              idempotencyKey,
+              hashIdempotentRequest(jobOptions),
+            );
+            if (outcome.kind === "conflict" || outcome.kind === "in-flight") {
+              json(
+                res,
+                {
+                  error:
+                    outcome.kind === "conflict"
+                      ? `幂等键 "${idempotencyKey}" 已用于不同的创建请求（${outcome.createdAt}）。请换键或省略。`
+                      : `幂等键 "${idempotencyKey}" 的同名创建正在进行中（${outcome.createdAt}）。`,
+                },
+                409,
+              );
+              return;
+            }
+            if (outcome.kind === "duplicate") {
+              json(res, {
+                job_id: outcome.jobId,
+                status: outcome.status ?? "unknown",
+                deduplicated: true,
+              });
+              return;
+            }
+          }
+          let created;
+          try {
+            created = await createJob(jobOptions);
+          } catch (error) {
+            if (idempotencyKey) await abortIdempotentCreate(ws, idempotencyKey);
+            throw error;
+          }
+          if (idempotencyKey) await commitIdempotentCreate(ws, idempotencyKey, created.jobId);
           await startBackground(ws, created.jobId, "", parseNumberField(body, "priority") ?? 0);
           json(res, { job_id: created.jobId, status: "queued" }, 201);
           return;

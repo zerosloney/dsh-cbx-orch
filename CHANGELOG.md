@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.3.0 (2026-08-23)
+
+本会话的加固轮：成本治理、审计权威迁移、storage 拆分、HTTP 边界测试与多项正确性/性能修复。
+
+### ⚠️ Breaking / 行为变化
+
+- **executor 插件默认强制白名单（fail-closed）**：`executor` 指向工作区内的插件路径时，未配置 `plugins.enforce` 或为 `true` 时**必须提供 `allowPaths`/`allowSha256`** 之一，否则创建即报错。旧行为（无白名单也放行）需显式 `plugins.enforce=false`（逃生门，持续告警 + `plugin_policy_warning` 审计事件）。`PluginPolicy` 新增 `defaultEnforce`（runner 侧传入 `true`；`plugin-host.js` 直调路径不受影响）。
+- **schema v6（审计权威迁移到 SQLite）**：`events` 表新增 `job_id` 列——job 级事件（`logJobEvent`/执行器调用事件）同时镜像进 SQLite，读取面（timeline/崩溃根因/事件增量/executor 命令）优先读 SQLite（执行器无 SQLite 连接、无法篡改），`events.ndjson` 降级为展示镜像。升级自动迁移；**降级回 v5 会被拒绝**（schema 版本高于当前）。
+- **Web approve 业务错误 500 → 409**：已取消/不需要批准/重复批准/Human Gate 缺失等审批状态冲突，从普通 `Error`（HTTP 500）改为 `CbxError("E_INVALID_STATE")`（HTTP 409）。
+
+### Added
+
+- **成本硬闸 `cost.maxExecutorInvocations`**：可配置单个任务累计执行器调用（stage + review + manager + gate 全部角色）上限，达到即转 `needs_fix` + `cost_limit` phase + Human Gate（绝不当作普通失败走重试）。优先级：工具参数 `max_executor_invocations` / Web `max_executor_invocations`（per-job，写入 context）> `.cbx.json` `cost.maxExecutorInvocations`；执行期实时读取。新增 `ExecutorCostLimitError` + `E_COST_LIMIT` 错误码，stage/review/manager/handshake 全角色识别。
+- **审计完整性验证（`verifyJobAudit`）**：比对 `events.ndjson` 与 SQLite 镜像（事件数 + 逐行 event/jobId），漂移即判定执行器篡改。`cbx_status` 附 `__audit`；`cbx_result`/result.json 附 `auditIntegrity`；`cbx_health` 聚合 `audit.checked/tampered`；`cbx_list`/Web 仪表盘展示 Audit 列（`篡改!`/`✓`/`—`）+ 详情面板审计状态。
+- **`listJobsWithAudit`**（artifacts）：终态 job 富化 `__audit`，供 cbx_list 与 `GET /api/jobs` 共用。
+- **`listPersistedStates` 分页**（`limit`/`offset`）+ `jobs.updated_at` 索引（schema v5）。
+- **镜像文件去 fsync**：`atomicWriteFile`/`saveJson` 新增 `{ fsync: false }` 选项，镜像类文件（state.json/context.json/result.json/context-pack 等）不再承担每次同步 fsync 写放大（rename 原子性保留）。
+- **执行器健康度落盘防抖**（500ms 合并窗口）+ `flushHealthStore`/`resetHealthStore` 清理。
+- **Web POST 动作端点测试**（web-actions）：approve/cancel/retry/continue/forget/purge 全覆盖。
+- **cbx_logs 事件增量游标语义**：`readEventsIncremental` 优先 SQLite（`jobEventsAfterCursor`），旧任务回退 ndjson 行游标（含增量续读）；修复稀疏 seq 漏事件 bug（`next_offset` 改为已读最后一条 seq，而非 +1）。
+- **`storage/` 模块拆分**：原 `storage.ts`（2370 行）按关注点拆为 12 个子模块（io/config/context/locks/db/persist/meta/events/outbox/prune/metrics/lease），`storage.ts` 变 30 行 barrel，对外接口零变化。
+
+### Fixed
+
+- **executor 插件默认 enforce 后 runner 测试适配**：测试插件源统一注入合法 manifest + 工作区白名单（真实插件形态）。
+- **`readEventsIncremental` SQLite 游标漏事件**：`next_offset = lastSeq + 1` 在 job 事件稀疏（混在 workspace 全局 seq）时，`seq > lastSeq+1` 会漏掉 `seq == lastSeq+1` 的本 job 事件。改为 `next_offset = 已读最后一条 seq`。
+- **`readEventsIncremental` 回退语义**：SQLite 正常但该 job 从未镜像（旧任务）时显式探测回退 ndjson（支持行游标增量续读）；ndjson 文件缺失返回空而非抛错。
+- **Web 测试基建**：POST 创建拉起的常驻调度器未清理（Windows SQLite 文件锁 EBUSY）——`stopScheduler` + 连接关闭 + 重试删除。
+- **全量测试偶发 300s 超时**（tools-workspace cbx_run 测试）：空文件假执行器被 spawn 失败进入重试循环 + 调度器未停，拖住全量进程。修复：测试用 `approval_before_run: true` 停在门状态（不 spawn 执行器）+ finally `stopScheduler`。连续 4 次全量 285 测试全绿无超时。
+- **git-ops 两处死代码**：`snapshotGitBaseline` 的 `statusOk ? stdout : stdout` 冗余（补上 fail-safe 标记）；`trackedDiff` unborn 分支的 `staged+unstaged` 拼接两次（删冗余）。
+- **`Date.now()` 被 `now()` 替换误伤**（storage 拆分时）：还原。
+
+### Security
+
+- **审计权威迁移**：job 级事件镜像进 SQLite（执行器子进程无 SQLite 连接，无法篡改）；ndjson 可被不可信执行器改写，但读取面全部走 SQLite，且 `verifyJobAudit`/`auditIntegrity` 检测漂移。
+- **`.cbx.json` 可信配置声明**（README）：严格校验未知字段拒绝的语义、降级风险、SSRF 面（webhook/telemetry endpoint）——外部 clone 仓库自带的 `.cbx.json` 应审查后再用。
+
+### Docs
+
+- README：成本治理（`cost.maxExecutorInvocations`）、审计权威与防篡改、`.cbx.json` 可信配置说明、executor 插件默认 enforce。
+- CHANGELOG：本条目。
+
 ## 0.2.0 (2026-08-22)
 
 自 npm 0.1.0（tag `v0.1.0`）以来的增量。

@@ -33,8 +33,15 @@ export interface PluginPolicy {
   enforce?: boolean;
   allowPaths?: string[];
   allowSha256?: string[];
-}
-export interface PluginIdentity extends ExecutorPluginManifest {
+  /**
+   * 调用方提供的"enforce 未显式设置时的缺省值"。这是 runner 侧安全默认的载体：
+   * `.cbx.json` 未配置 plugins.enforce 时，runner 传 `defaultEnforce: true` 让插件
+   * 路径默认走白名单校验（fail-closed），而不是"默认告警放行"。显式配置的
+   * `enforce` 始终优先。legacy 插件宿主（plugin-host 直接调 loadExecutorPlugin）
+   * 不传此字段时保持旧行为（enforce 缺省 = 不强制），因此该默认只对编排器主进程生效。
+   */
+  defaultEnforce?: boolean;
+}export interface PluginIdentity extends ExecutorPluginManifest {
   source: "plugin";
   path: string;
   sha256: string;
@@ -71,7 +78,10 @@ async function verifyExecutorPluginSource(
   const allowSha256 = (policy.allowSha256 ?? []).map((allowed) =>
     allowed.toLowerCase(),
   );
-  if (policy.enforce) {
+  // enforce 未显式配置时按调用方提供的 defaultEnforce 生效（runner 默认 true）。
+  // 显式 enforce 始终优先；两侧都未提供时保持旧行为（不强制）。
+  const enforce = policy.enforce ?? policy.defaultEnforce ?? false;
+  if (enforce) {
     if (!allowPaths.length && !allowSha256.length)
       throw new Error(
         "plugins.enforce=true 时必须配置 allowPaths 或 allowSha256。",

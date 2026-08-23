@@ -10,11 +10,14 @@ import {
   eventsAfterCursor,
   loadPersistedQueue,
   loadRuntimeExecutorsAllowlist,
+  listPersistedStates,
   prunePersistedData,
+  saveJson,
   savePersistedState,
   savePersistedStateCas,
   savePersistedQueue,
 } from "../lib/storage.js";
+import { loadConfig } from "../lib/state.js";
 
 const workspaces = [];
 
@@ -163,4 +166,71 @@ test("loadRuntimeExecutorsAllowlist: 非法白名单类型抛错", async () => {
   const ws = workspace();
   writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ executors: { envAllowlist: "TOKEN" } }), "utf8");
   await assert.rejects(loadRuntimeExecutorsAllowlist(ws));
+});
+
+// executorTiers：档位是路由依据，结构/取值非法必须在加载期拒绝（fail-closed）。
+test("loadConfig: executorTiers 合法配置可通过校验", async () => {
+  const ws = workspace();
+  writeFileSync(
+    path.join(ws, ".cbx.json"),
+    JSON.stringify({ executorTiers: { qwen: { speedTier: 1 }, cbc: { costTier: 1 } } }),
+    "utf8",
+  );
+  await assert.doesNotReject(loadConfig(ws));
+});
+
+test("loadConfig: executorTiers 档位越界抛错", async () => {
+  const ws = workspace();
+  writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ executorTiers: { qwen: { speedTier: 5 } } }), "utf8");
+  await assert.rejects(loadConfig(ws), /speedTier/);
+});
+
+test("loadConfig: executorTiers 未知字段与非对象值抛错", async () => {
+  const a = workspace();
+  writeFileSync(path.join(a, ".cbx.json"), JSON.stringify({ executorTiers: { qwen: { velocity: 2 } } }), "utf8");
+  await assert.rejects(loadConfig(a), /velocity/);
+  const b = workspace();
+  writeFileSync(path.join(b, ".cbx.json"), JSON.stringify({ executorTiers: { qwen: 3 } }), "utf8");
+  await assert.rejects(loadConfig(b));
+});
+
+test("listPersistedStates: 分页 limit/offset 按 updated_at 倒序返回", async () => {
+  const ws = workspace();
+  // updated_at 列由 savePersistedState 以 now() 写入（真实时间），逐条写保证
+  // 后写者 updated_at 更大；断言按"写入顺序倒序"（最新在前）。
+  await savePersistedState(ws, "j1", { jobId: "j1", status: "done" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await savePersistedState(ws, "j2", { jobId: "j2", status: "done" });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await savePersistedState(ws, "j3", { jobId: "j3", status: "done" });
+  const all = await listPersistedStates(ws);
+  assert.deepEqual(all.map((s) => s.jobId), ["j3", "j2", "j1"]);
+  const page1 = await listPersistedStates(ws, { limit: 2 });
+  assert.deepEqual(page1.map((s) => s.jobId), ["j3", "j2"]);
+  const page2 = await listPersistedStates(ws, { limit: 2, offset: 2 });
+  assert.deepEqual(page2.map((s) => s.jobId), ["j1"]);
+  const beyond = await listPersistedStates(ws, { limit: 2, offset: 10 });
+  assert.deepEqual(beyond, []);
+});
+
+test("listPersistedStates: 分页不改变全量语义（limit 缺省返回全部）", async () => {
+  const ws = workspace();
+  await savePersistedState(ws, "x1", { status: "queued", updatedAt: "2026-01-01T00:00:00Z" });
+  const all = await listPersistedStates(ws);
+  assert.equal(all.length, 1);
+});
+
+test("saveJson: fsync:false 仍原子写（临时文件 + rename），文件内容完整", async () => {
+  const ws = workspace();
+  const file = path.join(ws, "mirror.json");
+  await saveJson(file, { a: 1, nested: { b: [1, 2] } }, { fsync: false });
+  assert.deepEqual(JSON.parse(await (await import("node:fs/promises")).readFile(file, "utf8")), {
+    a: 1,
+    nested: { b: [1, 2] },
+  });
+  // 覆盖写也正常（rename 语义）
+  await saveJson(file, { c: 2 }, { fsync: false });
+  assert.deepEqual(JSON.parse(await (await import("node:fs/promises")).readFile(file, "utf8")), {
+    c: 2,
+  });
 });

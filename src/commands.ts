@@ -12,6 +12,7 @@ import { publishCbxFacade } from "./subagent-facade.js";
 import { routeNote } from "./session-message.js";
 import { deriveRequirements, noExecutorError, routeExecutor, type ExecutorStrategy, type RouteDecision } from "./executor-router.js";
 import { resolveExecutor } from "./executors/builtin.js";
+import { buildTierCatalog } from "./executor-catalog.js";
 import { loadHealth } from "./executor-health.js";
 import type { CbxDefaults, SessionCwdContext } from "./tools.js";
 import type { CommandResult } from "@deepseek-ai/dsh-commands";
@@ -152,11 +153,17 @@ export function registerCbxCommands(service: CbxCommandContext): void {
         // 与 tools.ts 的 cbx_run 对齐：请求执行器 = 显式覆盖 ?? 工作区 config ?? 插件配置默认。
         // （不能用 merged.executor——它在 mergeConfig 里已被兜底为 config ?? "codebuddy"，
         //   会丢 defaults.executor 的插件路径/特定内建默认。）
+        const { catalog: tierCatalog, warnings: tierWarnings } =
+          buildTierCatalog(loadHealth(ws), config.executorTiers);
+        for (const warning of tierWarnings) {
+          console.error(`[cbx] 档位目录：${warning}`);
+        }
         const decision: RouteDecision = routeExecutor(override.executor ?? config.executor ?? defaults.executor, {
           preference: config.executorPreference,
           requirements: deriveRequirements({ permissionMode: merged.permissionMode }),
           strategy: config.routingStrategy ?? "first-available",
           health: loadHealth(ws),
+          tierCatalog,
         });
         if (!decision.executor) throw noExecutorError(decision.available);
         const created = await createJob({

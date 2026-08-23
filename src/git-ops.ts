@@ -48,7 +48,9 @@ export async function snapshotGitBaseline(workspace: string): Promise<GitBaselin
     commit: commit.code === 0 ? commit.stdout.trim() : undefined,
     branch: branch.code === 0 && branch.stdout.trim() ? branch.stdout.trim() : undefined,
     dirty: !statusOk || Boolean(status.stdout.trim()),
-    status: statusOk ? status.stdout : status.stdout,
+    // fail-safe 可见性：git status 失败时在 status 文本里留下标记（dirty 已按
+    // 失败置 true 兜底，这里让基线的 status 文本本身也呈现异常，而非静默空串）。
+    status: statusOk ? status.stdout : `${status.stdout}\n[git status failed]`,
   };
 }
 
@@ -136,7 +138,7 @@ export async function prepareWorktree(workspace: string, directory: string, jobI
   if (carryDirty) {
     await carryDirtyIntoWorktree(workspace, target, directory);
   }
-  await saveJson(path.join(directory, "worktree.json"), { path: target, branch: autoBranch ? branch : undefined, baseCommit, carryDirty, createdAt: now() });
+  await saveJson(path.join(directory, "worktree.json"), { path: target, branch: autoBranch ? branch : undefined, baseCommit, carryDirty, createdAt: now() }, { fsync: false });
   return target;
 }
 
@@ -213,7 +215,7 @@ export async function cleanupRecordedWorktree(workspace: string, directory: stri
       if (remaining.length === 0) await rmdir(expectedParent);
     } catch { /* 容器清理是 best-effort，失败不影响 job 终态 */ }
   }
-  await saveJson(path.join(directory, "worktree-cleaned.json"), { path: target, cleanedAt: now() });
+  await saveJson(path.join(directory, "worktree-cleaned.json"), { path: target, cleanedAt: now() }, { fsync: false });
   return true;
 }
 
@@ -223,7 +225,7 @@ async function trackedDiff(workdir: string): Promise<string> {
   // Unborn repositories do not have HEAD yet.
   const staged = await captureAsync(["git", "diff", "--binary", "--cached", "--", ...CODE_PATHS], workdir);
   const unstaged = await captureAsync(["git", "diff", "--binary", "--", ...CODE_PATHS], workdir);
-  return staged.stdout + unstaged.stdout + (staged.code || unstaged.code ? staged.stdout + unstaged.stdout : "");
+  return staged.stdout + unstaged.stdout;
 }
 
 /** 相对路径是否"穿过"符号链接/junction：任一祖先目录或文件本身是链接即真。

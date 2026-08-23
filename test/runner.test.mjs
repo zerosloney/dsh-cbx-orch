@@ -12,18 +12,35 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { invokeExecutor } from "../lib/runner.js";
 import { jobContext } from "../lib/job-runtime.js";
+import { loadHealth, resetHealthStore } from "../lib/executor-health.js";
 
 const fixtures = [];
 
 after(() => {
   for (const directory of fixtures) rmSync(directory, { recursive: true, force: true });
+  resetHealthStore();
 });
 
-function fixture(pluginSource) {
+// 测试插件源统一注入合法 manifest（enforce 开启时 validateManifest 强制要求）。
+// 只接受 `export default { ... }` 形态（可能带前置 import），把 manifest 字段并入导出对象。
+function pluginSource(source) {
+  return source.replace(
+    /export default\s*\{/,
+    `export default { manifest: { apiVersion: "cbx.executor/v1", name: "test-plugin", version: "1.0.0", capabilities: ["execute"] },`,
+  );
+}
+
+function fixture(pluginSourceBody) {
   const workspace = mkdtempSync(path.join(tmpdir(), "cbx-runner-"));
   const directory = path.join(workspace, "job");
   mkdirSync(directory, { recursive: true });
-  writeFileSync(path.join(workspace, "executor.mjs"), pluginSource, "utf8");
+  // 真实插件形态：默认 enforce=true 要求 manifest + 白名单路径，测试源补上两者。
+  writeFileSync(path.join(workspace, "executor.mjs"), pluginSource(pluginSourceBody), "utf8");
+  writeFileSync(
+    path.join(workspace, ".cbx.json"),
+    JSON.stringify({ plugins: { enforce: true, allowPaths: ["executor.mjs"] } }),
+    "utf8",
+  );
   fixtures.push(workspace);
   return {
     workspace,
@@ -237,4 +254,57 @@ test("invokeExecutor: 清理失败不遮蔽取消 reason，并写脱敏审计事
     readFileSync(path.join(value.directory, "events.ndjson"), "utf8"),
     /plugin_artifact_cleanup_failed/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// 健康度回写的失败语义细分：超时/崩溃/启动错误分开计数，供路由层分档降权
+// ---------------------------------------------------------------------------
+
+test("invokeExecutor: 成功回写 successes，失败按 failure 记", async () => {
+  resetHealthStore();
+  const successValue = fixture(`
+    export default { async run() { return { code: 0, output: "ok" }; } };
+  `);
+  await invoke(successValue);
+  let rec = loadHealth(successValue.workspace)["executor.mjs"];
+  assert.equal(rec.successes, 1);
+  assert.equal(rec.consecutiveFailures, 0);
+
+  const failValue = fixture(`
+    export default { async run() { return { code: 3, output: "boom" }; } };
+  `);
+  await invoke(failValue);
+  rec = loadHealth(failValue.workspace)["executor.mjs"];
+  assert.equal(rec.failures, 1);
+  assert.equal(rec.lastFailureKind, "failure");
+  assert.equal(rec.timeouts, undefined);
+});
+
+test("invokeExecutor: 超时按 timeout 记，与崩溃分开", async () => {
+  resetHealthStore();
+  const value = fixture(`
+    export default { async run() { await new Promise(() => setInterval(() => {}, 1_000)); } };
+  `);
+  const result = await invoke(value, 250);
+  assert.equal(result.timedOut, true);
+  const rec = loadHealth(value.workspace)["executor.mjs"];
+  assert.equal(rec.failures, 1);
+  assert.equal(rec.timeouts, 1);
+  assert.equal(rec.consecutiveTimeouts, 1);
+  assert.equal(rec.lastFailureKind, "timeout");
+});
+
+test("invokeExecutor: 插件缺失等启动错误也计入健康度（取消除外）", async () => {
+  resetHealthStore();
+  const workspace = mkdtempSync(path.join(tmpdir(), "cbx-runner-"));
+  fixtures.push(workspace);
+  const directory = path.join(workspace, "job");
+  mkdirSync(directory, { recursive: true });
+  await assert.rejects(() =>
+    invokeExecutor("missing-plugin.mjs", workspace, directory, workspace, "p", "auto", 1, 5_000),
+  );
+  const rec = loadHealth(workspace)["missing-plugin.mjs"];
+  assert.ok(rec, "启动错误必须留下健康度记录");
+  assert.equal(rec.failures, 1);
+  assert.equal(rec.lastFailureKind, "failure");
 });

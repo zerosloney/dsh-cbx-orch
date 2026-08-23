@@ -2,6 +2,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { invokeExecutor, loadConfig } from "./core.js";
+import { deriveRequirements, resolveInvokableExecutor } from "./executor-router.js";
+import { loadHealth } from "./executor-health.js";
 import { snapshotDiff, type DiffSnapshot } from "./git-ops.js";
 import type { ProcessResult } from "./process-runner.js";
 
@@ -28,12 +30,19 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   const workspace = path.resolve(workspaceInput);
   const config = await loadConfig(workspace);
   options.signal?.throwIfAborted();
-  const executor = options.executor ?? config.executor ?? "codebuddy";
   const reviewRules = options.reviewRules ?? config.reviewRules;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
   const permissionMode = options.permissionMode ?? config.permissionMode ?? "default";
   const failOpen = options.failOpen ?? config.reviewGate?.failOpen === true;
+  // stop-gate 执行器执行期解析：配置的 executor 未安装时回退到可用 CLI，而不是让
+  // hook 直接 fail-closed 卡住会话停止；路由说明追加到结果 reason，用户可见。
+  const requestedExecutor = options.executor ?? config.executor ?? "codebuddy";
+  const gateRoute = resolveInvokableExecutor(requestedExecutor, {
+    requirements: deriveRequirements({ permissionMode }),
+    health: loadHealth(workspace),
+  });
+  const executor = gateRoute.name;
 
   const snapshot = await snapshotDiff(workspace);
   options.signal?.throwIfAborted();
@@ -45,7 +54,7 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   const directory = await mkdtemp(path.join(os.tmpdir(), "cbx-review-gate-"));
   try {
     options.signal?.throwIfAborted();
-    return await runReviewGateIn(directory, {
+    const result = await runReviewGateIn(directory, {
       workspace,
       executor,
       reviewRules,
@@ -56,6 +65,12 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
       failOpen,
       signal: options.signal,
     });
+    return gateRoute.routed
+      ? {
+          ...result,
+          reason: `${result.reason}（执行器路由：${requestedExecutor} 不可用，已回退到 ${gateRoute.name}）`,
+        }
+      : result;
   } finally {
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
   }

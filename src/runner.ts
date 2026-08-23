@@ -5,9 +5,11 @@ import { fileURLToPath } from "node:url";
 import { inspectExecutorPlugin, type ExecutorResult, type ExecutorRequest } from "./executor.js";
 import { findExecutable, resolveExecutor } from "./executors/builtin.js";
 import { recordExecutorOutcome } from "./executor-health.js";
-import { bumpInvocationCount, loadConfig } from "./state.js";
+import { bumpInvocationCount, loadConfig, loadState, mirrorJobEventToSqlite } from "./state.js";
+import { loadJobContext } from "./storage.js";
 import { validateTestCommand } from "./validation.js";
 import { runProcess, runShell, type ProcessResult } from "./process-runner.js";
+import { ExecutorCostLimitError } from "./errors.js";
 import { redactText, saveJson } from "./storage.js";
 import { APP_VERSION } from "./version.js";
 import { jobContext } from "./job-runtime.js";
@@ -34,8 +36,27 @@ function truncateDeep(value: unknown, maxChars = 500): unknown {
  * 内联凭据）持久化并随 SSE / events artifact 暴露——agent.log/test.log 的脱敏
  * 约束同样适用于事件流。
  */
+/** 从 job 事件文件路径解析 workspace 与 jobId（`<ws>/.cbx/jobs/<jobId>/events.ndjson`）。
+ *  供 appendEvent 镜像 SQLite 时使用；解析失败返回 undefined（镜像跳过）。 */
+function jobIdentityFromEventsFile(eventsFile: string): { workspace: string; jobId: string } | undefined {
+  const normalized = path.normalize(eventsFile);
+  const parts = normalized.split(path.sep);
+  // 定位 ".cbx/jobs/<jobId>/events.ndjson"
+  const jobsIndex = parts.lastIndexOf("jobs");
+  if (jobsIndex < 0 || jobsIndex + 2 >= parts.length) return undefined;
+  const jobId = parts[jobsIndex + 1];
+  const workspace = parts.slice(0, jobsIndex - 1).join(path.sep); // 去掉 .cbx
+  if (!jobId || !workspace) return undefined;
+  return { workspace, jobId };
+}
+
 function appendEvent(eventsFile: string, payload: Record<string, unknown>): void {
   appendFileSync(eventsFile, redactText(JSON.stringify(truncateDeep(payload))) + "\n", "utf8");
+  // SQLite 镜像（审计权威）：执行器可改 ndjson，改不了 events 表。
+  const identity = jobIdentityFromEventsFile(eventsFile);
+  if (identity) {
+    mirrorJobEventToSqlite(identity.workspace, identity.jobId, String(payload.event ?? "event"), payload);
+  }
 }
 
 /** Remove a per-invocation plugin artifact, surfacing errors other than a missing file. */
@@ -186,17 +207,36 @@ export async function invokeExecutor(
       invocationMeta,
       combined.signal,
     );
-    // 回写健康度：成功/失败 + 延迟，供路由层降权 / LRU / round-robin 使用。
+    // 回写健康度，失败语义细分：超时（撞墙钟被杀）与崩溃（非零退出）分开计数，
+    // 路由层据此施加不同档位的降权——超时可能只是任务过大，崩溃更可能是执行器坏了。
     try {
-      recordExecutorOutcome(workspace, executor, {
-        success: result.code === 0 && !result.timedOut,
-        latencyMs: Date.now() - start,
-      });
+      recordExecutorOutcome(
+        workspace,
+        executor,
+        result.timedOut
+          ? { success: false, kind: "timeout", latencyMs: Date.now() - start }
+          : result.code === 0
+            ? { success: true, latencyMs: Date.now() - start }
+            : { success: false, kind: "failure", latencyMs: Date.now() - start },
+      );
     } catch {
       /* 健康度记录失败不影响主流程 */
     }
     return result;
   } catch (error) {
+    // 取消/中止不算执行器的账；真实启动错误（二进制缺失、pid 记录失败等）按 failure 记录，
+    // 否则"选了没装的执行器"永远学不到教训，下次路由还会撞同一堵墙。
+    if (!callerSignal?.aborted && !jobSignal?.aborted) {
+      try {
+        recordExecutorOutcome(workspace, executor, {
+          success: false,
+          kind: "failure",
+          latencyMs: Date.now() - start,
+        });
+      } catch {
+        /* 健康度记录失败不影响主流程 */
+      }
+    }
     rethrowPreferredAbort(error, callerSignal, jobSignal);
   } finally {
     combined.dispose();
@@ -206,6 +246,34 @@ export async function invokeExecutor(
 async function invokeExecutorCore(executor: string, workspace: string, directory: string, workdir: string, prompt: string, permissionMode: string, maxTurns: number, timeoutMs: number, invocationMeta?: InvocationMeta, signal?: AbortSignal): Promise<ProcessResult> {
   signal?.throwIfAborted();
   if (invocationMeta?.jobId) {
+    // 成本硬闸：发起调用前检查累计执行器调用是否已达上限。达到上限即抛
+    // ExecutorCostLimitError——调用方（stage-runner/review-gate/handshake/adaptive）
+    // 识别后转 needs_fix + human gate，绝不当作普通失败走重试（重试会继续烧配额）。
+    // 上限优先级：创建时工具/Web 参数写入的 context.cost > `.cbx.json` 的 cost.maxExecutorInvocations；
+    // 均未配置 = 无上限（向后兼容）。
+    try {
+      const [state, config, context] = await Promise.all([
+        loadState(workspace, invocationMeta.jobId),
+        loadConfig(workspace),
+        loadJobContext(path.join(workspace, ".cbx", "jobs", invocationMeta.jobId)).catch(
+          () => undefined,
+        ),
+      ]);
+      const limit =
+        context?.cost?.maxExecutorInvocations ??
+        config.cost?.maxExecutorInvocations;
+      if (limit !== undefined) {
+        const current =
+          typeof state.executorInvocations === "number" &&
+          Number.isInteger(state.executorInvocations)
+            ? state.executorInvocations
+            : 0;
+        if (current >= limit) throw new ExecutorCostLimitError(limit, current);
+      }
+    } catch (error) {
+      // 只有成本闸本身抛错才向上传播；读取/配置失败不能阻塞执行器调用（既有语义）。
+      if (error instanceof ExecutorCostLimitError) throw error;
+    }
     try {
       await bumpInvocationCount(
         workspace,
@@ -229,15 +297,21 @@ async function invokeExecutorCore(executor: string, workspace: string, directory
   if (builtin) return invokeBuiltin(builtin, directory, workdir, prompt, permissionMode, maxTurns, timeoutMs, signal);
   const config = await loadConfig(workspace);
   signal?.throwIfAborted();
-  const identity = await inspectExecutorPlugin(executor, workspace, config.plugins);
+  // 安全默认：`.cbx.json` 未显式配置 plugins.enforce 时按 enforce=true 处理（fail-closed）——
+  // 插件路径 = 任意代码执行面，未经路径/SHA 白名单校验的插件默认拒绝加载。显式
+  // `enforce: false` 可显式放行（遗留工作区逃生门），显式 `enforce: true` 维持严格。
+  const pluginPolicy = config.plugins
+    ? { ...config.plugins, defaultEnforce: true }
+    : { defaultEnforce: true };
+  const identity = await inspectExecutorPlugin(executor, workspace, pluginPolicy);
   signal?.throwIfAborted();
-  if (!config.plugins?.enforce) {
-    // 默认不强制插件白名单：显式告警并落审计事件，提醒生产环境启用 plugins.enforce。
-    const warning = `executor 指向插件 ${identity.path}，但 plugins.enforce 未启用，插件未经路径/SHA 白名单校验即被加载；生产环境请配置 plugins.enforce=true 与 allowPaths/allowSha256。`;
+  if (config.plugins?.enforce === false) {
+    // 显式关闭强制：告警并落审计事件，让"跳过白名单"始终可见。
+    const warning = `executor 指向插件 ${identity.path}，但 plugins.enforce=false 已显式关闭白名单校验，插件未经路径/SHA 校验即被加载；生产环境请配置 plugins.enforce=true 与 allowPaths/allowSha256。`;
     console.error(`cbx: ${warning}`);
     appendEvent(path.join(directory, "events.ndjson"), { event: "plugin_policy_warning", executor: identity.name, path: identity.path, sha256: identity.sha256, enforce: false, at: new Date().toISOString() });
   }
-  const request: ExecutorRequest = { directory, workdir, prompt, permissionMode, maxTurns, timeoutMs, executor, plugin: { policy: config.plugins, sha256: identity.sha256 } };
+  const request: ExecutorRequest = { directory, workdir, prompt, permissionMode, maxTurns, timeoutMs, executor, plugin: { policy: pluginPolicy, sha256: identity.sha256 } };
   appendEvent(path.join(directory, "events.ndjson"), { event: "executor_metadata", source: identity.source, name: identity.name, version: identity.version, apiVersion: identity.apiVersion, capabilities: identity.capabilities, sha256: identity.sha256, at: new Date().toISOString() });
   appendEvent(path.join(directory, "events.ndjson"), { event: "plugin_started", executor: identity.name, at: new Date().toISOString() });
   const requestFile = path.join(directory, "plugin-request.json");
@@ -250,7 +324,7 @@ async function invokeExecutorCore(executor: string, workspace: string, directory
     await unlinkIfPresent(requestFile);
     await unlinkIfPresent(resultFile);
     signal?.throwIfAborted();
-    await saveJson(requestFile, request);
+    await saveJson(requestFile, request, { fsync: false });
     signal?.throwIfAborted();
     const processResult = await runProcess(process.execPath, [host, executor, workspace, requestFile, resultFile], workdir, timeoutMs, path.join(directory, "agent.log"), path.join(directory, "active.pid"), signal);
     signal?.throwIfAborted();

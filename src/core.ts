@@ -12,14 +12,14 @@ export { CbxError, isCbxError } from "./errors.js";
 export type { CbxErrorCode } from "./errors.js";
 
 // State management
-export { jobDir, loadState, loadConfig, mergeConfig, writeState, writeApprovalState, logJobEvent, forgetJob, forgetJobKeepWorktree, purgeJob } from "./state.js";
+export { jobDir, loadState, loadConfig, mergeConfig, writeState, writeApprovalState, logJobEvent, forgetJob, forgetJobKeepWorktree, purgeJob, flushJobEventMirrors } from "./state.js";
 export type { ForgetOptions, ForgetResult } from "./state.js";
 
 // Job creation
 export { createJob } from "./jobs.js";
 
 // Artifacts
-export { ARTIFACTS, AUDIT_CANDIDATE, contextArtifacts, contextRedactor, listJobs, readArtifact, readEventsIncremental, listArtifacts, discoverWorkspaces, dedupWorkspaces, listJobsAcrossWorkspaces } from "./artifacts.js";
+export { ARTIFACTS, AUDIT_CANDIDATE, contextArtifacts, contextRedactor, listJobs, listJobsWithAudit, readArtifact, readEventsIncremental, listArtifacts, discoverWorkspaces, dedupWorkspaces, listJobsAcrossWorkspaces } from "./artifacts.js";
 
 // Result writing
 export { writeResult } from "./result.js";

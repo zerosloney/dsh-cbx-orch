@@ -1,10 +1,10 @@
 import type { ServerResponse, IncomingMessage } from "node:http";
-import { open, readFile, stat, writeFile } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { jobDir, listJobs, listQueue, loadState } from "./core.js";
 import { captureAsync } from "./process-runner.js";
 import { parsePidRecordText } from "./pid-guard.js";
-import { constantTimeEqual, eventsAfterCursor, processAlive } from "./storage.js";
+import { constantTimeEqual, eventsAfterCursor, jobEventsAfterCursor, processAlive } from "./storage.js";
 import { TERMINAL_STATUSES } from "./types.js";
 
 /** 校验 token; 未配置 token 时始终放行。常量时间比较避免时序侧信道。
@@ -120,21 +120,47 @@ export interface JobTimeline {
 }
 
 /**
- * 从 events.ndjson 推导阶段时间线。兼容两套事件:
+ * 从事件流推导阶段时间线。兼容两套事件:
  * - 新格式(0.10.2+):job.state_changed 事件携带 status 维度
  * - 老格式(<=0.10.1):stage_started / stage_finished 配对携带 stage 维度
  * 优先用新格式;若不存在则用老格式配对构造。
+ *
+ * 读取源：优先 SQLite events 表（审计权威，执行器不可写）；SQLite 无该 job 事件
+ * （旧任务/镜像缺失）时回退 events.ndjson。
  */
 export async function buildTimeline(
   workspace: string,
   jobId: string,
 ): Promise<JobTimeline> {
-  const eventsFile = path.join(jobDir(workspace, jobId), "events.ndjson");
-  let raw = "";
+  // 先从 SQLite 取事件（审计权威），失败/无数据回退 ndjson。
+  let events: Array<Record<string, unknown>> = [];
   try {
-    raw = await readFile(eventsFile, "utf8");
+    const result = await jobEventsAfterCursor(workspace, jobId, 0, 5000);
+    events = result.rows.map((row) => {
+      const payload = row.payload as Record<string, unknown>;
+      // SQLite payload 与 ndjson 行的结构一致（都含 event/at/...），补 seq 便于排序
+      return { ...payload, seq: row.seq };
+    });
   } catch {
-    /* 任务还没产生事件 */
+    events = [];
+  }
+  if (events.length === 0) {
+    // fallback：ndjson（旧任务无 SQLite 镜像）
+    const eventsFile = path.join(jobDir(workspace, jobId), "events.ndjson");
+    try {
+      const raw = await readFile(eventsFile, "utf8");
+      for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          events.push(JSON.parse(trimmed) as Record<string, unknown>);
+        } catch {
+          /* 跳过坏行 */
+        }
+      }
+    } catch {
+      /* 任务还没产生事件 */
+    }
   }
   const stateChanges: Array<{ status: string; phase?: string; at: string }> =
     [];
@@ -151,15 +177,7 @@ export async function buildTimeline(
     reviewVerdict?: string;
     at: string;
   }> = [];
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let event: Record<string, unknown>;
-    try {
-      event = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
+  for (const event of events) {
     const at = String(event.at ?? "");
     if (
       event.event === "job.state_changed" &&
@@ -315,19 +333,13 @@ export async function readExecutorStatus(
   } catch {
     /* no pid file */
   }
-  // 从 events.ndjson 抓最近一次 process_started 的命令(用于 UI 展示「codebuddy -p ...」)。
+  // 从事件流抓最近一次 process_started 的命令(用于 UI 展示「codebuddy -p ...」)。
+  // 优先 SQLite（审计权威，执行器不可写），fallback ndjson。
   let command: string | null = null;
   try {
-    const raw = await readFile(path.join(dir, "events.ndjson"), "utf8");
-    for (const line of raw.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let event: Record<string, unknown>;
-      try {
-        event = JSON.parse(trimmed);
-      } catch {
-        continue;
-      }
+    const result = await jobEventsAfterCursor(workspace, jobId, 0, 5000);
+    for (const row of result.rows) {
+      const event = row.payload as Record<string, unknown>;
       if (event.event === "process_started" && Array.isArray(event.command)) {
         command = (event.command as unknown[])
           .map((part) => String(part))
@@ -335,7 +347,29 @@ export async function readExecutorStatus(
       }
     }
   } catch {
-    /* no events */
+    /* 无事件 */
+  }
+  if (command === null) {
+    try {
+      const raw = await readFile(path.join(dir, "events.ndjson"), "utf8");
+      for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+        if (event.event === "process_started" && Array.isArray(event.command)) {
+          command = (event.command as unknown[])
+            .map((part) => String(part))
+            .join(" ");
+        }
+      }
+    } catch {
+      /* no events */
+    }
   }
   // P0-2: 暴露累计执行器调用次数 + 配置 maxTurns，让 UI 算出内外 loop 乘数。
   let executorInvocations = 0;
@@ -362,68 +396,6 @@ export async function readExecutorStatus(
     executorInvocations,
     configuredMaxTurns,
     stageInvocations,
-  };
-}
-
-interface AgentLogChunk {
-  content: string;
-  nextOffset: number;
-  truncated: boolean;
-}
-
-/** 增量读 agent.log: since=0 读尾部 maxBytes 初始展示, since>0 按字节游标续读,截到最后一个完整行。
- *  旋转自愈：agent.log 是"追加到 32MB 上限后停止写入"的日志，正常不会变短。但若被手动截断/
- *  轮转（或崩溃恢复重建），磁盘文件可能比客户端上次拿到的游标小——此时按旧游标续读会读到
- *  新文件里无关的字节。做法：把每次返回的 nextOffset 持久化到 <job>/agent.log.cursor，
- *  since>0 且磁盘文件长度小于该游标时判定为"旋转/截断"，回落到尾部重新对齐。cursor 写失败
- *  不阻塞读取（最优努力），退回"since 超长即回落"的旧兜底。 */
-export async function readAgentLogIncremental(
-  workspace: string,
-  jobId: string,
-  since = 0,
-  maxBytes = 256 * 1024,
-): Promise<AgentLogChunk> {
-  const dir = jobDir(workspace, jobId);
-  const file = path.join(dir, "agent.log");
-  const cursorFile = path.join(dir, "agent.log.cursor");
-  let raw: Buffer;
-  try {
-    raw = await readFile(file);
-  } catch {
-    return { content: "", nextOffset: 0, truncated: false };
-  }
-  const tailStart = raw.length > maxBytes ? raw.length - maxBytes : 0;
-  let effectiveSince = since;
-  if (since > 0 && since <= raw.length) {
-    // 续读：校验是否发生了旋转/截断（磁盘比上次游标小）。cursor 读失败（不存在/损坏）
-    // 时按"since 仍在范围内"处理——旧行为；无法确认就不冒险重置。
-    try {
-      const persisted = Number((await readFile(cursorFile, "utf8")).trim());
-      if (Number.isSafeInteger(persisted) && persisted > 0 && raw.length < persisted)
-        effectiveSince = tailStart;
-    } catch {
-      /* no cursor yet */
-    }
-  } else {
-    effectiveSince = tailStart;
-  }
-  const start = since > 0 ? effectiveSince : tailStart;
-  const slice = raw.subarray(start);
-  const text = slice.toString("utf8");
-  // 截到最后一个完整行, 避免半行：末尾是换行则全保留；内部有换行但末尾非换行则退到上一个换行；
-  // 完全无换行（单行/二进制）无法判断半行，全保留交给前端展示。
-  const lastNl = text.lastIndexOf("\n");
-  const end = text.endsWith("\n") || lastNl < 0 ? text.length : lastNl + 1;
-  const content = text.slice(0, end);
-  const nextOffset = start + Buffer.byteLength(content, "utf8");
-  if (since > 0) {
-    // 持久化本次协商出的边界，供下一次续读做旋转自愈。写失败不阻塞读取。
-    await writeFile(cursorFile, String(nextOffset), "utf8").catch(() => undefined);
-  }
-  return {
-    content,
-    nextOffset,
-    truncated: start > 0,
   };
 }
 

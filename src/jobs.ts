@@ -73,6 +73,8 @@ export async function createJob(options: {
   adaptive?: Partial<import("./adaptive-manager.js").AdaptiveOptions>;
   dependencyGuard?: boolean;
   jobId?: string;
+  /** per-job 成本上限覆盖（工具/Web 参数透传；缺省回落 `.cbx.json` 的 cost）。 */
+  cost?: { maxExecutorInvocations?: number };
 }): Promise<{ jobId: string; directory: string }> {
   const workspace = path.resolve(options.workspace);
   if (typeof options.task !== "string" || !options.task.trim())
@@ -211,8 +213,11 @@ export async function createJob(options: {
     dirtyFingerprintVersion: 2,
     dependencyGuard: options.dependencyGuard ?? false,
     contextBudget,
+    cost: options.cost,
   };
-  await saveJson(path.join(directory, "context.json"), context);
+  await saveJson(path.join(directory, "context.json"), context, {
+    fsync: false,
+  });
   const state: JobState = {
     jobId,
     status: "queued",
@@ -226,6 +231,7 @@ export async function createJob(options: {
     configuredMaxTurns: context.maxTurns,
   };
   await savePersistedState(workspace, jobId, state);
-  await saveJson(path.join(directory, "state.json"), state);
+  // 创建期的 state.json 镜像（权威在 SQLite），无需 fsync。
+  await saveJson(path.join(directory, "state.json"), state, { fsync: false });
   return { jobId, directory };
 }

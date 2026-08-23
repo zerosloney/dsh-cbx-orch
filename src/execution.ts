@@ -34,6 +34,7 @@ import { contextRedactor, contextArtifacts } from "./artifacts.js";
 import { prepareWorktree, snapshotDiff, commitWorktree } from "./git-ops.js";
 import { tryMigrateDirtyFingerprintV2 } from "./baseline.js";
 import { assertExecutionPolicy } from "./validation.js";
+import { ExecutorCostLimitError } from "./errors.js";
 import {
   createHumanGate,
   parseHumanGate,
@@ -500,6 +501,24 @@ async function executeJobLocked(
             });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        // 成本硬闸：adaptive manager 调用已达上限——转 needs_fix + human gate。
+        if (error instanceof ExecutorCostLimitError) {
+          adaptiveRounds = [
+            ...adaptiveRounds,
+            { round, action: "error", phase: "cost_limit", error: message },
+          ];
+          return finish({
+            status: "needs_fix",
+            phase: "cost_limit",
+            adaptiveRound: round,
+            adaptiveRounds,
+            error: message,
+            humanGate: createHumanGate("needs_input", {
+              detail: message,
+              questions: ["提高 max_executor_invocations 后继续，或取消任务。"],
+            }),
+          });
+        }
         const phase =
           error instanceof ManagerWorktreeMutationError
             ? "adaptive_manager_safety"
@@ -918,7 +937,9 @@ async function prepareContinuationUnlocked(
       context.adaptive.maxRounds,
       extraRounds,
     );
-    await saveJson(path.join(directory, "context.json"), context);
+    await saveJson(path.join(directory, "context.json"), context, {
+      fsync: false,
+    });
   } else if (extraRounds) {
     throw new Error("extra_rounds 只能用于 max_rounds Human Gate。");
   }

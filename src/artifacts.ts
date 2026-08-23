@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { listPersistedStates, redactText, type RuntimeConfig } from "./storage.js";
+import { listPersistedStates, redactText, jobEventsAfterCursor, verifyJobAudit, type RuntimeConfig } from "./storage.js";
 import { jobDir } from "./state.js";
 import { CbxError } from "./errors.js";
 import type { JobState, JobContext } from "./types.js";
@@ -18,9 +18,49 @@ export function contextRedactor(governance?: RuntimeConfig["governance"]): (text
   return text => redactText(text, governance?.redactFields, governance?.redactPatterns);
 }
 
-export async function listJobs(workspaceInput: string): Promise<JobState[]> {
+/** 列出持久化任务状态（按 updated_at 倒序）。`limit`/`offset` 分页可选：
+ *  缺省返回全量（保持向后兼容）；分页用于大工作区避免每次全表扫描。 */
+export async function listJobs(
+  workspaceInput: string,
+  options: { limit?: number; offset?: number } = {},
+): Promise<JobState[]> {
   const workspace = path.resolve(workspaceInput);
-  return listPersistedStates<JobState>(workspace);
+  return listPersistedStates<JobState>(workspace, options);
+}
+
+/** 终态集合：审计完整性富化只对终态 job 做（非终态无审计结果）。 */
+const TERMINAL_FOR_AUDIT: ReadonlySet<string> = new Set([
+  "done",
+  "failed",
+  "review_failed",
+  "cancelled",
+]);
+
+/**
+ * 列出任务并富化审计完整性（`__audit` 字段）：仅对终态且 SQLite 有镜像锚点的 job
+ * 执行 verifyJobAudit（每 job 一次 SQLite 查询 + 一次 ndjson 读）。非终态/旧任务
+ * （无镜像）不附 `__audit`。供 cbx_list 工具与 Web 仪表盘共用。
+ */
+export async function listJobsWithAudit(
+  workspaceInput: string,
+  options: { limit?: number; offset?: number } = {},
+): Promise<JobState[]> {
+  const workspace = path.resolve(workspaceInput);
+  const jobs = await listPersistedStates<JobState>(workspace, options);
+  return Promise.all(
+    jobs.map(async (job) => {
+      if (!TERMINAL_FOR_AUDIT.has(String(job.status ?? ""))) return job;
+      try {
+        const audit = await verifyJobAudit(workspace, job.jobId);
+        if (audit.sqliteCount && audit.sqliteCount > 0) {
+          return { ...job, __audit: audit };
+        }
+      } catch {
+        /* 验证失败跳过 */
+      }
+      return job;
+    }),
+  );
 }
 
 /**
@@ -94,9 +134,48 @@ export async function readArtifact(workspaceInput: string, jobId: string, artifa
 }
 
 export async function readEventsIncremental(workspaceInput: string, jobId: string, since = 0): Promise<{ events: string[]; next_offset: number }> {
-  // intentional-simple: 行级游标 + 逐行 JSON.parse 校验。events.ndjson 单 job 最多几百行，O(n) 扫描无压力。
-  // worker 用 appendFileSync 追加；并发写入时最后一条可能截断，parse 失败则停在此处，下次调用补齐。
-  const raw = await readArtifact(workspaceInput, jobId, "events.ndjson");
+  // 优先 SQLite events 表（审计权威，执行器不可写）：按 job_id 过滤 + seq 游标增量读。
+  // 镜像缺失（旧任务）时回退 events.ndjson 行级扫描。返回行以 JSON 字符串呈现，
+  // 与 ndjson 行形态一致（调用方无需区分来源）。
+  //
+  // 游标语义：jobEventsAfterCursor 用 `seq > cursor`，因此 next_offset 必须等于
+  // "已读的最后一条 seq"（而非 +1）——job 事件在 workspace 全局 seq 中是稀疏的
+  // （混有其它 job / 工作区事件），lastSeq+1 与 lastSeq 之间若恰好有本 job 事件
+  // （seq == lastSeq+1），`seq > lastSeq+1` 会漏掉它。
+  const workspace = path.resolve(workspaceInput);
+  try {
+    const result = await jobEventsAfterCursor(workspace, jobId, since, 1000);
+    const lines = result.rows.map((row) => JSON.stringify(row.payload));
+    if (lines.length === 0) {
+      // 该 job 在 SQLite 中是否从未镜像过（旧任务 v6 前创建）：是则回退 ndjson
+      // 行游标（支持增量续读）；SQLite 有历史但 since 之后无新增 = 正常空。
+      const probe = await jobEventsAfterCursor(workspace, jobId, 0, 1);
+      if (probe.rows.length === 0) {
+        const ndjson = await readNdjsonEventsIncremental(workspaceInput, jobId, since);
+        if (ndjson.events.length > 0 || since > 0) return ndjson;
+      }
+    }
+    const nextOffset = result.rows.at(-1)?.seq ?? since;
+    return { events: lines, next_offset: nextOffset };
+  } catch {
+    // fallback：ndjson（镜像查询异常）
+    const ndjson = await readNdjsonEventsIncremental(workspaceInput, jobId, since);
+    return { events: ndjson.events, next_offset: ndjson.next_offset };
+  }
+}
+
+/** 读取 job 的 events.ndjson（行游标增量）：`since` 为上次的行偏移。文件缺失返回空。 */
+async function readNdjsonEventsIncremental(
+  workspaceInput: string,
+  jobId: string,
+  since: number,
+): Promise<{ events: string[]; next_offset: number }> {
+  let raw: string;
+  try {
+    raw = await readArtifact(workspaceInput, jobId, "events.ndjson");
+  } catch {
+    return { events: [], next_offset: since };
+  }
   const lines = raw.split("\n");
   const events: string[] = [];
   let offset = since;

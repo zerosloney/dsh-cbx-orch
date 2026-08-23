@@ -13,6 +13,7 @@ tr.job.selected{background:#1c2840;border-left:3px solid #9ecbff}
 .job-select:focus-visible,.art:focus-visible{outline:2px solid #9ecbff;outline-offset:2px}
 .s-done{color:#70e090}.s-failed,.s-needs_fix,.s-review_failed{color:#ff8d8d}.s-running,.s-awaiting_approval{color:#ffd166}.s-queued{color:#9ecbff}.s-cancelled{color:#888}
 .v-PASS{color:#70e090;font-weight:bold}.v-FAIL{color:#ff8d8d;font-weight:bold}
+.audit-ok{color:#70e090;font-weight:bold}.audit-tampered{color:#ff5d5d;font-weight:bold}.audit-na{color:#666}
 #detail-panel{margin-top:16px;background:#0d1117;border-radius:8px;padding:14px;border:1px solid #2a3140;min-height:80px}
 .hint{color:#555}
 .stages{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;align-items:center}

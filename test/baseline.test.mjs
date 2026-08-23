@@ -5,10 +5,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { tryMigrateDirtyFingerprintV2 } from "../lib/baseline.js";
+import { closeDatabaseConnections } from "../lib/storage.js";
+import { flushJobEventMirrors } from "../lib/state.js";
 
 const repos = [];
 
-after(() => {
+after(async () => {
+  // logJobEvent 现在会 fire-and-forget 镜像 SQLite（审计权威），测试结束时可能
+  // 仍有异步写入在途——先排空镜像、关连接释放句柄，再删目录（Windows 文件锁）。
+  await flushJobEventMirrors();
+  await closeDatabaseConnections();
   for (const dir of repos) rmSync(dir, { recursive: true, force: true });
 });
 

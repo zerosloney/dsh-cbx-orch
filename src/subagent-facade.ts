@@ -45,7 +45,7 @@ export type CbxSubagentDescriptorData = {
  * 背景：cbx 委派运行外部编码 CLI（opencode/codebuddy/...），经 jobs-bridge 注册为
  * harness 原生后台任务（`ctx.jobs`），所以只出现在该页的「后台任务」区。子代理目录
  * 只认 `origin:'subagent'` 的会话 + `subagent/descriptor` 事件 —— 此前 cbx 任务永远
- * 进不了前台子代理树（docs/alignment.md §4.3 的既有边界）。
+ * 进不了前台子代理树（子代理目录只认真实 harness 子会话的既有边界）。
  *
  * 本模块实现该边界上的薄层：
  * - 用 `ctx.sessions.prepare/enter/announce` 创建镜像会话（header: origin='subagent'、
@@ -59,7 +59,7 @@ export type CbxSubagentDescriptorData = {
  * 与 jobs-bridge 的关系：两条通道并存、互不干扰——桥接「后台任务」，外观层接
  * 「前台子代理树」。任一失败都不影响 cbx 本体执行。
  *
- * 已知边界（沿用 alignment.md §4.3 的权衡）：镜像会话没有真实 harness agent，
+ * 已知边界（镜像外观层的固有权衡）：镜像会话没有真实 harness agent，
  * 因此不可冷恢复/续跑（one-shot 镜像）；运行期间的状态灯由服务端目录对 live
  * 子会话统一标 running，终态后靠 detach 转 inactive。
  */

@@ -189,7 +189,16 @@ function rowHtml(j){
   // 终态显示 totalSeconds,非终态用 createdAt 实时算 elapsed。
   var terminal=['done','failed','review_failed','cancelled','needs_fix'].indexOf(j.status)>=0;
   var elapsed = terminal && j.totalSeconds != null ? (j.totalSeconds < 60 ? j.totalSeconds + 's' : Math.floor(j.totalSeconds/60) + 'm ' + (j.totalSeconds%60) + 's') : fmtElapsed(j.createdAt);
-  return '<tr class="'+cls+'" data-id="'+esc(j.jobId)+'" data-created="'+esc(j.createdAt||'')+'" data-terminal="'+terminal+'"><td><button type="button" class="job-select">'+esc(j.jobId)+'</button></td><td class="s-'+esc(j.status)+'">'+esc(j.status)+'</td><td>'+esc(j.phase||'')+'</td><td>'+esc(String(j.attempt))+'</td><td class="v-'+esc(j.reviewVerdict||'')+'">'+esc(j.reviewVerdict||'—')+'</td><td class="elapsed">'+elapsed+'</td><td>'+esc(fmt(j.updatedAt))+'</td></tr>';
+  // 审计完整性徽标：__audit.tampered → 篡改!；__audit.valid → ✓；否则 —。
+  var audit = auditBadge(j.__audit);
+  return '<tr class="'+cls+'" data-id="'+esc(j.jobId)+'" data-created="'+esc(j.createdAt||'')+'" data-terminal="'+terminal+'"><td><button type="button" class="job-select">'+esc(j.jobId)+'</button></td><td class="s-'+esc(j.status)+'">'+esc(j.status)+'</td><td>'+esc(j.phase||'')+'</td><td>'+esc(String(j.attempt))+'</td><td class="v-'+esc(j.reviewVerdict||'')+'">'+esc(j.reviewVerdict||'—')+'</td><td class="elapsed">'+elapsed+'</td><td class="audit '+audit.cls+'">'+audit.text+'</td><td>'+esc(fmt(j.updatedAt))+'</td></tr>';
+}
+// 审计完整性徽标：篡改!（红色）/ ✓（绿色）/ —（灰色）。__audit 来自后端富化。
+function auditBadge(a){
+  if(!a)return {text:'—',cls:'audit-na'};
+  if(a.tampered)return {text:'篡改!',cls:'audit-tampered'};
+  if(a.valid)return {text:'✓',cls:'audit-ok'};
+  return {text:'—',cls:'audit-na'};
 }
 function selectJob(id){
   selected=(selected===id)?null:id;
@@ -295,6 +304,12 @@ async function loadTab(id,tab,panelsEl,result){
       var html='';
       if(result){
         html+='<div><b>状态：</b>'+esc(result.status||'—')+'</div>';
+        // 审计完整性：result.auditIntegrity（终态时 ndjson vs SQLite 镜像一致性校验）。
+        if(result.auditIntegrity){
+          var ai=result.auditIntegrity;
+          var badge=ai.tampered?'<b style="color:#ff5d5d">篡改!</b> 事件日志与 SQLite 镜像不一致（执行器可能篡改了 events.ndjson）':(ai.valid?'<b style="color:#70e090">✓ 审计完整</b>':'<span style="color:#888">无法验证</span>');
+          html+='<div style="margin-top:6px"><b>审计完整性：</b>'+badge+(typeof ai.ndjsonCount==='number'?' <span style="color:#888">('+ai.ndjsonCount+' 事件)</span>':'')+'</div>';
+        }
         if(result.handback)html+='<pre class="art-view" style="display:block;max-height:240px">'+esc(result.handback)+'</pre>';
         if(result.evidenceArtifacts)html+='<div style="margin-top:6px;color:#888">证据刷新在 Diff / Test / Review 选项卡。</div>';
       } else {

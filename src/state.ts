@@ -17,6 +17,9 @@ import {
   now,
   redactText,
   withQueueLock,
+  nextEventSeq,
+  insertEvent,
+  recordEventMirrorFailure,
   type RuntimeConfig,
 } from "./storage.js";
 import { assertJobId } from "./validation.js";
@@ -31,6 +34,55 @@ const JOB_EVENTS_ROTATE_BYTES = 10 * 1024 * 1024;
 
 /** 事件流写入失败只告警一次：持续刷屏会淹没真正的日志，但首次失败必须留痕。 */
 let logJobEventWriteWarned = false;
+
+/** job 级事件的 SQLite 镜像链（按 workspace 串行化，保证与 ndjson 同序）。
+ *  SQLite events 表是执行器子进程无法写入的审计权威：ndjson 可被不可信执行器
+ *  篡改，镜像表不可——读取面（timeline/崩溃原因/增量）以 SQLite 为准。 */
+const jobEventMirrorChains = new Map<string, Promise<void>>();
+const jobEventMirrorWarned = new Set<string>();
+
+/** fire-and-forget 把一条 job 级事件镜像进 SQLite events 表（带 job_id）。
+ *  失败不阻塞主流程（ndjson 仍落盘），但计数告警——镜像缺失意味着审计权威
+ *  与 ndjson 漂移，值得排查。 */
+export function mirrorJobEventToSqlite(
+  workspace: string,
+  jobId: string,
+  event: string,
+  detail: Record<string, unknown>,
+): void {
+  const chainKey = `${workspace}::job-events`;
+  const previous = jobEventMirrorChains.get(chainKey) ?? Promise.resolve();
+  const current = previous
+    .catch(() => undefined)
+    .then(async () => {
+      try {
+        const seq = await nextEventSeq(workspace);
+        const payload = { event, jobId, ...detail, at: now() };
+        await insertEvent(workspace, seq, event, payload, jobId);
+      } catch (error) {
+        recordEventMirrorFailure(workspace);
+        if (!jobEventMirrorWarned.has(chainKey)) {
+          jobEventMirrorWarned.add(chainKey);
+          console.error(
+            `cbx: job 事件 SQLite 镜像写入失败（审计权威与 ndjson 漂移，执行器可篡改 ndjson）：${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    });
+  jobEventMirrorChains.set(chainKey, current);
+  void current.finally(() => {
+    if (jobEventMirrorChains.get(chainKey) === current)
+      jobEventMirrorChains.delete(chainKey);
+  });
+}
+
+/** 等待全部 job 事件 SQLite 镜像写入排空（测试/关闭用）。关闭数据库连接前调用，
+ *  避免在途镜像因连接关闭而丢失审计记录。 */
+export async function flushJobEventMirrors(): Promise<void> {
+  while (jobEventMirrorChains.size > 0) {
+    await Promise.allSettled([...jobEventMirrorChains.values()]);
+  }
+}
 
 /** 把降级路径的失败原因落到 job 事件流，避免裸吞导致排障无据。 */
 export function logJobEvent(
@@ -66,6 +118,8 @@ export function logJobEvent(
     } finally {
       closeSync(fd);
     }
+    // SQLite 镜像（审计权威）：fire-and-forget，失败不阻塞 ndjson 落盘。
+    mirrorJobEventToSqlite(workspace, jobId, event, detail);
     logJobEventWriteWarned = false;
   } catch (error) {
     if (!logJobEventWriteWarned) {
@@ -322,7 +376,10 @@ async function mirrorStateFile(
   state: JobState,
 ): Promise<void> {
   try {
-    await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state);
+    // state.json 是 SQLite 的镜像：进程崩溃后可重建，无需承担 fsync 写放大。
+    await saveJson(path.join(jobDir(workspace, jobId), "state.json"), state, {
+      fsync: false,
+    });
   } catch (error) {
     logJobEvent(workspace, jobId, "state_mirror_write_failed", {
       error: error instanceof Error ? error.message : String(error),

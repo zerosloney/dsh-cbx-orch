@@ -5,6 +5,7 @@ import { approveJob } from "./approval.js";
 import {
   listArtifacts,
   listJobs,
+  listJobsWithAudit,
   readArtifact,
 } from "./artifacts.js";
 import type { JobState } from "./types.js";
@@ -19,7 +20,7 @@ import {
   retryQueueJob,
 } from "./queue-api.js";
 import { runReviewGate } from "./review-gate.js";
-import { readAgentLogIncremental } from "./ui.js";
+import { readAgentLogIncremental } from "./log-tail.js";
 import { bridgeCbxJob, tailAgentLog, type CbxBridgeResult } from "./jobs-bridge.js";
 import { publishCbxFacade, type CbxFacadeResult } from "./subagent-facade.js";
 import {
@@ -31,9 +32,18 @@ import {
   type RouteDecision,
 } from "./executor-router.js";
 import { loadHealth } from "./executor-health.js";
+import { buildTierCatalog } from "./executor-catalog.js";
+import {
+  IDEMPOTENCY_KEY_MAX_LENGTH,
+  abortIdempotentCreate,
+  beginIdempotentCreate,
+  commitIdempotentCreate,
+  hashIdempotentRequest,
+} from "./idempotency.js";
 import { probeAllExecutors, resolveExecutor } from "./executors/builtin.js";
 import { formatTaskList } from "./format.js";
 import { forgetJobKeepWorktree, jobDir, loadConfig, loadState, mergeConfig, purgeJob } from "./state.js";
+import { verifyJobAudit } from "./storage.js";
 import { buildSessionMessage, progressLine } from "./session-message.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
 
@@ -242,22 +252,32 @@ function healthSummary(h?: Record<string, unknown>): string {
   return `${s}/${f}${flag}${lat}`;
 }
 
-/** cbx_executors 的可读渲染：本机 agent CLI 探测表格（含能力/成本速度/健康度）+ 路由提示。 */
+/** cbx_executors 的可读渲染：本机 agent CLI 探测表格（含能力/档位出处/健康度）+ 覆盖告警。 */
 function renderExecutors(_args: Record<string, unknown>, value: unknown): ContentBlock[] {
-  const probes = Array.isArray(value) ? value : [];
+  const v = (value && typeof value === "object" && !Array.isArray(value) ? value : {}) as Record<string, unknown>;
+  const probes = Array.isArray(v.executors) ? v.executors : [];
   const lines: string[] = [];
   lines.push("本机编码 agent CLI（cbx 执行器探测）:");
   lines.push("");
-  lines.push("| Executor | Avail | Source | Capabilities | Cost/Spd | Health(s/f) | Command |");
-  lines.push("|----------|-------|--------|--------------|-----------|-------------|---------|");
+  lines.push("| Executor | Avail | Source | Capabilities | Cost/Spd(出处) | Health(s/f/样本) | Command |");
+  lines.push("|----------|-------|--------|--------------|----------------|------------------|---------|");
   for (const probe of probes) {
     const p = (probe && typeof probe === "object" ? probe : {}) as Record<string, unknown>;
+    const tiers = (p.tiers ?? null) as Record<string, unknown> | null;
+    const costSrc = String(tiers?.costSource ?? "—");
+    const spdSrc = String(tiers?.speedSource ?? "—");
+    const samples = tiers && typeof tiers.samples === "number" ? tiers.samples : "—";
     lines.push(
-      `| ${String(p.name ?? "—").padEnd(8)} | ${String(p.available ? "yes" : "no").padEnd(5)} | ${String(p.source ?? "—").padEnd(6)} | ${String(capSummary(p.capabilities as Record<string, unknown>)).padEnd(12)} | ${String(`${p.costTier ?? "—"}/${p.speedTier ?? "—"}`).padEnd(9)} | ${String(healthSummary(p.health as Record<string, unknown>)).padEnd(11)} | ${String(p.command ?? "—")} |`,
+      `| ${String(p.name ?? "—").padEnd(8)} | ${String(p.available ? "yes" : "no").padEnd(5)} | ${String(p.source ?? "—").padEnd(6)} | ${String(capSummary(p.capabilities as Record<string, unknown>)).padEnd(12)} | ${String(`${p.costTier ?? "—"}/${p.speedTier ?? "—"} (${costSrc}/${spdSrc}, n=${samples})`).padEnd(14)} | ${String(healthSummary(p.health as Record<string, unknown>)).padEnd(16)} | ${String(p.command ?? "—")} |`,
     );
   }
+  const tierWarnings = Array.isArray(v.tierWarnings) ? (v.tierWarnings as string[]) : [];
+  if (tierWarnings.length > 0) {
+    lines.push("");
+    for (const warning of tierWarnings) lines.push(`⚠ ${warning}`);
+  }
   lines.push("");
-  lines.push("cbx_run 未指定 executor 时按策略路由（先过滤不满足需求的执行器，再打分选最优）；显式指定但未安装会自动回退并注明。");
+  lines.push("cbx_run 未指定 executor 时按策略路由（先过滤不满足需求的执行器，再打分选最优）；显式指定但未安装会自动回退并注明。速度/成本档出处：measured=实测校准、configured=人工覆盖、declared=声明估值。");
   return jsonContent(lines.join("\n"));
 }
 
@@ -322,7 +342,11 @@ function runJobOutput(args: Record<string, unknown>, value: unknown): ContentBlo
     taskList: Array.isArray(v.__taskList) ? (v.__taskList as JobState[]) : undefined,
     jobDir: typeof v.__jobDir === "string" ? v.__jobDir : undefined,
   });
-  return jsonContent(withDashboardFooter(text, ws));
+  // 幂等命中：显式告知没有重复创建，避免调用方误以为新任务已入队。
+  const body = v.deduplicated === true
+    ? `幂等键命中（deduplicated=true）：未创建新任务，返回既有任务。需要重跑请用 cbx_retry。\n\n${text}`
+    : text;
+  return jsonContent(withDashboardFooter(body, ws));
 }
 
 export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
@@ -365,6 +389,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       keep_worktree: { type: "boolean", description: "Keep the isolated worktree on completion." },
       review_rules: { type: "string", description: "Review focus instructions." },
       review_executor: { type: "string", description: "Executor for the review phase (defaults to executor)." },
+      max_executor_invocations: { type: "integer", description: "Per-job hard cap on total executor invocations (stage + review + manager + gate). Reaching it pauses the job as needs_fix/cost_limit with a human gate instead of burning more quota. Defaults to .cbx.json cost.maxExecutorInvocations; unset = no cap." },
+      idempotency_key: { type: "string", description: "Optional dedup key: retrying cbx_run with the same key and the same payload returns the existing job instead of creating a duplicate (same key + different payload is rejected). A failed creation releases the reservation so a retry truly re-runs." },
     },
     output: {
       schema: { type: "json" },
@@ -373,6 +399,14 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     async execute(args, exec) {
       const ws = await workspaceOf(args.workspace, exec);
       const config = await loadConfig(ws);
+      // 幂等键（可选）：同键同载荷返回既有任务，同键不同载荷显式拒绝。
+      // 校验前置——坏键在路由/探测之前就失败，不浪费探测也不留半截状态。
+      const idempotencyKey =
+        typeof args.idempotency_key === "string" ? args.idempotency_key.trim() : undefined;
+      if (args.idempotency_key !== undefined && !idempotencyKey)
+        throw new Error("idempotency_key 提供时必须是非空字符串。");
+      if (idempotencyKey && idempotencyKey.length > IDEMPOTENCY_KEY_MAX_LENGTH)
+        throw new Error(`idempotency_key 超过 ${IDEMPOTENCY_KEY_MAX_LENGTH} 字符上限。`);
       // 路由：先探测本机已安装的 agent CLI，再把委派路由到可用执行器。
       // - 未指定 / "auto" → 按 preference 选第一个已安装；
       // - 显式指定但未安装 → 自动回退到可用 CLI（reason 说明）；
@@ -400,11 +434,20 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       const strategy = (args.routing_strategy ??
         config.routingStrategy ??
         "first-available") as ExecutorStrategy;
+      // 档位目录：实测校准（样本足够时）+ executorTiers 人工覆盖 + 出处标注。
+      // 覆盖表里的未知执行器名必须响亮告警——错字静默失效正是这层要消灭的。
+      const workspaceHealth = loadHealth(ws);
+      const { catalog: tierCatalog, warnings: tierWarnings } =
+        buildTierCatalog(workspaceHealth, config.executorTiers);
+      for (const warning of tierWarnings) {
+        bridgeLog(`cbx 档位目录：${warning}`);
+      }
       const decision = routeExecutor(args.executor ?? config.executor ?? defaults.executor, {
         preference: args.executor_preference ?? config.executorPreference,
         requirements,
         strategy,
-        health: loadHealth(ws),
+        health: workspaceHealth,
+        tierCatalog,
       });
       if (!decision.executor) throw noExecutorError(decision.available);
       if (decision.routed) {
@@ -427,7 +470,9 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         executor: decision.executor,
         reviewExecutor: args.review_executor,
       });
-      const created = await createJob({
+      // 创建参数单点构造：幂等指纹与 createJob 用同一个对象，保证"同请求"判定
+      // 与实际创建内容永远一致（不会出现指纹说 A、创建的是 B 的漂移）。
+      const jobOptions = {
         workspace: ws,
         task: args.task,
         testCommand: merged.testCommand,
@@ -450,7 +495,49 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
         adaptive: merged.adaptive,
         trustMode: merged.trustMode,
         dependencyGuard: merged.dependencyGuard,
-      });
+        cost: args.max_executor_invocations === undefined
+          ? undefined
+          : { maxExecutorInvocations: Number(args.max_executor_invocations) },
+      };
+      if (idempotencyKey) {
+        const outcome = await beginIdempotentCreate(
+          ws,
+          idempotencyKey,
+          hashIdempotentRequest(jobOptions),
+        );
+        if (outcome.kind === "conflict") {
+          throw new Error(
+            `幂等键 "${idempotencyKey}" 已用于不同的创建请求（预留于 ${outcome.createdAt}）。请换一个键，或省略 idempotency_key。`,
+          );
+        }
+        if (outcome.kind === "in-flight") {
+          throw new Error(
+            `幂等键 "${idempotencyKey}" 的同名创建正在进行中（${outcome.createdAt}），未重复创建。若确认上次已失败可稍后重试或换键。`,
+          );
+        }
+        if (outcome.kind === "duplicate") {
+          // 命中既有任务：不重复创建/入队/挂桥（原调用方已持有跟踪通道）。
+          bridgeLog(
+            `cbx 幂等命中：任务 ${outcome.jobId} 已存在（状态 ${outcome.status ?? "unknown"}），本次未重复创建。需要重跑请用 cbx_retry。`,
+          );
+          return toJson({
+            job_id: outcome.jobId,
+            status: outcome.status ?? "unknown",
+            deduplicated: true,
+            __router: decision,
+            __jobDir: jobDir(ws, outcome.jobId),
+          });
+        }
+      }
+      let created;
+      try {
+        created = await createJob(jobOptions);
+      } catch (error) {
+        // 失败释放预留：不留毒键，同键重试可以真正重跑。
+        if (idempotencyKey) await abortIdempotentCreate(ws, idempotencyKey);
+        throw error;
+      }
+      if (idempotencyKey) await commitIdempotentCreate(ws, idempotencyKey, created.jobId);
       await startBackground(ws, created.jobId, "", 0);
       // 创建时的路由决策视图（RouteDecision 的最小 JSON 视图）：桥首轮快照/终态摘要
       // 与前台子代理镜像首条消息都据此显示「委派给了谁、为什么」——路由决策不再
@@ -525,6 +612,14 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       } catch {
         /* result.json 尚未生成（排队/运行中）：富化字段缺省即可 */
       }
+      // 审计完整性：终态 job 验证 events.ndjson 是否与 SQLite 镜像一致（检测执行器篡改）。
+      // best-effort：验证失败不阻塞状态读取。
+      try {
+        const audit = await verifyJobAudit(ws, args.job_id);
+        enriched.__audit = audit;
+      } catch {
+        /* 审计验证不可用（非终态/镜像缺失）：跳过 */
+      }
       return toJson(clampJson(enriched));
     },
   }));
@@ -540,7 +635,10 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       render: renderJobList,
     },
     async execute(args, exec) {
-      return toJson(await listJobs(await workspaceOf(args.workspace, exec)));
+      const ws = await workspaceOf(args.workspace, exec);
+      // 审计完整性富化（listJobsWithAudit）：终态 job 附 __audit（ndjson vs SQLite 镜像）。
+      const jobs = await listJobsWithAudit(ws);
+      return toJson(clampJson(jobs));
     },
   }));
 
@@ -597,6 +695,12 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       const ws = args.workspace ? await workspaceOf(args.workspace, exec) : undefined;
       const probes = probeAllExecutors();
       const health = ws ? loadHealth(ws) : {};
+      // 档位目录：无 workspace 时按空健康度构建（全部 declared 估值，如实标注）；
+      // 有 workspace 时展示实测校准/人工覆盖后的有效档位与出处。覆盖表未知名
+      // 以 tierWarnings 结构化返回（fail-closed：错字不可静默消失）。
+      const config = ws ? await loadConfig(ws) : {};
+      const { catalog: tierCatalog, warnings: tierWarnings } =
+        buildTierCatalog(health, config.executorTiers);
       const enriched = probes.map((p) => {
         const spec = resolveExecutor(p.name);
         return {
@@ -604,12 +708,19 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
           capabilities: spec?.capabilities ?? null,
           costTier: spec?.costTier ?? null,
           speedTier: spec?.speedTier ?? null,
+          // 有效档位视图：declared=声明估值 / measured=实测校准 / configured=人工覆盖。
+          tiers: tierCatalog[p.name] ?? null,
           // 无健康度记录的 workspace 上 health 为 undefined，会导致工具返回值
           // 不是无损 JSON（harness 拒绝）；用 null 兜底保证可序列化。
           health: health[p.name] ?? null,
         };
       });
-      return toJson(clampJson(enriched));
+      return toJson(
+        clampJson({
+          executors: enriched,
+          ...(tierWarnings.length > 0 ? { tierWarnings } : {}),
+        }),
+      );
     },
   }));
 

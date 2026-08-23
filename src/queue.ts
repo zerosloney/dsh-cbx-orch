@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { readFile, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { acquireServiceLease, forceReleaseOwnLock, loadPersistedQueue, now, processAlive, savePersistedQueue, withQueueLock } from "./storage.js";
+import { acquireServiceLease, forceReleaseOwnLock, jobEventsAfterCursor, loadPersistedQueue, now, processAlive, savePersistedQueue, withQueueLock } from "./storage.js";
 import { isCbxError } from "./errors.js";
 import { logJobEvent } from "./state.js";
 import { terminateTree } from "./process-runner.js";
@@ -51,8 +51,23 @@ async function saveQueue(workspace: string, queue: QueueFile): Promise<void> {
 }
 
 /** 从 job 事件流里取最近一条 worker_crash 的 error，供熔断/失败信息携带真实根因。
- *  事件文件不存在、为空或全为坏行时返回占位文案而非抛错——诊断信息不应让调度失败。 */
-async function lastWorkerCrashReason(directory: string): Promise<string> {
+ *  优先 SQLite events 表（审计权威，执行器不可写）；镜像缺失时回退 events.ndjson。
+ *  事件不存在、为空或全为坏行时返回占位文案而非抛错——诊断信息不应让调度失败。 */
+async function lastWorkerCrashReason(
+  workspace: string,
+  jobId: string,
+  directory: string,
+): Promise<string> {
+  // SQLite 优先：worker_crash 由 worker 进程（编排器侧）写 logJobEvent，镜像到 events 表。
+  try {
+    const result = await jobEventsAfterCursor(workspace, jobId, 0, 5000);
+    for (let i = result.rows.length - 1; i >= 0; i--) {
+      const event = result.rows[i].payload as { event?: string; error?: string };
+      if (event.event === "worker_crash" && event.error) return event.error;
+    }
+  } catch {
+    /* 镜像不可用，走 ndjson */
+  }
   const scan = async (file: string): Promise<string | undefined> => {
     let raw: string;
     try {
@@ -165,6 +180,8 @@ export async function dispatchQueue(runtime: QueueRuntime, workspaceInput: strin
             // 错误信息携带最近一条 worker_crash 的真实根因，而不是笼统的"反复无法
             // 恢复"——否则像"isolated 要求 Git 仓库"这类可修复错误会被淹没在事件流里。
             const rootCause = await lastWorkerCrashReason(
+              workspace,
+              entry.jobId,
               runtime.jobDir(workspace, entry.jobId),
             );
             entry.status = "failed";

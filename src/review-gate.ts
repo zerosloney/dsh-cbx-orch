@@ -35,6 +35,13 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
   const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
   const permissionMode = options.permissionMode ?? config.permissionMode ?? "default";
   const failOpen = options.failOpen ?? config.reviewGate?.failOpen === true;
+  // 无未提交改动 → 直接 SKIP，**先于执行器解析**：clean 工作区根本不需要拉起审查
+  // 执行器（本机无可用 CLI 时也应返回 SKIP 而非报"执行器不可用"——没有东西要审）。
+  const snapshot = await snapshotDiff(workspace);
+  options.signal?.throwIfAborted();
+  if (!snapshot.status.trim() && !snapshot.complete.trim()) {
+    return { pass: true, reason: "无未提交改动，跳过 review", review: "", verdict: "SKIP" };
+  }
   // stop-gate 执行器执行期解析：配置的 executor 未安装时回退到可用 CLI，而不是让
   // hook 直接 fail-closed 卡住会话停止；路由说明追加到结果 reason，用户可见。
   const requestedExecutor = options.executor ?? config.executor ?? "codebuddy";
@@ -43,12 +50,6 @@ export async function runReviewGate(workspaceInput: string, options: { executor?
     health: loadHealth(workspace),
   });
   const executor = gateRoute.name;
-
-  const snapshot = await snapshotDiff(workspace);
-  options.signal?.throwIfAborted();
-  if (!snapshot.status.trim() && !snapshot.complete.trim()) {
-    return { pass: true, reason: "无未提交改动，跳过 review", review: "", verdict: "SKIP" };
-  }
 
   // mkdtemp 临时目录不会被 OS 自动回收（Windows 尤甚），跑完即删；清理失败不掩盖审查结果。
   const directory = await mkdtemp(path.join(os.tmpdir(), "cbx-review-gate-"));

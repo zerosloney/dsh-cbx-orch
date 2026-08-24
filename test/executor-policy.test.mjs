@@ -26,10 +26,20 @@ function makeWorkspace() {
 
 test("默认策略（无 plugins 配置）: 路径穿越被拒", async () => {
   const workspace = makeWorkspace();
-  await assert.rejects(
-    () => inspectExecutorPlugin("../outside.mjs", workspace, {}),
-    /插件路径必须位于工作区内/,
-  );
+  // 在工作区**外**（tmpdir）创建真实文件：realpath 能成功解析到工作区外，才触发
+  // 路径穿越拒绝。旧测试只传 "../outside.mjs"（文件不存在），Linux 上 realpath 先抛
+  // ENOENT，与期望的"插件路径必须位于工作区内"不符（Windows 碰巧解析到存在的上级
+  // 目录才通过）。
+  const outside = path.join(tmpdir(), "cbx-executor-policy-outside.mjs");
+  writeFileSync(outside, PLUGIN_SOURCE, "utf8");
+  try {
+    await assert.rejects(
+      () => inspectExecutorPlugin("../cbx-executor-policy-outside.mjs", workspace, {}),
+      /插件路径必须位于工作区内/,
+    );
+  } finally {
+    rmSync(outside, { force: true });
+  }
 });
 
 test("enforce 缺省 + defaultEnforce=true: 无 allow 列表时拒绝加载（fail-closed）", async () => {

@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.4.0 (2026-08-24)
+
+本会话的加固与集成轮：全面代码审查（6 子代理深读 + 逐条验证）后的修复、ctx.settings 集成、安全策略指纹。
+
+### ⚠️ Breaking / 行为变化
+
+- **安全策略指纹（防执行器拆闸）**：任务创建时把 `.cbx.json` 的**安全关键字段**（`cost.maxExecutorInvocations` / `plugins` / `reviewGate` / `executors.envAllowlist`）做 sha256 指纹存入 SQLite；执行器调用前重算比对，**指纹漂移即拒绝调用**（`needs_fix` + `policy_drift` phase + Human Gate，fail-closed）。非隔离执行器 cwd=workspace 可中途改写 `.cbx.json` 静默拆闸的场景被拦截。**operator 主动改配置后续跑**（`cbx_continue` 通过 Human Gate，如 `cost_limit` 加预算）自动刷新指纹——显式续跑 = 显式接受当前配置，无需重建任务。旧任务（无指纹字段）跳过校验，完全向后兼容。
+- **审计完整性验证口径升级**：`verifyJobAudit` 从「事件数 + event 类型」比对升级为**逐行完整 payload 深度比对** + 「ndjson 必须是 SQLite 镜像的连续尾部子序列」语义——内容篡改（改写任意行/删中间行/伪造追加）被检测；轮转（>10MB 滚 .1）/保留期清理不误报；事件超 5 万条镜像读取截断返回「无法验证」而非误报。
+- **review/isolated 配置优先级修正**：`cbx_run` 工具与 `/cbx-run` 命令的 `review`/`isolated` 从「工具参数 > 插件默认」改为「工具参数 > 工作区 `.cbx.json` > 插件默认」——插件默认（schemastery `.default(true)`）不再永久压制工作区配置。
+
+### Added
+
+- **ctx.settings 集成（`src/settings-integration.ts`）**：宿主提供 `ctx.settings` 服务时注册 `cbx` namespace，把插件级默认配置（`executor`/`review`/`isolated`/`carryDirty`/`executors.envAllowlist`）暴露到 harness 设置界面，变更**即时生效**。优先级：工具参数 > 工作区 `.cbx.json` > settings > 插件 config。动态 import `@deepseek-ai/dsh-settings`（新增 optional peerDependency，版本线 0.1.0-rc.6 与现有 dsh 系列对齐）——宿主未装时静默跳过。**范围刻意最小**：不覆盖 `workspaces`（安全白名单）与 web token。
+- **Web 层静默失败修复**：`waitForWebServer` 超时打日志 + 30s 延迟重试（不再"2s 没等到就永远不挂载且零诊断"）；`webPluginActive` 改读 `cbxWeb.mounted`（路由真实挂载才判定激活，`/cbx-web` 不再打开 404）。
+- **jobs-bridge 重复注册防护**：同一 job 二次 `cbx_continue` 复用既有桥接任务（`existing: true`），终态后 registry 移除可重建——不再双份轮询/通知/cancel。
+- **loadState 读失败不误判终止**：后台任务桥与前台镜像区分「真移除（目录/state.json 不存在）」与「瞬时读失败（目录在，重试）」，不再把 SQLite 读失败误报为 killed。
+- **日志脱敏边界加固**：`LogRedactor` 首 chunk 延迟写 + TAIL_BYTES 16→64（覆盖最长 PEM 头）+ 流结束 flush——跨 chunk 私钥/PEM 不再漏网。
+- **速度档校准只算成功样本延迟**：失败/超时样本的延迟不再污染 `speedTier` 推导（fastest 策略不再首选间歇崩溃的失败执行器）。
+- **win32 探测负缓存 TTL**：`resolvedPathCache` 带 TTL（正结果 5 分钟、负结果 30 秒）——运行期新装 CLI 快速可见，不再永久"未安装"。
+- **执行器插件主进程崩溃隔离**：`inspectExecutorPlugin` 的 import 包 try/catch——插件顶层 throw 转为可诊断错误而非打挂整个 harness 进程。
+
+### Fixed
+
+- **CSP 与内联样式冲突**：`default-src 'self'` 缺 `style-src 'unsafe-inline'` 导致分布条/进度条/状态圆点内联样式被浏览器丢弃——已补 `style-src 'self' 'unsafe-inline'`。
+- **审批取消竞态分支 HTTP 409 映射失效**：`approval.ts` 竞态复检分支改抛 `CbxError("E_INVALID_STATE")`（原裸 `Error` 变 500）。
+- **幂等失败清理掩盖原始错误**：`abortIdempotentCreate` 失败不再顶替 `createJob` 真实失败原因（tools/web 各落日志提示）。
+- **savePersistedStateCas 非原子**：UPDATE→SELECT→INSERT 三步包单事务——跨进程双首写不再撞 PRIMARY KEY。
+- **schema 迁移并发幂等**：全部 `CREATE TABLE/INDEX IF NOT EXISTS` + `INSERT OR IGNORE` + v3/v6 `ALTER TABLE ADD COLUMN` 列存在性检查——并发首开迁移不再报 "table already exists"/"duplicate column name"。
+- **raw 子进程路径硬死线**：超时 killTree 后 5s 强制 settle——不可中断 IO 不再让 Promise 永久挂起。
+- **LRU/round-robin 闲置分封顶**：60 分钟闲置封顶（原无上限，约 1h 后压过一切健康度罚）。
+- **脱敏正则加词边界**：`DEFAULT_REDACT_PATTERNS` 加 `\b`——`sk-xxx` 不再命中更长 base64 子串过度脱敏。
+- **策略指纹经续跑刷新**（本条目内 0.4.0 后续修复）：`prepareContinuation` 处理 Human Gate 续跑时同步刷新指纹——`cost_limit` 加预算续跑不再被 `policy_drift` 死锁。
+- **残余英文日志/错误消息统一为中文**（web.ts SSE guard、ui.ts tailer 告警）。
+
+### Security
+
+- **审计镜像脱敏不对称修复**：SQLite events 表（审计权威、读取面优先）与 ndjson 共用同一份脱敏 payload——执行器输出回显的凭据不再从权威副本原样读出。
+- **插件主进程崩溃隔离**（见 Added）。
+- **策略指纹 fail-closed**（见 Breaking）。
+
+### Docs
+
+- README：ctx.settings 集成、安全策略指纹（含续跑刷新）、审计验证口径、日志脱敏边界。
+- CHANGELOG：本条目。
+
 ## 0.3.0 (2026-08-23)
 
 本会话的加固轮：成本治理、审计权威迁移、storage 拆分、HTTP 边界测试与多项正确性/性能修复。

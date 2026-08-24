@@ -4,6 +4,35 @@ var currentWorkspace=null;
 var selected=null;
 var filterStatus='';
 
+// 主题状态管理：默认淡色简约风格 (light)
+var currentTheme = localStorage.getItem('cbx-theme') || 'light';
+function applyTheme(theme) {
+  currentTheme = theme;
+  document.documentElement.setAttribute('data-theme', theme);
+  try { localStorage.setItem('cbx-theme', theme); } catch(e){}
+  var btn = document.querySelector('#theme-toggle');
+  var txt = document.querySelector('#theme-toggle-text');
+  if (btn && txt) {
+    if (theme === 'dark') {
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg><span id="theme-toggle-text">深色</span>';
+    } else {
+      btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg><span id="theme-toggle-text">浅色</span>';
+    }
+  }
+}
+applyTheme(currentTheme);
+
+document.addEventListener('DOMContentLoaded', function(){
+  applyTheme(currentTheme);
+  var toggleBtn = document.querySelector('#theme-toggle');
+  if(toggleBtn) {
+    toggleBtn.addEventListener('click', function(){
+      applyTheme(currentTheme === 'light' ? 'dark' : 'light');
+      refresh();
+    });
+  }
+});
+
 function rowAttr(id){
   return window.CSS&&CSS.escape?CSS.escape(String(id)):String(id).replace(/[^\w-]/g,function(c){return'\\'+c});
 }
@@ -21,19 +50,23 @@ function esc(s){
 }
 
 // 状态分组：把粒度状态归并到分布条/过滤用的分组。key 决定颜色与过滤集合。
-var STATUS_GROUPS=[
-  {key:'done',label:'完成',color:'#10b981',match:['done']},
-  {key:'running',label:'运行中',color:'#f59e0b',match:['running']},
-  {key:'queued',label:'排队',color:'#60a5fa',match:['queued']},
-  {key:'awaiting_approval',label:'待审批',color:'#fb923c',match:['awaiting_approval']},
-  {key:'failed',label:'失败',color:'#ef4444',match:['failed']},
-  {key:'needs_fix',label:'返工',color:'#f43f5e',match:['needs_fix','review_failed']},
-  {key:'cancelled',label:'已取消',color:'#94a3b8',match:['cancelled']},
-];
+function getStatusGroups() {
+  var isDark = currentTheme === 'dark';
+  return [
+    {key:'done',label:'完成',color:isDark?'#10b981':'#059669',match:['done']},
+    {key:'running',label:'运行中',color:isDark?'#f59e0b':'#d97706',match:['running']},
+    {key:'queued',label:'排队',color:isDark?'#60a5fa':'#2563eb',match:['queued']},
+    {key:'awaiting_approval',label:'待审批',color:isDark?'#fb923c':'#ea580c',match:['awaiting_approval']},
+    {key:'failed',label:'失败',color:isDark?'#ef4444':'#dc2626',match:['failed']},
+    {key:'needs_fix',label:'返工',color:isDark?'#f43f5e':'#e11d48',match:['needs_fix','review_failed']},
+    {key:'cancelled',label:'已取消',color:isDark?'#94a3b8':'#64748b',match:['cancelled']},
+  ];
+}
 
 function statusGroupKey(s){
-  for(var i=0;i<STATUS_GROUPS.length;i++){
-    if(STATUS_GROUPS[i].match.indexOf(s)>=0)return STATUS_GROUPS[i].key;
+  var groups = getStatusGroups();
+  for(var i=0;i<groups.length;i++){
+    if(groups[i].match.indexOf(s)>=0)return groups[i].key;
   }
   return '';
 }
@@ -60,7 +93,6 @@ function ensureAuth(){
   authInProgress=new Promise(function(resolve){
     var token=window.prompt('CBX 仪表盘需要访问令牌（见 <工作区>/.cbx/web.token 或 dsh 启动日志）：');
     if(!token){authCooldownUntil=Date.now()+60000;authInProgress=null;resolve(false);return;}
-    // 所有请求走相对路径：页面位于 /cbx/ 时解析为 /cbx/...，独立根路径部署同样成立。
     fetch('auth',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({token:token})})
       .then(function(res){
         if(res.ok){authInProgress=null;resolve(true);}
@@ -74,7 +106,6 @@ function ensureAuth(){
 function cbxFetch(url,opts){
   opts=opts||{};
   opts.headers=Object.assign({},opts.headers||{});
-  // token 走 HttpOnly cookie（同源请求自动携带），JS 不可读、不落 URL。
   opts.credentials='same-origin';
   return fetch(url,opts).then(function(res){
     if(res.status===401){
@@ -89,7 +120,6 @@ function cbxPost(url,body){
   return cbxFetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
 }
 
-// 非 JSON 响应（挂载路径错误/网关错误页等）不再让轮询循环抛未处理 rejection。
 function safeJson(r){
   return r.json().catch(function(){return null});
 }
@@ -151,7 +181,8 @@ function updateCards(jobs,q){
   var fb=document.querySelector('#filter-bar');
   if(filterStatus){
     fb.hidden=false;
-    var group=STATUS_GROUPS.find(function(g){return g.key===filterStatus})||{};
+    var groups = getStatusGroups();
+    var group=groups.find(function(g){return g.key===filterStatus})||{};
     document.querySelector('#filter-label').textContent='当前筛选：'+(group.label||filterStatus);
   } else {
     fb.hidden=true;
@@ -168,12 +199,13 @@ function setCard(id,value,cls){
 function renderDistBar(jobs){
   var bar=document.querySelector('#dist-bar');
   if(!jobs.length){bar.hidden=true;return;}
+  var groups = getStatusGroups();
   var counts={};
-  STATUS_GROUPS.forEach(function(g){counts[g.key]=0;});
+  groups.forEach(function(g){counts[g.key]=0;});
   jobs.forEach(function(j){var k=statusGroupKey(j.status);if(k)counts[k]++;});
   var total=jobs.length;
   var html='';
-  STATUS_GROUPS.forEach(function(g){
+  groups.forEach(function(g){
     var c=counts[g.key];
     if(!c)return;
     var pct=Math.round(c/total*100);
@@ -242,10 +274,8 @@ function fmtElapsed(iso) {
 
 function rowHtml(j){
   var cls='job'+(selected===j.jobId?' selected':'');
-  // 终态显示 totalSeconds,非终态用 createdAt 实时算 elapsed。
   var terminal=['done','failed','review_failed','cancelled','needs_fix'].indexOf(j.status)>=0;
   var elapsed = terminal && j.totalSeconds != null ? (j.totalSeconds < 60 ? j.totalSeconds + 's' : Math.floor(j.totalSeconds/60) + 'm ' + (j.totalSeconds%60) + 's') : fmtElapsed(j.createdAt);
-  // 审计完整性徽标：__audit.tampered → 篡改!；__audit.valid → ✓ 完整；否则 —。
   var audit = auditBadge(j.__audit);
   return '<tr class="'+cls+'" data-id="'+esc(j.jobId)+'" data-created="'+esc(j.createdAt||'')+'" data-terminal="'+terminal+'">'
     + '<td><button type="button" class="job-select">'+esc(j.jobId)+'</button></td>'
@@ -322,7 +352,6 @@ async function loadDetail(id){
   }
   body.innerHTML=stageHtml+'<div class="tabs" id="detail-tabs"></div><div class="tab-panels" id="detail-panels"></div>';
 
-  // 写操作按钮：按任务状态决定可用动作
   (function renderActions(){
     var status=result&&result.status||'';
     var actions=[];
@@ -363,7 +392,6 @@ async function loadDetail(id){
     });
   })();
 
-  // 动态 tab 列表
   var tabs=[
     {name:'overview',label:'概览'},
     {name:'timeline',label:'阶段时间线'},
@@ -386,7 +414,6 @@ async function loadDetail(id){
     });
   });
 
-  // 默认加载 overview
   loadTab(id,'overview',panelsEl,result);
 }
 
@@ -400,7 +427,6 @@ async function loadTab(id,tab,panelsEl,result){
       if(result){
         html+='<div style="display:flex;flex-direction:column;gap:10px">';
         html+='<div style="font-size:14px"><b>任务状态：</b><span class="s-'+esc(result.status||'')+'" style="font-weight:600">'+esc(result.status||'—')+'</span></div>';
-        // 审计完整性：result.auditIntegrity（终态时 ndjson vs SQLite 镜像一致性校验）。
         if(result.auditIntegrity){
           var ai=result.auditIntegrity;
           var badge=ai.tampered?'<b style="color:var(--status-failed)">⚠ 篡改!</b> 事件日志与 SQLite 镜像不一致（执行器可能篡改了 events.ndjson）':(ai.valid?'<b style="color:var(--status-done)">✓ 审计完整</b>':'<span style="color:var(--text-muted)">无法验证</span>');
@@ -461,7 +487,6 @@ async function loadTab(id,tab,panelsEl,result){
       }
       html+='</div>';
       if(ex.command)html+='<div class="cmd"><code>$ '+esc(ex.command)+'</code></div>';
-      // 增量 agent.log 拉取(默认读尾部 256KB)
       var log=await cbxFetch('api/jobs/'+id+'/agent.log?since=0').then(function(r){return r.json()});
       if(log&&log.content){
         html+='<div style="margin-top:14px">'+renderCodeBlock('agent.log 尾部日志', log.content, 'agent-log')+'</div>';
@@ -498,7 +523,6 @@ document.querySelector('#jobs').addEventListener('click',function(e){
   if(row)selectJob(row.dataset.id);
 });
 
-// 卡片点击过滤：data-filter 非空的卡片切换表过滤；空的卡片（总任务/最后活动/健康）清除过滤。
 document.querySelector('#cards').addEventListener('click',function(e){
   var card=e.target.closest('.card');
   if(!card)return;
@@ -547,7 +571,6 @@ document.querySelector('#btn-resume').addEventListener('click',async function(){
   }
 });
 
-// 创建任务：POST /api/jobs
 document.querySelector('#btn-create').addEventListener('click',async function(){
   var input=document.querySelector('#new-task');
   var task=(input.value||'').trim();
@@ -570,7 +593,6 @@ document.querySelector('#new-task').addEventListener('keydown',function(e){
   if(e.key==='Enter')document.querySelector('#btn-create').click();
 });
 
-// 键盘快捷键增强：按 '/' 聚焦任务输入框，按 'Escape' 取消选中
 window.addEventListener('keydown', function(e){
   if(e.key==='/' && document.activeElement !== document.querySelector('#new-task')){
     e.preventDefault();
@@ -582,12 +604,10 @@ window.addEventListener('keydown', function(e){
 
 loadWorkspaces().then(refresh);
 
-// 全量轮询
 setInterval(function(){
   refresh().catch(function(e){console.warn('cbx-ui: refresh failed',e);});
 },1500);
 
-// 每秒刷新所有行耗时
 function refreshElapsedRows(){
   document.querySelectorAll('tr.job').forEach(function(row){
     if(row.getAttribute('data-terminal')==='true')return;

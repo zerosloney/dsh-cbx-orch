@@ -8,6 +8,7 @@ import {
   now,
   updateJobContext,
   withFileLock,
+  securityPolicyFingerprint,
 } from "./storage.js";
 import { finishSpan, startSpan } from "./observability.js";
 import {
@@ -947,6 +948,11 @@ async function prepareContinuationUnlocked(
   }
   const humanGate = resolveHumanGate(gate, safeInstructions, redact);
   // 用户已针对 gate 给出纠偏：重置失败计数与重试预算，避免旧 error/旧计数在续跑时被重复计入或预算过早耗尽。
+  // 同时刷新安全策略指纹：用户显式续跑（cbx_continue）= 显式接受当前 `.cbx.json`
+  // 配置——`cost_limit` 的既定解法是"改 maxExecutorInvocations 加预算后续跑"，若
+  // 不刷新指纹，改配置后每次续跑都会被 policy_drift 拒绝（操作死循环）。执行器
+  // 被动改写 `.cbx.json` 仍被拒——执行器不经过续跑路径，指纹只在这里由 operator
+  // 动作刷新。旧任务（无指纹字段）写入新指纹后开始受保护。
   await writeState(workspace, jobId, {
     humanGate,
     continuationInstructions: humanGate.instructions ?? null,
@@ -956,6 +962,7 @@ async function prepareContinuationUnlocked(
     executionUsed: 0,
     fixUsed: 0,
     stageRetries: {},
+    securityFingerprint: securityPolicyFingerprint(config),
   });
   return { instructions: safeInstructions };
 }

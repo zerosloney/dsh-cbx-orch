@@ -1,6 +1,6 @@
 {
   "name": "dsh-cbx-orch",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Durable coding-agent orchestrator as a DeepSeek Harness plugin: dispatch tasks to codebuddy/opencode/omp/cline/qwen with persistent jobs, queue, review, and rollback.",
   "license": "MIT",
   "type": "module",

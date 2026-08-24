@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.3 (2026-08-24)
+
+### Fixed
+
+- **隐藏属性 display 优先级冲突**：在 `ui/style.css` 声明 `[hidden] { display: none !important; }`，彻底修复状态分布条（`#dist-bar`）与筛选栏（`#filter-bar`）在无任务或未激活筛选时因 class 选择器覆盖导致意外显示空框的问题。
+
 ## 0.4.2 (2026-08-24)
 
 Web 仪表盘默认切换为**纯净淡色简约风格（Light Minimalist Theme）**，并提供双主题（浅色 / 深色）实时切换。

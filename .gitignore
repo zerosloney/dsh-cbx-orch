@@ -6,3 +6,4 @@ dist/
 .env
 .smoke-ws/
 .pnpm-store/
+*.png

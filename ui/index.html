@@ -1,27 +1,267 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>CBX Orchestrator</title>
-<link rel="stylesheet" href="style.css">
-</head><body>
-<div class="topbar"><h1>CBX Orchestrator</h1><span class="ws-pill"><span class="ws-name" id="ws-name">—</span><span class="ws-count" id="ws-count"></span></span></div>
-<div class="ws-list" id="ws-list" hidden></div>
-<div class="dist-bar" id="dist-bar" hidden></div>
-<div class="filter-bar" id="filter-bar" hidden><span id="filter-label"></span><button type="button" id="btn-clear-filter" class="job-action">清除筛选</button></div>
-<div class="cards" id="cards">
-  <div class="card" data-filter=""><div class="card-label">总任务</div><div class="card-value" id="c-total">—</div></div>
-  <div class="card" data-filter="running"><div class="card-label">运行中 / 并发</div><div class="card-value" id="c-running">—</div></div>
-  <div class="card" data-filter="queued"><div class="card-label">排队</div><div class="card-value" id="c-queued">—</div></div>
-  <div class="card" data-filter="awaiting_approval"><div class="card-label">待审批</div><div class="card-value" id="c-approval">—</div></div>
-  <div class="card" data-filter="failed"><div class="card-label">失败</div><div class="card-value" id="c-failed">—</div></div>
-  <div class="card" data-filter="needs_fix"><div class="card-label">返工</div><div class="card-value" id="c-needs-fix">—</div></div>
-  <div class="card" data-filter="done"><div class="card-label">完成</div><div class="card-value" id="c-done">—</div></div>
-  <div class="card" data-filter=""><div class="card-label">最后活动</div><div class="card-value" id="c-last">—</div></div>
-  <div class="card" data-filter=""><div class="card-label">健康</div><div class="card-value" id="c-health">—</div></div>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CBX Orchestrator — DeepSeek Harness</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app-container">
+
+  <!-- Topbar Header -->
+  <header class="topbar">
+    <div class="brand-group">
+      <div class="brand-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+          <polyline points="2 17 12 22 22 17"></polyline>
+          <polyline points="2 12 12 17 22 12"></polyline>
+        </svg>
+      </div>
+      <h1 class="brand-title">CBX Orchestrator</h1>
+      <span class="brand-tag">DeepSeek Harness</span>
+    </div>
+
+    <div class="topbar-right">
+      <div class="live-indicator">
+        <span class="live-dot"></span>
+        <span>LIVE</span>
+      </div>
+      <span class="ws-pill">
+        <span class="ws-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+          </svg>
+        </span>
+        <span class="ws-name" id="ws-name">—</span>
+        <span class="ws-count" id="ws-count"></span>
+      </span>
+    </div>
+  </header>
+
+  <!-- Multi-workspace selector chips -->
+  <div class="ws-list" id="ws-list" hidden></div>
+
+  <!-- Status Distribution Bar -->
+  <div class="dist-bar" id="dist-bar" hidden></div>
+
+  <!-- Filter Bar -->
+  <div class="filter-bar" id="filter-bar" hidden>
+    <div style="display:flex;align-items:center;gap:6px">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+      </svg>
+      <span id="filter-label"></span>
+    </div>
+    <button type="button" id="btn-clear-filter" class="job-action">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="6" x2="6" y2="18"></line>
+        <line x1="6" y1="6" x2="18" y2="18"></line>
+      </svg>
+      清除筛选
+    </button>
+  </div>
+
+  <!-- KPI Metric Cards -->
+  <div class="cards" id="cards">
+    <div class="card" data-filter="">
+      <div class="card-label">
+        <span>总任务</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect>
+          <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
+        </svg>
+      </div>
+      <div class="card-value" id="c-total">—</div>
+    </div>
+
+    <div class="card" data-filter="running">
+      <div class="card-label">
+        <span>运行中 / 并发</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+        </svg>
+      </div>
+      <div class="card-value" id="c-running">—</div>
+    </div>
+
+    <div class="card" data-filter="queued">
+      <div class="card-label">
+        <span>排队</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <polyline points="12 6 12 12 16 14"></polyline>
+        </svg>
+      </div>
+      <div class="card-value" id="c-queued">—</div>
+    </div>
+
+    <div class="card" data-filter="awaiting_approval">
+      <div class="card-label">
+        <span>待审批</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+        </svg>
+      </div>
+      <div class="card-value" id="c-approval">—</div>
+    </div>
+
+    <div class="card" data-filter="failed">
+      <div class="card-label">
+        <span>失败</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="15" y1="9" x2="9" y2="15"></line>
+          <line x1="9" y1="9" x2="15" y2="15"></line>
+        </svg>
+      </div>
+      <div class="card-value" id="c-failed">—</div>
+    </div>
+
+    <div class="card" data-filter="needs_fix">
+      <div class="card-label">
+        <span>返工</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path>
+        </svg>
+      </div>
+      <div class="card-value" id="c-needs-fix">—</div>
+    </div>
+
+    <div class="card" data-filter="done">
+      <div class="card-label">
+        <span>完成</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
+          <polyline points="22 4 12 14.01 9 11.01"></polyline>
+        </svg>
+      </div>
+      <div class="card-value" id="c-done">—</div>
+    </div>
+
+    <div class="card" data-filter="">
+      <div class="card-label">
+        <span>最后活动</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="2"></circle>
+          <path d="M16.24 7.76a6 6 0 0 1 0 8.49m-8.48-.01a6 6 0 0 1 0-8.49m11.31-2.82a10 10 0 0 1 0 14.14m-14.14 0a10 10 0 0 1 0-14.14"></path>
+        </svg>
+      </div>
+      <div class="card-value" id="c-last">—</div>
+    </div>
+
+    <div class="card" data-filter="">
+      <div class="card-label">
+        <span>健康</span>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+        </svg>
+      </div>
+      <div class="card-value" id="c-health">—</div>
+    </div>
+  </div>
+
+  <!-- Control & Quick Action Bar -->
+  <div class="bar" id="bar">
+    <div class="queue-controls">
+      <button type="button" id="btn-pause" class="job-action">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+          <rect x="6" y="4" width="4" height="16"></rect>
+          <rect x="14" y="4" width="4" height="16"></rect>
+        </svg>
+        暂停队列
+      </button>
+      <button type="button" id="btn-resume" class="job-action">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+          <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+        恢复队列
+      </button>
+    </div>
+
+    <span class="create">
+      <div class="input-wrapper">
+        <span class="input-icon">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 17 10 11 4 5"></polyline>
+            <line x1="12" y1="19" x2="20" y2="19"></line>
+          </svg>
+        </span>
+        <input id="new-task" type="text" placeholder="输入任务描述或 prompt 后回车创建…" autocomplete="off">
+        <span class="kbd-hint">↵ Enter</span>
+      </div>
+      <button type="button" id="btn-create" class="job-action btn-primary">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <line x1="5" y1="12" x2="19" y2="12"></line>
+        </svg>
+        创建任务
+      </button>
+    </span>
+  </div>
+
+  <!-- Jobs Table -->
+  <div class="table-card">
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Job ID</th>
+          <th scope="col">Status</th>
+          <th scope="col">Phase</th>
+          <th scope="col">Attempt</th>
+          <th scope="col">Review</th>
+          <th scope="col">Elapsed</th>
+          <th scope="col">Audit</th>
+          <th scope="col">Updated</th>
+        </tr>
+      </thead>
+      <tbody id="jobs"></tbody>
+    </table>
+  </div>
+
+  <!-- Job Detail Panel -->
+  <div id="detail-panel">
+    <div class="detail-header">
+      <h2>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="12" y1="16" x2="12" y2="12"></line>
+          <line x1="12" y1="8" x2="12.01" y2="8"></line>
+        </svg>
+        任务详情
+      </h2>
+    </div>
+    <div id="detail-body">
+      <p class="hint">点击上方任务行查看详情</p>
+    </div>
+  </div>
+
+  <!-- Live Event Stream Console -->
+  <div class="terminal-card">
+    <div class="terminal-header">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div class="term-dots">
+          <span class="term-dot term-dot-red"></span>
+          <span class="term-dot term-dot-yellow"></span>
+          <span class="term-dot term-dot-green"></span>
+        </div>
+        <h2>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 17 10 11 4 5"></polyline>
+            <line x1="12" y1="19" x2="20" y2="19"></line>
+          </svg>
+          实时事件流
+        </h2>
+      </div>
+      <div style="font-size:11px;color:var(--text-muted)">SSE Connected</div>
+    </div>
+    <div id="stream"></div>
+  </div>
+
 </div>
-<div class="bar" id="bar"><button type="button" id="btn-pause" class="job-action">暂停队列</button><button type="button" id="btn-resume" class="job-action">恢复队列</button><span class="create"><input id="new-task" type="text" placeholder="输入任务描述后创建…" autocomplete="off"><button type="button" id="btn-create" class="job-action">创建任务</button></span></div>
-<table><thead><tr><th scope="col">Job</th><th scope="col">Status</th><th scope="col">Phase</th><th scope="col">Attempt</th><th scope="col">Review</th><th scope="col">Elapsed</th><th scope="col">Audit</th><th scope="col">Updated</th></tr></thead>
-<tbody id="jobs"></tbody></table>
-<div id="detail-panel"><h2 style="margin-top:0">任务详情</h2><div id="detail-body"><p class="hint">点击上方任务行查看详情</p></div></div>
-<h2>事件流</h2>
-<div id="stream"></div>
+
 <script src="app.js"></script>
-</body></html>
+</body>
+</html>

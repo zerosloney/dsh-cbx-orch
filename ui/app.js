@@ -95,10 +95,23 @@ function ensureAuth(){
     if(!token){authCooldownUntil=Date.now()+60000;authInProgress=null;resolve(false);return;}
     fetch('auth',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({token:token})})
       .then(function(res){
-        if(res.ok){authInProgress=null;resolve(true);}
-        else{alert('令牌无效。');authCooldownUntil=Date.now()+60000;authInProgress=null;resolve(false);}
+        if(res.ok){
+          authInProgress=null;
+          loadWorkspaces();
+          resolve(true);
+        } else {
+          alert('令牌无效。');
+          authCooldownUntil=Date.now()+60000;
+          authInProgress=null;
+          resolve(false);
+        }
       })
-      .catch(function(){alert('登录请求失败。');authCooldownUntil=Date.now()+60000;authInProgress=null;resolve(false);});
+      .catch(function(){
+        alert('登录请求失败。');
+        authCooldownUntil=Date.now()+60000;
+        authInProgress=null;
+        resolve(false);
+      });
   });
   return authInProgress;
 }
@@ -109,7 +122,9 @@ function cbxFetch(url,opts){
   opts.credentials='same-origin';
   return fetch(url,opts).then(function(res){
     if(res.status===401){
-      return ensureAuth().then(function(ok){return ok?fetch(url,opts):res;});
+      return ensureAuth().then(function(ok){
+        return ok ? fetch(url,opts) : res;
+      });
     }
     return res;
   });
@@ -125,6 +140,9 @@ function safeJson(r){
 }
 
 async function refresh(){
+  if(allWorkspaces.length === 0){
+    await loadWorkspaces();
+  }
   var ws=encodeURIComponent(currentWorkspace||'');
   var jobs=await cbxFetch('api/jobs?workspace='+ws).then(safeJson)||[];
   var q=await cbxFetch('api/queue?workspace='+ws).then(safeJson)||{entries:[]};
@@ -138,6 +156,7 @@ async function refresh(){
     var row=document.querySelector('tr.job[data-id="'+rowAttr(selected)+'"]');
     if(row)row.classList.add('selected');
   }
+  renderWorkspaces();
 }
 
 function updateCards(jobs,q){
@@ -222,20 +241,40 @@ async function loadWorkspaces(){
     if(!response.ok) throw new Error('HTTP '+response.status);
     var data=await response.json();
     allWorkspaces=data.workspaces||[];
-    currentWorkspace=data.default;
+    if(!currentWorkspace || !allWorkspaces.some(function(w){return w.path===currentWorkspace;})){
+      currentWorkspace=data.default || (allWorkspaces[0] && allWorkspaces[0].path) || '';
+    }
+    var qs=new URLSearchParams(location.search);
+    var req=qs.get('workspace');
+    if(req&&allWorkspaces.some(function(w){return w.path===req;}))currentWorkspace=req;
+    renderWorkspaces();
   }catch(e){
     console.error('cbx-ui: loadWorkspaces error', e);
-    document.querySelector('#ws-name').textContent='fetch error: '+(e instanceof Error?e.message:String(e));
-    return;
+    var nameEl = document.querySelector('#ws-name');
+    if(nameEl && (nameEl.textContent === '—' || nameEl.textContent === '')) {
+      nameEl.textContent = '默认工作区';
+    }
   }
-  var qs=new URLSearchParams(location.search);
-  var req=qs.get('workspace');
-  if(req&&allWorkspaces.some(function(w){return w.path===req;}))currentWorkspace=req;
-  renderWorkspaces();
 }
 
 function renderWorkspaces(){
+  var cur=allWorkspaces.find(function(w){return w.path===currentWorkspace;}) || allWorkspaces[0];
+  var nameEl=document.querySelector('#ws-name');
+  var countEl=document.querySelector('#ws-count');
+  if(cur){
+    if(nameEl) nameEl.textContent = cur.name || cur.path;
+    var t = totalJobs(cur);
+    if(countEl) countEl.textContent = t ? '(' + t + ')' : '';
+  } else if(currentWorkspace){
+    if(nameEl) nameEl.textContent = currentWorkspace;
+    if(countEl) countEl.textContent = '';
+  } else {
+    if(nameEl && nameEl.textContent === '—') nameEl.textContent = '默认工作区';
+    if(countEl) countEl.textContent = '';
+  }
+
   var list=document.querySelector('#ws-list');
+  if(!list) return;
   if(allWorkspaces.length>1){
     list.hidden=false;
     list.innerHTML=allWorkspaces.map(function(w){
@@ -248,9 +287,6 @@ function renderWorkspaces(){
   } else {
     list.hidden=true;
   }
-  var cur=allWorkspaces.find(function(w){return w.path===currentWorkspace;});
-  document.querySelector('#ws-name').textContent=cur?cur.name:(currentWorkspace||'\u2014');
-  document.querySelector('#ws-count').textContent=cur?'('+totalJobs(cur)+')':'';
 }
 
 function switchWorkspace(path){

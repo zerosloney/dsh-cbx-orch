@@ -180,7 +180,7 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
   workspaces.forEach((ws, wsIndex) => {
     const guard = async (): Promise<void> => {
       const current = await workspacePolicy.resolveWorkspace(ws);
-      if (current !== ws) throw new Error("workspace identity changed");
+      if (current !== ws) throw new Error("工作区身份已变化：路由重定向目标不再指向授权工作区。");
     };
     stopTailers.push(startEventTailer(ws, (event) =>
       broadcast(wsIndex, { ...event, workspace: ws }), {

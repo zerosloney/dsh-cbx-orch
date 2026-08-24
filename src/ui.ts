@@ -543,10 +543,10 @@ export function startEventTailer(
         stop();
         try {
           if (onGuardFailure) await onGuardFailure(error);
-          else console.warn("cbx: event tailer stopped after workspace identity validation failed");
+          else console.warn("cbx: 事件尾部跟随器因工作区身份校验失败而停止");
         } catch {
           // Guard failure handling must never create an unhandled rejection.
-          console.warn("cbx: event tailer stopped after workspace identity validation failed");
+          console.warn("cbx: 事件尾部跟随器因工作区身份校验失败而停止");
         }
         return;
       }

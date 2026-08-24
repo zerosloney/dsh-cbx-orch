@@ -43,12 +43,14 @@ const jobEventMirrorWarned = new Set<string>();
 
 /** fire-and-forget 把一条 job 级事件镜像进 SQLite events 表（带 job_id）。
  *  失败不阻塞主流程（ndjson 仍落盘），但计数告警——镜像缺失意味着审计权威
- *  与 ndjson 漂移，值得排查。 */
+ *  与 ndjson 漂移，值得排查。
+ *  `payload` 必须是**已经过脱敏**的完整事件对象（含 at）：ndjson 落盘与 SQLite
+ *  镜像共用同一份脱敏 payload，保证两侧内容一致且凭据不进入权威库。 */
 export function mirrorJobEventToSqlite(
   workspace: string,
   jobId: string,
   event: string,
-  detail: Record<string, unknown>,
+  payload: Record<string, unknown>,
 ): void {
   const chainKey = `${workspace}::job-events`;
   const previous = jobEventMirrorChains.get(chainKey) ?? Promise.resolve();
@@ -57,7 +59,6 @@ export function mirrorJobEventToSqlite(
     .then(async () => {
       try {
         const seq = await nextEventSeq(workspace);
-        const payload = { event, jobId, ...detail, at: now() };
         await insertEvent(workspace, seq, event, payload, jobId);
       } catch (error) {
         recordEventMirrorFailure(workspace);
@@ -112,14 +113,21 @@ export function logJobEvent(
     // 写入边界统一脱敏（内置凭据形状）：事件 detail 可能携带执行器输出/错误文本，
     // 其中回显的内联凭据不得持久落盘（agent.log/test.log 同此约束）。
     const fd = openSync(file, "a");
+    let payload: Record<string, unknown>;
     try {
-      writeSync(fd, redactText(JSON.stringify({ event, jobId, ...detail, at: now() })) + "\n");
+      // 写入边界统一脱敏（内置凭据形状）：事件 detail 可能携带执行器输出/错误文本，
+      // 其中回显的内联凭据不得持久落盘（agent.log/test.log 同此约束）。
+      payload = JSON.parse(
+        redactText(JSON.stringify({ event, jobId, ...detail, at: now() })),
+      ) as Record<string, unknown>;
+      writeSync(fd, JSON.stringify(payload) + "\n");
       fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
     // SQLite 镜像（审计权威）：fire-and-forget，失败不阻塞 ndjson 落盘。
-    mirrorJobEventToSqlite(workspace, jobId, event, detail);
+    // 传入已脱敏的完整 payload（含 at），两侧内容一致。
+    mirrorJobEventToSqlite(workspace, jobId, event, payload);
     logJobEventWriteWarned = false;
   } catch (error) {
     if (!logJobEventWriteWarned) {

@@ -163,6 +163,18 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 
 **Web 空配置的默认工作区来源（v0.1 起）**：`web.workspaces` 为空/缺省时，Web 层不再盲回落 `process.cwd()`，而是跟随 **harness 工作区注册表**（`ctx.workspaceRegistry`，即用户在 harness GUI 中实际打开过的目录；DMS 会话目录 `sessions/--<path>--` 由 harness 维护）。这保证了「在某个工作区会话里跑 `/cbx-run` 创建的任务，能在同一目录的仪表盘上看到」——Web 层本身没有会话上下文，注册表是 harness 侧对「用户工作区」的权威来源。注册表不可用或为空时（例如无 harness workspace 服务的瘦身 profile）回落进程 cwd，保持旧行为。
 
+### ctx.settings 集成（可选，harness 设置界面统一管理插件默认）
+
+宿主提供 `ctx.settings` 服务（`@deepseek-ai/dsh-settings`）时，插件注册 `cbx` settings namespace，把**插件级默认配置**（`executor` / `review` / `isolated` / `carryDirty` / `executors.envAllowlist`）暴露到 harness 设置界面——不再只能改 profile 的 `cordis.patch.yml`，且变更**即时生效**（无需重启）。
+
+优先级：**工具参数 > 工作区 `.cbx.json` > settings > 插件 config（profile 配置）**。settings 是「插件默认」的运行时替代层，工作区级 `.cbx.json` 仍更具体、优先。
+
+范围刻意最小：
+- **不覆盖 `workspaces`**（安全白名单保持 profile 配置，不暴露给运行时设置面）；
+- **不覆盖 web token**（工作区级，见 `.cbx/web.token`）。
+
+实现：动态 import `@deepseek-ai/dsh-settings`（optional peerDependency）——宿主未装 settings 服务时静默跳过，插件按纯 profile 配置运行，零行为变化。
+
 ### 工作区配置（`.cbx.json`，与 cbx-orch 相同）
 
 `executor`、`executorPreference`、`executorRequirements`（如 `{ autoApprove: true, exclude: ["omp"] }`）、`routingStrategy`（`first-available`/`capability-best`/`cost-aware`/`fastest`/`round-robin`/`least-recently-used`）、`testCommand`、`review`、`isolated`、`timeoutMs`、`maxRetries`、`maxTurns`、`maxConcurrent`、`reviewRules`、`approval`、`git`、`reviewGate`（`enabled`、`failOpen`）、`cost`（`maxExecutorInvocations`，执行器调用硬上限，见「成本治理」）、`notifications`（webhook/OTLP outbox）、`governance`（retention/redact）、`telemetry`、`ui.token`、`executors`（`envAllowlist`，工作区级环境白名单，见「配置」节）等，见 cbx-orch 文档。
@@ -176,6 +188,7 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 
 - **重试预算**：`maxRetries` = 首次执行失败后允许的重试次数，总执行次数 = 1 + maxRetries（`maxRetries: 1` 即 2 次执行 + 1 次修复重试）。每个 stage 的预算独立持久化，崩溃重入不重置；用户 resolve Human Gate 或显式 retry 时归零。
 - **成本治理（`cost.maxExecutorInvocations`）**：可配置单个任务累计执行器调用（stage + review + manager + gate 全部角色）的**硬上限**，防 API 配额烧穿。执行器调用前检查 `executorInvocations` 计数，达到上限即转 `needs_fix` + `cost_limit` phase + Human Gate（绝不当作普通失败走重试——重试只会继续烧配额）；用户可 `cbx_continue` 加预算（修改 `.cbx.json` 的 `maxExecutorInvocations` 后续跑）或取消任务。缺省不配置 = 无上限（完全向后兼容）。配置在**执行期实时读取**（改配置即生效，无需重建任务），与 `maxTurns × maxRetries × stages × maxRounds` 的隐含上限互补——后者是预算结构，前者是硬性熔断。
+- **安全策略指纹（防执行器拆闸）**：任务创建时把 `.cbx.json` 的**安全关键字段**（`cost.maxExecutorInvocations` / `plugins` / `reviewGate` / `executors.envAllowlist`）做 sha256 指纹存入 SQLite（state 权威，执行器无连接无法篡改）；执行器调用前重算现读值比对，**指纹漂移即拒绝调用**（`needs_fix` + `policy_drift` phase + Human Gate，fail-closed）。防的是：非隔离执行器 cwd=workspace 可中途改写 `.cbx.json`（调高成本上限、拆插件白名单、设 `reviewGate.failOpen: true` 等）静默削弱安全/成本控制。operator 主动改配置后需重新创建任务（旧任务拒绝继续）。旧任务（无指纹字段）跳过校验，完全向后兼容。
 - **默认工作区跟随目录委派**：`cbx_*` 工具与 `/cbx-*` 命令在未显式传 `workspace` 时，默认工作区 = 当前 agent 会话的工作目录（`session.header.cwd`，即目录委派时设定的目录），无 agent 上下文时回落 `process.cwd()`。空配置（`workspaces: []`）时委派到哪个目录就在哪个目录跑；显式白名单仍精确匹配，会话 cwd 不在列表内同样拒绝并提示配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。调度器按工作区动态拉起（入队即 `ensureScheduler`），委派目录无需预先配置即可自动接管队列。**常驻调度器只在显式配置的工作区于插件启动时预拉**（崩溃重启后无需等下一次入队就能续跑遗留任务）；空配置时工作区跟随委派目录动态解析、没有单一权威目录，故不预拉 `process.cwd()` 的调度器（避免在启动目录凭空创建 `.cbx/`），这些目录的调度器仍在入队/派发时按需拉起并同样续跑遗留任务。
 - **创建期前提校验（省去无谓的崩溃循环）**：`isolated=true` 但工作区不是 Git 仓库时，`cbx_run`/Web 创建接口**创建即报错**，错误信息直接给出修复建议（`git init` 或 `isolated: false`）。已入队的此类任务崩溃熔断时，队列错误的 `最后崩溃原因` 会带出真实的 `worker_crash` 根因，而不是笼统的"worker 反复无法恢复"。工作区授权被拒时，错误会列出当前允许的工作区与配置位置（profile `cordis.patch.yml` 的 `config.workspaces` / `config.web.workspaces`）。
 - **隔离任务 + 工作区脏基线（`carryDirty`）**：`isolated=true` 且工作区有未提交内容时，隔离 worktree 从干净基线创建，带不动脏状态。缺省（`carryDirty` 未设）时 **`cbx_run`/`/cbx-run`/Web 创建即报错**并列出三种补救（先 `git commit`/`stash`、设 `carryDirty: true`、或 `isolated: false`），不再让任务带病入队、执行期才 `dirty_baseline` 崩溃。设 `carryDirty: true`（工具参数 `carry_dirty`，或 `.cbx.json`/插件配置 `carryDirty`）后，创建时会把当前未提交改动（已跟踪 diff + 未跟踪文件）带进隔离 worktree——任务在 worktree 里对"进行中的工作"安全执行，不污染主工作区、也无需先提交；任务结束时 worktree 仍按既有语义清理。适用于"审查/继续未提交的改动"这类场景。
@@ -199,14 +212,14 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 
 **事件一致性说明**：事件同时写 `events.ndjson`（展示/轮转镜像）与 SQLite `events` 表（**审计权威**）。SQLite 镜像写入失败时不让事件发布失败、也不重试——它会与 ndjson 暂时漂移，属主动降级。镜像失败累计计数经 `/cbx/api/metrics`（`healthz` 只读指标）的 `eventMirrorFailures` 暴露（进程内存态，重启归零），>0 时说明 SSE 回放可能与此 job 的 ndjson 不一致，值得排查。
 
-**审计权威与防篡改**：job 级事件（`logJobEvent` / 执行器调用事件）同时镜像进 SQLite `events` 表（带 `job_id` 列，schema v6）。**执行器（不可信子进程）只有文件系统权限、没有 SQLite 连接，无法写入 events 表**——因此 SQLite 是执行器无法篡改的审计权威；`events.ndjson` 降级为展示/轮转镜像，可被执行器改写。读取面（timeline / 崩溃根因 / 事件增量 / executor 命令展示）**优先读 SQLite**，镜像缺失时回退 ndjson。审计完整性的**展示面**：`cbx_status` 附 `__audit` 验证结果、`cbx_result`/`result.json` 附 `auditIntegrity`、`cbx_list` 与 Web 仪表盘展示 Audit 列（`篡改!` / `✓` / `—`）与详情面板审计状态、`cbx_health` 聚合 `audit.checked/tampered` 计数。已知边界：旧任务（无 SQLite 镜像）无法验证；对抗性执行器若能同时掌握镜像内容（如读 jobDir 的 events.ndjson 但改不了 SQLite）只能伪造 ndjson 造成漂移被检测，无法污染权威。
+**审计权威与防篡改**：job 级事件（`logJobEvent` / 执行器调用事件）同时镜像进 SQLite `events` 表（带 `job_id` 列，schema v6）。**执行器（不可信子进程）只有文件系统权限、没有 SQLite 连接，无法写入 events 表**——因此 SQLite 是执行器无法篡改的审计权威；`events.ndjson` 降级为展示/轮转镜像，可被执行器改写。读取面（timeline / 崩溃根因 / 事件增量 / executor 命令展示）**优先读 SQLite**，镜像缺失时回退 ndjson。审计完整性的**展示面**：`cbx_status` 附 `__audit` 验证结果、`cbx_result`/`result.json` 附 `auditIntegrity`、`cbx_list` 与 Web 仪表盘展示 Audit 列（`篡改!` / `✓` / `—`）与详情面板审计状态、`cbx_health` 聚合 `audit.checked/tampered` 计数。验证口径：ndjson 必须是 SQLite 镜像的**连续尾部子序列**（每行逐字段一致，含 payload 内容）——头部缺失（轮转/保留期清理）不误报，改写任意行或删除中间行即判定篡改；ndjson 行数多于镜像（伪造追加）同样判定篡改；事件超 5 万条导致镜像读取截断时返回「无法验证」而非误报。已知边界：旧任务（无 SQLite 镜像）无法验证；对抗性执行器若能同时掌握镜像内容（如读 jobDir 的 events.ndjson 但改不了 SQLite）只能伪造 ndjson 造成漂移被检测，无法污染权威。
 
 > **schema 升级注意**：state.sqlite schema 版本已到 **v6**（`jobs.updated_at` 索引 v5 + `events.job_id` v6）。升级自动迁移且幂等；**降级回旧版本会被拒绝运行**（"schema 版本高于当前 cbx"）。升级后旧任务（v6 前创建）无 SQLite 事件镜像，审计验证显示"无法验证"（`cbx_health` 不计入 `audit.checked`），新任务全量镜像。
 
 ## 安全说明
 
 - **环境变量继承**：执行器/测试命令的子进程完整继承宿主的 `process.env`（与终端直接运行一致）。这是有意设计——编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境中的 API 凭据才能工作，因此不做变量过滤。可选硬化：插件 config 的 `executors.envAllowlist` 可收窄（见「配置」节）；日志落盘边界仍统一脱敏。
-- **落盘脱敏**：`agent.log` / `test.log` / `events.ndjson` 在写入边界对常见凭据形状（OpenAI/GitHub/Slack/Google/AWS key、私钥、Bearer token）做正则脱敏（流式跨 chunk 边界保留 16 字节重叠，防 key 被切断漏网）；事件流与遥测 span 中的长字段同时做长度截断，敏感键名（token/password/secret/…）整体替换；`plugin-request.json`（内嵌完整 prompt）在插件宿主读取后立即删除，不留持久副本。
+- **落盘脱敏**：`agent.log` / `test.log` / `events.ndjson` 在写入边界对常见凭据形状（OpenAI/GitHub/Slack/Google/AWS key、私钥、Bearer token）做正则脱敏（流式跨 chunk 边界保留 64 字节重叠 + 首 chunk 延迟写，防 key 被切断漏网；SQLite 审计镜像与 ndjson 共用同一份脱敏 payload，凭据不进入权威库）；事件流与遥测 span 中的长字段同时做长度截断，敏感键名（token/password/secret/…）整体替换；`plugin-request.json`（内嵌完整 prompt）在插件宿主读取后立即删除，不留持久副本。
 - **测试命令防线**：黑名单在匹配前先归一化（剥引号/反斜杠/`${var}`/`%var%`），拦截 `r\m`、`r""m` 一类拼接绕过；覆盖 `rm -rf`/`del /s`/`find -exec`/`git clean`/`truncate`/`dd`/`shred`/首 token `eval`/PowerShell 全部 `-EncodedCommand` 缩写；创建时与**执行时各验一次**（context.json 是执行器可写文件）。仍属软防线——非隔离任务请运行在受控环境，敏感场景建议 `isolated: true`。
 - **进程终止安全**：跨进程 kill 前按 pid 归属校验（见「行为语义」）；Windows 树杀始终走 `taskkill /T /F`（不用会漏掉孙进程的 `child.kill`）；abort 后设硬死线，杀不死的子进程不再让任务永久挂起。
 - **路径安全**：jobId 全链路校验（字符集白名单 + 拒绝 `..`/Windows 设备名/尾点段），目录删除与 context 写入共用同一道门；未跟踪符号链接不被跟随。

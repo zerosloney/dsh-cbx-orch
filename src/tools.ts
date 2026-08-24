@@ -457,8 +457,12 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       }
       const merged = mergeConfig(config, {
         testCommand: args.test,
-        review: args.review ?? defaults.review,
-        isolated: args.isolated ?? defaults.isolated,
+        // 优先级：显式参数 > 工作区 .cbx.json > 插件配置默认。用 `?? config.review`
+        // 而不是直接吃 defaults——mergeConfig 的 override 必胜，若传 defaults
+        // （schemastery .default(true) 保证非 undefined）会永久压制 .cbx.json 的
+        // review/isolated（与 executor/carryDirty 的三级链对齐）。
+        review: args.review ?? config.review ?? defaults.review,
+        isolated: args.isolated ?? config.isolated ?? defaults.isolated,
         timeoutMs: args.timeout_ms === undefined ? undefined : Number(args.timeout_ms),
         maxRetries: args.max_retries === undefined ? undefined : Number(args.max_retries),
         maxTurns: args.max_turns === undefined ? undefined : Number(args.max_turns),
@@ -533,8 +537,17 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
       try {
         created = await createJob(jobOptions);
       } catch (error) {
-        // 失败释放预留：不留毒键，同键重试可以真正重跑。
-        if (idempotencyKey) await abortIdempotentCreate(ws, idempotencyKey);
+        // 失败释放预留：不留毒键，同键重试可以真正重跑。abort 自身失败不能
+        // 掩盖 createJob 的真实失败原因（否则排障被误导为"清理失败"）。
+        if (idempotencyKey) {
+          try {
+            await abortIdempotentCreate(ws, idempotencyKey);
+          } catch (abortError) {
+            bridgeLog(
+              `cbx 幂等预留释放失败（${String(abortError)}）——同键 ${idempotencyKey} 重试将按 in-flight 处理，请稍后或换键。`,
+            );
+          }
+        }
         throw error;
       }
       if (idempotencyKey) await commitIdempotentCreate(ws, idempotencyKey, created.jobId);

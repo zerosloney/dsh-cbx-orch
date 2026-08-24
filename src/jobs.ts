@@ -7,6 +7,7 @@ import {
   loadPersistedState,
   redactText,
   now,
+  securityPolicyFingerprint,
 } from "./storage.js";
 import { loadConfig, jobDir } from "./state.js";
 import {
@@ -133,6 +134,18 @@ export async function createJob(options: {
   const persisted = await loadPersistedState<unknown>(workspace, jobId);
   if (persisted)
     throw new Error(`任务已存在（SQLite 有记录但目录缺失）：${jobId}`);
+  const baseline = await snapshotGitBaseline(workspace);
+  // 创建期 fail-fast：隔离任务无法携带未提交内容（worktree 从干净基线创建）。
+  // 在创建时立刻给可操作提示，避免任务带病入队、执行期才因 dirty_baseline 崩溃。
+  // carryDirty: true 时才允许——把未提交改动带进隔离 worktree 执行。
+  if (options.isolated && baseline?.dirty && !options.carryDirty) {
+    throw new Error(
+      "隔离任务无法携带创建时的未提交内容。三种处理方式：\n" +
+        "  1) 先提交或清理工作区（git commit / stash）后重试；\n" +
+        "  2) 设 carryDirty: true（工具参数 carry_dirty）——把当前未提交改动带进隔离 worktree，任务在主工作区之外安全执行；\n" +
+        "  3) 设 isolated: false——任务直接在当前工作区（含未提交改动）执行。",
+    );
+  }
   await mkdir(directory, { recursive: true });
   const request = `# 任务\n\n## 目标\n\n${taskContract?.goal ?? options.task.trim()}\n\n## 验收标准\n\n${taskContract?.acceptanceCriteria?.map((item) => `- ${item}`).join("\n") || "- 以目标和验收命令为准。"}\n\n## 非目标\n\n${taskContract?.nonGoals?.map((item) => `- ${item}`).join("\n") || "- 未指定。"}\n\n## 约束\n\n${taskContract?.constraints?.map((item) => `- ${item}`).join("\n") || "- 只修改完成目标所需的文件。"}\n\n## 验收命令\n\n${options.testCommand ?? "未指定；请根据项目现有脚本选择最相关的检查。"}\n\n## 执行规则\n\n- 先检查项目结构和现有测试，再修改。\n- 完成后运行验收命令。\n- 将修改摘要、测试命令、测试结果和遗留问题写入 handback.md。\n`;
   await writeFile(path.join(directory, "request.md"), request, "utf8");
@@ -150,18 +163,6 @@ export async function createJob(options: {
     );
   if (taskContract)
     await saveJson(path.join(directory, "context-contract.json"), taskContract);
-  const baseline = await snapshotGitBaseline(workspace);
-  // 创建期 fail-fast：隔离任务无法携带未提交内容（worktree 从干净基线创建）。
-  // 在创建时立刻给可操作提示，避免任务带病入队、执行期才因 dirty_baseline 崩溃。
-  // carryDirty: true 时才允许——把未提交改动带进隔离 worktree 执行。
-  if (options.isolated && baseline?.dirty && !options.carryDirty) {
-    throw new Error(
-      "隔离任务无法携带创建时的未提交内容。三种处理方式：\n" +
-        "  1) 先提交或清理工作区（git commit / stash）后重试；\n" +
-        "  2) 设 carryDirty: true（工具参数 carry_dirty）——把当前未提交改动带进隔离 worktree，任务在主工作区之外安全执行；\n" +
-        "  3) 设 isolated: false——任务直接在当前工作区（含未提交改动）执行。",
-    );
-  }
   // v2 脏指纹（仅跟踪文件）：未跟踪 scratch 文件不再触发非隔离任务的脏漂移误报。
   const dirtyFingerprint = await gitDirtyFingerprintTracked(workspace);
   const runtimeConfig = await loadConfig(workspace);
@@ -229,6 +230,10 @@ export async function createJob(options: {
     attempt: 0,
     // P0-2: 创建时记录 maxTurns，UI/result 可直接读取实际预算而无需推断。
     configuredMaxTurns: context.maxTurns,
+    // 安全策略指纹（成本闸/插件白名单/reviewGate/环境白名单）：创建时固定，
+    // 执行期现读 .cbx.json 重算比对——防非隔离执行器中途改写 .cbx.json 静默
+    // 拆掉安全/成本控制。存 SQLite（state 权威），执行器无连接无法篡改。
+    securityFingerprint: securityPolicyFingerprint(runtimeConfig),
   };
   await savePersistedState(workspace, jobId, state);
   // 创建期的 state.json 镜像（权威在 SQLite），无需 fsync。

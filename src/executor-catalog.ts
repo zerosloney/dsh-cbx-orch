@@ -97,13 +97,17 @@ export function buildTierCatalog(
   // 先算实测平均延迟，再定谁参与校准。一律走滑动窗口口径（windowStats 对旧格式
   // 记录自动回退累计字段）：机器变慢/换执行器版本后，校准跟着最近几次调用走，
   // 而不是被历史平均稀释。
+  // 延迟只取**成功样本**（successLatency*）：失败/超时样本的延迟（超时≈整个
+  // timeoutMs）会污染速度档推导——fail-fast 崩溃执行器的平均延迟会因失败样本
+  // 虚低而被推导为最高 speedTier，fastest 策略反而首选间歇崩溃者。失败代价由
+  // 路由层的 crashStreak/timeoutStreak 独立重罚，档位只应反映"成功时的真实速度"。
   const measured = new Map<string, { avg: number; samples: number }>();
   for (const spec of BUILTIN_EXECUTORS) {
     const stats = windowStats(health[spec.name]);
-    if (stats.latencySamples >= MIN_TIER_CALIBRATION_SAMPLES && stats.totalLatencyMs > 0) {
+    if (stats.successLatencySamples >= MIN_TIER_CALIBRATION_SAMPLES && stats.successTotalLatencyMs > 0) {
       measured.set(spec.name, {
-        avg: stats.totalLatencyMs / stats.latencySamples,
-        samples: stats.latencySamples,
+        avg: stats.successTotalLatencyMs / stats.successLatencySamples,
+        samples: stats.successLatencySamples,
       });
     }
   }
@@ -126,11 +130,12 @@ function tierViewFor(
   bestAvg: number,
   override?: ExecutorTiersOverride,
 ): ExecutorTierView {
-  // 视图里的 samples/avg 与校准同口径：滑动窗口内的观测（非终身累计）。
+  // 视图里的 samples/avg 与校准同口径：只统计成功样本（失败延迟会污染速度档
+  // 推导，见 buildTierCatalog 注释）——展示值与推导 speedTier 用的值一致。
   const stats = windowStats(health[spec.name]);
-  const samples = stats.latencySamples;
+  const samples = stats.successLatencySamples;
   const avgLatencyMs =
-    samples > 0 ? Math.round(stats.totalLatencyMs / samples) : undefined;
+    samples > 0 ? Math.round(stats.successTotalLatencyMs / samples) : undefined;
 
   // cost：无本地可测量来源，只有 configured > declared 两档。
   const costOverride = override?.costTier;

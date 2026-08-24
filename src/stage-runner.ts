@@ -27,7 +27,7 @@ import {
   type VerifiedProgress,
 } from "./progress.js";
 import { evidenceHashes, structuredAuditRequested } from "./evidence.js";
-import { ExecutorCostLimitError } from "./errors.js";
+import { ExecutorCostLimitError, isUnretryableInvocationError } from "./errors.js";
 import { createHumanGate } from "./human-gate.js";
 import { resolveExecutor } from "./executors/builtin.js";
 import { contextArtifacts, AUDIT_CANDIDATE } from "./artifacts.js";
@@ -119,8 +119,8 @@ export async function requestAdaptiveAction(params: {
       { role: "manager", jobId: context.jobId },
     );
   } catch (error) {
-    // 成本硬闸原样穿透：由 execution.ts 的 adaptive 循环 catch 转 needs_fix + human gate。
-    if (error instanceof ExecutorCostLimitError) throw error;
+    // 成本硬闸/策略漂移原样穿透：由 execution.ts 的 adaptive 循环 catch 转 needs_fix + human gate。
+    if (isUnretryableInvocationError(error)) throw error;
     invocationError = error;
   }
   const after = await snapshotDiff(workdir);
@@ -397,17 +397,17 @@ export async function runStage(params: {
         { role: "stage", jobId, stageIndex },
       );
     } catch (error) {
-      // 成本硬闸：已达 maxExecutorInvocations 上限——转 needs_fix + human gate，
-      // 绝不走重试（重试只会继续烧配额）。取消竞态检查仍优先。
-      if (error instanceof ExecutorCostLimitError) {
+      // 成本硬闸/策略漂移：已达上限或配置被改——转 needs_fix + human gate，
+      // 绝不走重试（重试只会继续烧配额或绕过已拒绝的策略）。取消竞态检查仍优先。
+      if (isUnretryableInvocationError(error)) {
         const state = await finish({
           status: "needs_fix",
-          phase: "cost_limit",
+          phase: error instanceof ExecutorCostLimitError ? "cost_limit" : "policy_drift",
           stage: stage.name,
           error: error.message,
           humanGate: createHumanGate("needs_input", {
             detail: error.message,
-            questions: ["提高 max_executor_invocations 后继续，或取消任务。"],
+            questions: ["确认 .cbx.json 配置变更意图后继续，或取消任务。"],
           }),
         });
         return outcome(true, state, -1, null, null);
@@ -649,15 +649,15 @@ export async function runStage(params: {
       );
     } catch (error) {
       // 成本硬闸：已达上限转 needs_fix（审查也计入同一调用预算），不走 retry。
-      if (error instanceof ExecutorCostLimitError) {
+      if (isUnretryableInvocationError(error)) {
         const state = await finish({
           status: "needs_fix",
-          phase: "cost_limit",
+          phase: error instanceof ExecutorCostLimitError ? "cost_limit" : "policy_drift",
           stage: stage.name,
           error: error.message,
           humanGate: createHumanGate("needs_input", {
             detail: error.message,
-            questions: ["提高 max_executor_invocations 后继续，或取消任务。"],
+            questions: ["确认 .cbx.json 配置变更意图后继续，或取消任务。"],
           }),
         });
         return outcome(true, state, 0, 0, null);

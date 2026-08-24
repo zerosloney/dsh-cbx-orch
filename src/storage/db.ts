@@ -36,39 +36,50 @@ function migrate(db: CbxDatabase): void {
   );
   if (version < 1)
     db.transaction(() => {
+      // 并发首开迁移（两进程同读 version=0 各跑一遍）时，CREATE IF NOT EXISTS +
+      // INSERT OR IGNORE 让后跑者幂等通过，不再撞 "table already exists" / 主键冲突。
       db.exec(
-        "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE queue_state (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), state_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE delivery_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, record_json TEXT NOT NULL); CREATE TABLE service_leases (name TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS jobs (job_id TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS queue_state (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), state_json TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS delivery_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, record_json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS service_leases (name TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
       );
       db.prepare(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
       ).run(1, now());
     })();
   if (version < 2)
     db.transaction(() => {
       db.exec(
-        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
       );
       db.prepare(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
       ).run(2, now());
     })();
   if (version < 3)
     db.transaction(() => {
-      db.exec("ALTER TABLE service_leases ADD COLUMN owner_token TEXT");
+      // 列存在性检查：并发迁移时后跑者跳过已加的列（ALTER 无 IF NOT EXISTS）。
+      const hasOwnerToken = (
+        db
+          .prepare(
+            "SELECT 1 FROM pragma_table_info('service_leases') WHERE name = 'owner_token'",
+          )
+          .get() as { "1"?: number } | undefined
+      ) !== undefined;
+      if (!hasOwnerToken)
+        db.exec("ALTER TABLE service_leases ADD COLUMN owner_token TEXT");
       db.exec(
-        "CREATE TABLE delivery_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, channel TEXT NOT NULL, endpoint TEXT NOT NULL, body_json TEXT NOT NULL, config_json TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at INTEGER NOT NULL, locked_by TEXT, locked_until INTEGER, last_error TEXT); CREATE INDEX delivery_outbox_available_idx ON delivery_outbox(available_at, id)",
+        "CREATE TABLE IF NOT EXISTS delivery_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, channel TEXT NOT NULL, endpoint TEXT NOT NULL, body_json TEXT NOT NULL, config_json TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, available_at INTEGER NOT NULL, locked_by TEXT, locked_until INTEGER, last_error TEXT); CREATE INDEX IF NOT EXISTS delivery_outbox_available_idx ON delivery_outbox(available_at, id)",
       );
       db.prepare(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
       ).run(3, now());
     })();
   if (version < 4)
     db.transaction(() => {
       db.exec(
-        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, workspace TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, payload_json TEXT NOT NULL, at TEXT NOT NULL); CREATE INDEX events_workspace_seq_idx ON events(workspace, seq)",
+        "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, workspace TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL, payload_json TEXT NOT NULL, at TEXT NOT NULL); CREATE INDEX IF NOT EXISTS events_workspace_seq_idx ON events(workspace, seq)",
       );
       db.prepare(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
       ).run(4, now());
     })();
   if (version < 5)
@@ -77,19 +88,26 @@ function migrate(db: CbxDatabase): void {
       // 索引让 ORDER BY updated_at DESC 走索引。jobs 行以 job_id 为主键的写路径不受影响。
       db.exec("CREATE INDEX IF NOT EXISTS jobs_updated_at_idx ON jobs(updated_at DESC)");
       db.prepare(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
       ).run(5, now());
     })();
   if (version < 6)
     db.transaction(() => {
       // job 级事件镜像进 SQLite（审计权威）：执行器子进程只有文件系统权限、无
       // SQLite 连接，无法篡改 events 表。job_id 列支持按任务过滤查询。
-      db.exec("ALTER TABLE events ADD COLUMN job_id TEXT");
+      const hasJobId = (
+        db
+          .prepare(
+            "SELECT 1 FROM pragma_table_info('events') WHERE name = 'job_id'",
+          )
+          .get() as { "1"?: number } | undefined
+      ) !== undefined;
+      if (!hasJobId) db.exec("ALTER TABLE events ADD COLUMN job_id TEXT");
       db.exec(
         "CREATE INDEX IF NOT EXISTS events_workspace_job_seq_idx ON events(workspace, job_id, seq)",
       );
       db.prepare(
-        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
       ).run(6, now());
     })();
   if (version > SCHEMA_VERSION)

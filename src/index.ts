@@ -10,6 +10,7 @@ import { registerCbxTools, type CbxDefaults } from "./tools.js";
 import { registerCbxCommands } from "./commands.js";
 import { acquireScheduler, type SchedulerHandle } from "./queue-api.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
+import { installCbxSettings } from "./settings-integration.js";
 
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -81,6 +82,13 @@ export default class CbxOrchestrator extends Service {
     );
     registerCbxTools(ctx, defaults);
     registerCbxCommands({ ctx, defaults });
+    // ctx.settings 集成（可选）：settings 服务存在时把插件默认配置暴露为用户设置
+    // namespace `cbx`（executor/review/isolated/carryDirty/envAllowlist），变更即时
+    // 生效；宿主无 settings 服务时静默跳过。返回 disposer 并入卸载链。
+    let disposeSettings: (() => void) | undefined;
+    void installCbxSettings(ctx, defaults, config).then((disposer) => {
+      disposeSettings = disposer;
+    });
     let disposeSchedulers: (() => Promise<void>) | undefined;
     // Register provider teardown before the scheduler effect. Cordis unloads
     // effects in reverse registration order; the explicit await below also
@@ -96,18 +104,23 @@ export default class CbxOrchestrator extends Service {
             disposeEnvAllowlist();
           } finally {
             try {
-              // 先排空 job 事件 SQLite 镜像（fire-and-forget 在途写入），
-              // 再关数据库连接，避免审计记录因连接关闭而丢失。
-              await flushJobEventMirrors();
+              // settings 集成的 envAllowlist 还原（若 settings 覆盖过初始值）。
+              disposeSettings?.();
             } finally {
               try {
-                // 清理健康度防抖定时器与内存缓存（进程退出，落盘 best-effort）。
-                resetHealthStore();
+                // 先排空 job 事件 SQLite 镜像（fire-and-forget 在途写入），
+                // 再关数据库连接，避免审计记录因连接关闭而丢失。
+                await flushJobEventMirrors();
               } finally {
                 try {
-                  await closeDatabaseConnections();
+                  // 清理健康度防抖定时器与内存缓存（进程退出，落盘 best-effort）。
+                  resetHealthStore();
                 } finally {
-                  disposeObservability();
+                  try {
+                    await closeDatabaseConnections();
+                  } finally {
+                    disposeObservability();
+                  }
                 }
               }
             }

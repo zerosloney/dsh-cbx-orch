@@ -95,7 +95,7 @@ test("verifyJobAudit: 执行器篡改 ndjson（追加伪造事件）被检测为
   const result = await verifyJobAudit(workspace, jobId);
   assert.equal(result.tampered, true);
   assert.equal(result.valid, false);
-  assert.match(result.reason ?? "", /不一致|不匹配/);
+  assert.match(result.reason ?? "", /不一致|不匹配|多于|伪造/);
 });
 
 test("verifyJobAudit: 执行器篡改 ndjson（删除行）被检测为 tampered", async () => {

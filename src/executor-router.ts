@@ -239,7 +239,11 @@ function scoreExecutor(spec: BuiltinExecutor, ctx: ScoreContext): number {
     case "round-robin":
     case "least-recently-used": {
       const used = h?.lastUsedAt ? Date.parse(h.lastUsedAt) : 0;
-      s += ((ctx.now - used) / 60_000) * 4; // 越久未用分越高
+      // 越久未用分越高，但封顶 60 分钟闲置（240 分）：旧实现无上限，闲置约 1 小时
+      // 后分数无限累积、压过一切健康度罚——"间歇崩溃的闲置执行器"会被无限抬升。
+      // 封顶后 LRU 语义保留（60 分钟内闲置分单调），但不再无界。
+      const idleMinutes = Math.max(0, (ctx.now - used) / 60_000);
+      s += Math.min(idleMinutes, 60) * 4;
       break;
     }
     case "first-available":

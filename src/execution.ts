@@ -34,7 +34,7 @@ import { contextRedactor, contextArtifacts } from "./artifacts.js";
 import { prepareWorktree, snapshotDiff, commitWorktree } from "./git-ops.js";
 import { tryMigrateDirtyFingerprintV2 } from "./baseline.js";
 import { assertExecutionPolicy } from "./validation.js";
-import { ExecutorCostLimitError } from "./errors.js";
+import { ExecutorCostLimitError, isUnretryableInvocationError } from "./errors.js";
 import {
   createHumanGate,
   parseHumanGate,
@@ -501,21 +501,23 @@ async function executeJobLocked(
             });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        // 成本硬闸：adaptive manager 调用已达上限——转 needs_fix + human gate。
-        if (error instanceof ExecutorCostLimitError) {
+        // 成本硬闸/策略漂移：adaptive manager 调用已达上限或配置被改——转 needs_fix + human gate。
+        if (isUnretryableInvocationError(error)) {
+          const driftPhase =
+            error instanceof ExecutorCostLimitError ? "cost_limit" : "policy_drift";
           adaptiveRounds = [
             ...adaptiveRounds,
-            { round, action: "error", phase: "cost_limit", error: message },
+            { round, action: "error", phase: driftPhase, error: message },
           ];
           return finish({
             status: "needs_fix",
-            phase: "cost_limit",
+            phase: driftPhase,
             adaptiveRound: round,
             adaptiveRounds,
             error: message,
             humanGate: createHumanGate("needs_input", {
               detail: message,
-              questions: ["提高 max_executor_invocations 后继续，或取消任务。"],
+              questions: ["确认 .cbx.json 配置变更意图后继续，或取消任务。"],
             }),
           });
         }

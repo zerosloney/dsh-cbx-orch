@@ -1,4 +1,5 @@
 import type { Context } from "@deepseek-ai/cordis";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { listJobs } from "./artifacts.js";
@@ -73,6 +74,8 @@ export interface JobsRegistryLike {
 export interface CbxBridgeResult {
   /** Harness 原生 job id（`job_output` / `job_kill` 用），未注册成功时缺省。 */
   id?: string;
+  /** 该 job 已有存活桥接任务（cbx_continue 场景复用），非新建。 */
+  existing?: boolean;
   /** 失败原因分类；成功时缺省。调用方根据 reason 决定如何在 UI 上提示。 */
   reason?:
     | "no-agent-context"
@@ -99,6 +102,42 @@ export interface CbxBridgeOptions {
    * 测试时传 spy，生产传 `ctx.logger('cbx')`。
    */
   logger?: (message: string) => void;
+}
+
+/** 一个存活桥接任务的句柄（registry 条目）。 */
+interface BridgeHandle {
+  /** harness 原生 job id（jobs.start 返回）。 */
+  id: string;
+  /** 是否已 settle（终态收口）；settle 后从 registry 移除，允许重新注册。 */
+  settled: boolean;
+}
+
+/**
+ * 每个 context 一份存活桥接任务 registry（key = workspace::jobId），随 context
+ * 生命周期清理。用途：防止同一 cbx job 重复 cbx_continue 时注册多个 harness 后台
+ * 任务（旧实现每次都 jobs.start，产生双份轮询/完成通知/cancel 转发）——与
+ * subagent-facade 的 registry 复用同一模式。
+ */
+const bridgeRegistries = new WeakMap<Context, Map<string, BridgeHandle>>();
+
+function bridgeRegistryOf(ctx: Context): Map<string, BridgeHandle> {
+  let registry = bridgeRegistries.get(ctx);
+  if (registry === undefined) {
+    registry = new Map();
+    bridgeRegistries.set(ctx, registry);
+    try {
+      ctx.effect(() => () => {
+        registry!.clear();
+      });
+    } catch {
+      /* ctx.effect 缺位（瘦 profile）：各 handle 的 settle 路径自行收口 */
+    }
+  }
+  return registry;
+}
+
+function bridgeKey(workspace: string, jobId: string): string {
+  return `${workspace}::${jobId}`;
 }
 
 /**
@@ -152,14 +191,40 @@ export function bridgeCbxJob(
     return { reason };
   }
   const label = `cbx ${options.jobId}: ${options.task.replace(/\s+/g, " ").trim().slice(0, 80)}`;
+  // 去重：同一 job 已有存活桥接任务时复用（返回 existing: true），避免双份轮询/
+  // 完成通知/cancel 转发。与 subagent-facade 的 registry 复用同一模式。
+  const registry = bridgeRegistryOf(ctx);
+  const key = bridgeKey(options.workspace, options.jobId);
+  const existingHandle = registry.get(key);
+  if (existingHandle && !existingHandle.settled) {
+    options.logger?.(
+      `cbx jobs-bridge: 复用既有桥接任务 (${options.jobId}, harness job id: ${existingHandle.id})。`,
+    );
+    return { id: existingHandle.id, existing: true };
+  }
   try {
     const id = jobs.start({
       kind: "cbx",
       label,
       owner: agent,
       outputLimitBytes: OUTPUT_LIMIT_BYTES,
-      run: () => monitorCbxJob(options.workspace, options.jobId, POLL_MS, options.router),
+      run: () =>
+        monitorCbxJob(
+          options.workspace,
+          options.jobId,
+          POLL_MS,
+          options.router,
+          () => {
+            // settle 后从 registry 移除：下次 cbx_continue 可重新注册（旧任务已终态）。
+            const current = registry.get(key);
+            if (current && current.id === id && !current.settled) {
+              current.settled = true;
+              registry.delete(key);
+            }
+          },
+        ),
     });
+    registry.set(key, { id, settled: false });
     return { id };
   } catch (error) {
     const reason = "registration-rejected" as const;
@@ -259,6 +324,8 @@ export function monitorCbxJob(
   jobId: string,
   pollMs = POLL_MS,
   router?: RouterInfoLike,
+  /** settle（终态收口）后回调：bridgeCbxJob 用它把 registry 条目标记 settled 并移除。 */
+  onSettled?: () => void,
 ): {
   cancel(reason?: string): void;
   done: Promise<{ status: "completed" | "killed" | "failed"; detail?: string; output?: string }>;
@@ -282,6 +349,12 @@ export function monitorCbxJob(
     settled = true;
     if (timer) clearTimeout(timer);
     resolveDone(outcome);
+    // 终态通知在 resolveDone 之后：registry 移除不应阻塞调用方等待 done。
+    try {
+      onSettled?.();
+    } catch {
+      /* 回调异常不影响 settle 本身 */
+    }
   };
 
   const tick = async (): Promise<void> => {
@@ -296,9 +369,11 @@ export function monitorCbxJob(
 
   const tickOnce = async (): Promise<void> => {
     let state: JobState | undefined;
+    let stateReadFailed = false;
     try {
       state = await loadState(workspace, jobId);
     } catch {
+      stateReadFailed = true;
       state = undefined;
     }
     if (state) {
@@ -337,6 +412,17 @@ export function monitorCbxJob(
         });
         return;
       }
+    } else if (stateReadFailed) {
+      // loadState 失败：区分「真移除/从未存在」与「瞬时读失败」。
+      // - 目录或 state.json 不存在（forget/purge 清干净 / 任务从未创建）= 终止；
+      // - 目录与 state.json 都在但 SQLite 读失败（瞬时/WAL 抖动）= 本轮跳过重试，
+      //   不误判 killed（否则用户在任务运行时收到终止通知）。
+      const dir = jobDir(workspace, jobId);
+      if (!existsSync(dir) || !existsSync(path.join(dir, "state.json"))) {
+        settle({ status: "killed", detail: "job directory removed" });
+        return;
+      }
+      // 目录与 state.json 在：读失败是瞬时问题，下一轮继续尝试（不打日志防刷屏）。
     } else {
       // job 目录消失（forget/purge）：视为已终止。
       settle({ status: "killed", detail: "job directory removed" });

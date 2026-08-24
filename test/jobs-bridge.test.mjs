@@ -144,6 +144,32 @@ test("bridgeCbxJob: 有 agent 与 jobs 时注册并返回 harness job id", async
   });
 });
 
+test("bridgeCbxJob: 同 job 二次注册复用既有桥接任务（existing=true），不重复 start", async () => {
+  await withJob(async ({ workspace, jobId }) => {
+    const specs = [];
+    const jobs = {
+      start: (spec) => { specs.push(spec); return "cbx-dedup"; },
+    };
+    // 同一 ctx（registry 按 ctx 键控）：二次注册应命中 registry 复用。
+    const ctx = fakeContext(jobs);
+    const agent = { id: "session-1" };
+    const first = bridgeCbxJob(ctx, { workspace, jobId, task: "t1", agent });
+    assert.equal(first.id, "cbx-dedup");
+    assert.equal(first.existing, undefined);
+    const second = bridgeCbxJob(ctx, { workspace, jobId, task: "t2", agent });
+    assert.equal(second.id, "cbx-dedup", "复用既有 harness job id");
+    assert.equal(second.existing, true, "标记为复用而非新建");
+    assert.equal(specs.length, 1, "jobs.start 只应调用一次");
+    // 首个监视器 settle 后 registry 移除：再注册可新建（旧任务已终态）。
+    const monitor = specs[0].run();
+    await monitor.done; // 目录无 state → 视为 killed → settle → registry 移除
+    const third = bridgeCbxJob(ctx, { workspace, jobId, task: "t3", agent });
+    assert.equal(specs.length, 2, "终态后重新注册");
+    assert.equal(third.existing, undefined);
+    await specs[1].run().done;
+  });
+});
+
 test("bridgeCbxJob: jobs.start 抛错时返回 reason=registration-rejected + detail", async () => {
   await withJob(async ({ workspace, jobId }) => {
     const logs = [];

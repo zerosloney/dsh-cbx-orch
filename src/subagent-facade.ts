@@ -3,6 +3,8 @@ import type { AssistantMessage, MessageId, UserMessage } from "@deepseek-ai/dsh-
 import type { Session, SessionId, SessionStore } from "@deepseek-ai/dsh-session";
 import type { ToolRestriction } from "@deepseek-ai/dsh-tools";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import { readArtifact } from "./artifacts.js";
 import { resolveAgent, tailAgentLog } from "./jobs-bridge.js";
 import { buildSessionMessage, progressLine, routeNote, type RouterInfoLike } from "./session-message.js";
@@ -304,15 +306,25 @@ function scheduleMirror(options: CbxFacadeOptions, handle: FacadeHandle, pollMs:
 async function mirrorOnce(options: CbxFacadeOptions, handle: FacadeHandle): Promise<void> {
   const { workspace, jobId } = options;
   let state: JobState | undefined;
+  let stateReadFailed = false;
   try {
     state = await loadState(workspace, jobId);
   } catch {
+    stateReadFailed = true;
     state = undefined;
   }
   if (state === undefined) {
-    // job 目录消失（forget/purge）：视为已终止。
-    appendAssistant(handle, `[cbx ${jobId}] job 目录已移除，前台镜像结束。`);
-    await settleFacade(options, handle);
+    // 区分「真移除/从未存在」与「瞬时读失败」：目录或 state.json 不存在
+    // （forget/purge 清干净 / 任务从未创建）= 终止；都在但 SQLite 读失败
+    // （瞬时/WAL 抖动）= 本轮跳过重试，不误报终止。
+    const dir = jobDir(workspace, jobId);
+    if (!stateReadFailed || !existsSync(dir) || !existsSync(path.join(dir, "state.json"))) {
+      // job 目录消失（forget/purge）：视为已终止。
+      appendAssistant(handle, `[cbx ${jobId}] job 目录已移除，前台镜像结束。`);
+      await settleFacade(options, handle);
+      return;
+    }
+    // loadState 读失败但目录与 state.json 在（瞬时问题）：本轮跳过，下一轮重试。
     return;
   }
 

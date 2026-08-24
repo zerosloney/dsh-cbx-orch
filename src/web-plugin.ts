@@ -28,6 +28,27 @@ export interface WorkspaceRegistryLike {
   list(): ReadonlyArray<{ path: string }>;
 }
 
+/** webServer 轮询窗口：25 × 200ms = 5s（harness 启动时序繁忙时给足裕量）。 */
+const WEB_SERVER_WAIT_ATTEMPTS = 25;
+const WEB_SERVER_POLL_MS = 200;
+/** 首次轮询超时后的一次延迟重试间隔：晚就绪的 webServer 仍能挂上仪表盘，
+ *  不再"2s 没等到就永远不挂载且零诊断"。 */
+const WEB_SERVER_RETRY_MS = 30_000;
+
+/** Wait briefly for an optional web server without making it a required injection. */
+async function waitForWebServer(ctx: Context): Promise<Context["webServer"] | undefined> {
+  for (let attempt = 0; attempt < WEB_SERVER_WAIT_ATTEMPTS; attempt += 1) {
+    try {
+      const webServer = ctx.get("webServer") as Context["webServer"] | undefined;
+      if (typeof webServer?.register === "function") return webServer;
+    } catch {
+      /* Headless profile or web server not ready yet. */
+    }
+    await new Promise((resolve) => setTimeout(resolve, WEB_SERVER_POLL_MS));
+  }
+  return undefined;
+}
+
 /**
  * Resolve the effective workspace list for the web dashboard.
  *
@@ -119,12 +140,11 @@ async function resolveWebToken(
 
 /**
  * Web entry of the cbx orchestrator: mounts the dashboard (HTML + REST + SSE)
- * under `/cbx` on the harness web server. Injects `webServer`, so it only
- * activates in profiles that host the web server; headless profiles load the
- * core plugin alone.
+ * under `/cbx` on the harness web server. The web server is optional so the
+ * bundle can also load its core entry in headless profiles.
  */
 export default class CbxWeb extends Service {
-  static inject = ["cbx", "webServer"];
+  static inject = ["cbx"];
 
   static Config: z<WebConfig> = z.object({
     web: z.object({
@@ -132,6 +152,13 @@ export default class CbxWeb extends Service {
       workspaces: z.array(z.string()),
     }),
   });
+
+  /**
+   * 仪表盘路由是否已真实挂载到 webServer。与「服务存在」不同：token fail-closed、
+   * 工作区策略解析失败、webServer 就绪超时都会让服务存在但路由未挂载。供
+   * commands.ts 的 webPluginActive 判定（/cbx-web 据此区分"可访问"与"未挂载"）。
+   */
+  mounted = false;
 
   constructor(ctx: Context, config: WebConfig) {
     super(ctx, "cbxWeb");
@@ -172,13 +199,50 @@ export default class CbxWeb extends Service {
     // token 解析是异步的：解析完成前插件可能已被卸载（HMR/关闭），此时不得再注册路由，
     // 否则路由/尾部 tailer/心跳定时器会挂在一个已 dispose 的 ctx 上泄漏。
     let disposed = false;
+    let retryTimer: NodeJS.Timeout | undefined;
     ctx.effect(() => async () => {
       disposed = true;
+      // 清掉延迟重试定时器：卸载后不得再尝试挂载（挂在已 dispose 的 ctx 上）。
+      if (retryTimer !== undefined) {
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
       await releaseOwned();
       await waitPendingAcquires();
       await releaseOwned();
     }, "cbxWeb.lifecycle");
-    void (async () => {
+    // 挂载尝试（含 webServer 等待）：首轮超时打日志并 30s 后重试一次——晚就绪的
+    // webServer 仍能挂上，不再"2s 没等到就永远不挂载且零诊断"（旧实现静默 return）。
+    let mountAttempted = false;
+    const attemptMount = async (): Promise<void> => {
+      if (disposed) return;
+      const webServer = await waitForWebServer(ctx);
+      if (disposed) return;
+      if (!webServer) {
+        if (!mountAttempted) {
+          // 首轮超时：区分 headless（无 web 层，预期行为）与"webServer 就绪慢"（故障）。
+          // ctx.get 不抛错且返回 undefined = 服务未注册；无法完全区分两者，但延迟
+          // 重试 + 明确日志能让"晚就绪"自愈，headless 则只记一次 warn 不刷屏。
+          ctx.logger("cbx").warn(
+            `cbx web: ${WEB_SERVER_WAIT_ATTEMPTS * WEB_SERVER_POLL_MS / 1000}s 内未检测到 webServer，30s 后将重试一次。` +
+              "若本 profile 无 web 层（headless），此提示可忽略。",
+          );
+        }
+        if (!retryTimer) {
+          retryTimer = setTimeout(() => {
+            retryTimer = undefined;
+            void attemptMount().catch((error) => {
+              // 重试挂载异常：记录并放弃（不产生 unhandled rejection）。
+              ctx.logger("cbx").error(
+                `cbx web 延迟重试挂载失败：${error instanceof Error ? error.message : String(error)}`,
+              );
+            });
+          }, WEB_SERVER_RETRY_MS);
+          retryTimer.unref?.();
+        }
+        return;
+      }
+      mountAttempted = true;
       if (explicitWorkspaces.length === 0) {
         // 空配置：Web 层没有会话上下文，但 harness 工作区注册表（ctx.workspaceRegistry）
         // 记录了用户实际打开的工作区目录（会话 cwd → workspace 记录）。跟随注册表而非
@@ -192,14 +256,15 @@ export default class CbxWeb extends Service {
               `cbx web 未配置 web.workspaces，跟随 harness 工作区注册表（${registryWorkspaces.length} 个）：${registryWorkspaces.join(", ")}`,
             );
             // 注册表路径已是 canonical（realpath），WorkspacePolicy 会再次校验目录存在性。
-            await registerWebWith(new WorkspacePolicy([...registryWorkspaces]));
+            await registerWebWith(new WorkspacePolicy([...registryWorkspaces]), webServer);
             return;
           }
           // 注册表存在但为空：回落 process.cwd()（旧行为）。
         }
       }
-      await registerWebWith(workspacePolicy);
-    })().catch(async (error) => {
+      await registerWebWith(workspacePolicy, webServer);
+    };
+    void attemptMount().catch(async (error) => {
       const wasDisposed = disposed;
       disposed = true;
       await releaseOwned();
@@ -212,8 +277,12 @@ export default class CbxWeb extends Service {
       }
     });
     // registerWebWith 内部完成调度器获取、token 解析与路由挂载；拆成函数以支持
-    // 注册表派生列表与显式列表两条路径共用同一套启动流程。
-    function registerWebWith(policy: WorkspacePolicy): Promise<void> {
+    // 注册表派生列表与显式列表两条路径共用同一套启动流程。箭头函数保持 this
+    // 指向实例，成功挂载后置 mounted 供 commands.ts 判定。
+    const registerWebWith = async (
+      policy: WorkspacePolicy,
+      webServer: Context["webServer"],
+    ): Promise<void> => {
       return (async () => {
         let workspaces: readonly string[];
         try {
@@ -252,11 +321,15 @@ export default class CbxWeb extends Service {
         }
         if (disposed) return;
         await registerCbxWebRoutes(ctx, {
+          webServer,
           workspacePolicy: policy,
           token,
           isDisposed: () => disposed,
         });
+        // 路由真实挂载成功后才置标记：/cbx-web 命令据此知道仪表盘可访问。
+        this.mounted = true;
+        ctx.logger("cbx").info(`cbx web 仪表盘已挂载（${workspaces.length} 个工作区）。`);
       })();
-    }
+    };
   }
 }

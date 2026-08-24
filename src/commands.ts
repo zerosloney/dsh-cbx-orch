@@ -80,10 +80,16 @@ function webBaseUrl(ctx: Context): string {
   return `http://127.0.0.1:${port}`;
 }
 
-/** cbx 仪表盘是否已挂载：cbx-orch-web 插件激活时 ctx.cbxWeb 服务在。 */
+/** cbx 仪表盘是否已真实挂载：cbx-orch-web 插件激活**且路由已挂到 webServer**。
+ *  只看服务存在会误判——轮询等待中 / token fail-closed / 工作区策略解析失败时，
+ *  ctx.cbxWeb 已注册但 /cbx 路由不存在，打开浏览器只会 404。mounted 标记在
+ *  registerCbxWebRoutes 成功后置位（web-plugin.ts）。 */
 function webPluginActive(ctx: Context): boolean {
   try {
-    return Boolean(ctx.get("cbxWeb"));
+    const cbxWeb = ctx.get("cbxWeb") as
+      | { mounted?: boolean }
+      | undefined;
+    return Boolean(cbxWeb?.mounted);
   } catch {
     return false;
   }
@@ -146,8 +152,12 @@ export function registerCbxCommands(service: CbxCommandContext): void {
         const ws = await resolveWorkspace(undefined, invocation);
         const config = await loadConfig(ws);
         const merged = mergeConfig(config, {
-          review: defaults.review,
-          isolated: defaults.isolated,
+          // 优先级：工作区 .cbx.json > 插件配置默认。mergeConfig 的 override 必胜，
+          // 直接传 defaults（schemastery .default(true) 保证非 undefined）会永久压制
+          // .cbx.json 的 review/isolated；用 `config.review ?? defaults.review` 让
+          // 工作区配置优先。
+          review: config.review ?? defaults.review,
+          isolated: config.isolated ?? defaults.isolated,
         });
         // 先探测本机已安装的 agent CLI，再按需求过滤 + 策略打分选最合适的一个。
         // 与 tools.ts 的 cbx_run 对齐：请求执行器 = 显式覆盖 ?? 工作区 config ?? 插件配置默认。
@@ -419,7 +429,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
         }
         if (!webActive) {
           lines.push(
-            "提示：当前 profile 未加载 cbx-orch-web 插件（headless profile），/cbx 路由尚未挂载；请用含 web 插件的配置（如 dsh --profile web）启动后访问。",
+            "提示：cbx web 路由尚未挂载——可能是 headless profile 未加载 cbx-orch-web 插件，或 webServer 就绪较慢/挂载被拒（token fail-closed 等）。请用含 web 插件的配置（如 dsh --profile web）启动，或查看插件日志中的挂载失败原因。",
           );
         } else {
           const tokenFile = path.join(ws, ".cbx", "web.token");

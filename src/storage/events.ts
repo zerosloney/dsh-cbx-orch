@@ -114,18 +114,26 @@ export interface JobAuditVerification {
  * events.ndjson；但它没有 SQLite 连接，无法写 events 表。因此 ndjson 与镜像
  * 漂移 = 检测到篡改（或镜像失败，此时 valid=false 但 tampered=false，需人工排查）。
  *
- * 事件行以 (seq, payload) 为身份：两边按出现顺序对齐比较 event 类型与关键字段。
+ * 对齐语义：ndjson 必须是 SQLite 镜像的**连续尾部子序列**——即 ndjson 的每一行
+ * 都与 SQLite 中"距末尾同样距离"的那一行逐字段一致（event/jobId/at/全部 detail）。
+ * - ndjson 头部缺失（事件 >10MB 轮转到 .1 代、或保留期清理先删了镜像行）= 尾部
+ *   仍对齐 → 不误报；
+ * - 执行器改写任意行（含 payload 内容）= 该行深度比对失败 → 检测；
+ * - 执行器删除中间行 = ndjson 不再是连续尾部 → 检测。
  * SQLite 无该 job 事件（旧任务/镜像未启用）时视为"无锚点"，不判定篡改。
  */
 export async function verifyJobAudit(
   workspace: string,
   jobId: string,
 ): Promise<JobAuditVerification> {
-  // 1) SQLite 镜像（权威锚点）
+  // 1) SQLite 镜像（权威锚点）。上限取大值（50000）并检测截断：超限时无法完整
+  //    验证，宁可返回"无法验证"也不把诚实任务误报成篡改。
   let sqliteEvents: Array<Record<string, unknown>> = [];
+  let sqliteTruncated = false;
   try {
-    const result = await jobEventsAfterCursor(workspace, jobId, 0, 10000);
+    const result = await jobEventsAfterCursor(workspace, jobId, 0, 50000);
     sqliteEvents = result.rows.map((row) => row.payload as Record<string, unknown>);
+    sqliteTruncated = result.truncated;
   } catch {
     /* 镜像不可用 */
   }
@@ -133,46 +141,99 @@ export async function verifyJobAudit(
     // 无锚点：无法验证（旧任务或镜像缺失）。不判定篡改，但标记 valid=false 提示。
     return { valid: false, tampered: false, reason: "SQLite 镜像无该 job 事件（旧任务或镜像缺失），无法验证审计完整性。", sqliteCount: 0 };
   }
-  // 2) ndjson（可能被执行器篡改）
+  // 2) ndjson（可能被执行器篡改）：主文件 + 轮转 .1 代合并（按行序）。
   const ndjsonEvents: Array<Record<string, unknown>> = [];
-  try {
-    const raw = await readFile(path.join(workspace, ".cbx", "jobs", jobId, "events.ndjson"), "utf8");
+  const readNdjson = async (file: string): Promise<void> => {
+    let raw: string;
+    try {
+      raw = await readFile(file, "utf8");
+    } catch {
+      return; // 主文件缺失 = 与镜像漂移；.1 缺失 = 无历史代
+    }
     for (const line of raw.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
         ndjsonEvents.push(JSON.parse(trimmed) as Record<string, unknown>);
       } catch {
-        /* 坏行：执行器可能截断了文件，按不匹配处理 */
+        /* 坏行：执行器可能截断了文件，按不匹配处理（不 push 会让后续对齐错位） */
       }
     }
-  } catch {
-    /* ndjson 缺失：与镜像漂移 */
-  }
+  };
+  const base = path.join(workspace, ".cbx", "jobs", jobId, "events.ndjson");
+  await readNdjson(base);
+  await readNdjson(`${base}.1`);
   const sqliteCount = sqliteEvents.length;
   const ndjsonCount = ndjsonEvents.length;
-  if (ndjsonEvents.length !== sqliteEvents.length) {
+  if (sqliteTruncated) {
     return {
       valid: false,
-      tampered: true,
-      reason: `events.ndjson 事件数（${ndjsonEvents.length}）与 SQLite 镜像（${sqliteEvents.length}）不一致——ndjson 可能被篡改。`,
+      tampered: false,
+      reason: `该 job 事件超过 50000 条，SQLite 镜像读取被截断，无法完整验证审计完整性。`,
       ndjsonCount,
       sqliteCount,
     };
   }
-  // 3) 逐行对齐：event 类型 + jobId + at（时间）必须一致
-  for (let i = 0; i < sqliteEvents.length; i++) {
-    const sqlite = sqliteEvents[i];
+  // 3) 连续尾部子序列对齐：ndjson 的最后 N 行必须与 SQLite 的最后 N 行逐字段一致。
+  //    ndjson 行数 > SQLite = ndjson 有镜像之外的行（镜像 fire-and-forget 失败不会
+  //    产生多余行，只能是执行器追加伪造）→ 判定篡改。
+  if (ndjsonCount > sqliteCount) {
+    return {
+      valid: false,
+      tampered: true,
+      reason: `events.ndjson 事件数（${ndjsonCount}）多于 SQLite 镜像（${sqliteCount}）——ndjson 含镜像没有的事件，可能被执行器伪造。`,
+      ndjsonCount,
+      sqliteCount,
+    };
+  }
+  const offset = sqliteCount - ndjsonCount;
+  for (let i = 0; i < ndjsonCount; i++) {
+    const sqlite = sqliteEvents[i + offset];
     const ndjson = ndjsonEvents[i];
-    if (String(sqlite.event) !== String(ndjson.event) || String(sqlite.jobId) !== String(ndjson.jobId)) {
+    if (!eventsEqual(sqlite, ndjson)) {
       return {
         valid: false,
         tampered: true,
-        reason: `第 ${i + 1} 行事件不匹配：SQLite=${String(sqlite.event)}，ndjson=${String(ndjson.event)}——ndjson 被篡改。`,
+        reason: `第 ${i + 1} 行事件与 SQLite 镜像不一致（含 payload 内容）——ndjson 被篡改。`,
         ndjsonCount,
         sqliteCount,
       };
     }
   }
   return { valid: true, tampered: false, ndjsonCount, sqliteCount };
+}
+
+/** 事件行深度相等：event/jobId/at 与全部 detail 字段逐项一致（防 payload 内容篡改）。
+ *  对象字段用规范化（键排序）JSON 比较，避免两侧键序不同导致的误判。 */
+function eventsEqual(
+  sqlite: Record<string, unknown>,
+  ndjson: Record<string, unknown>,
+): boolean {
+  // 键集合必须一致（执行器增删字段即判定篡改）。
+  const sqliteKeys = Object.keys(sqlite).sort();
+  const ndjsonKeys = Object.keys(ndjson).sort();
+  if (sqliteKeys.length !== ndjsonKeys.length) return false;
+  for (let i = 0; i < sqliteKeys.length; i++) {
+    if (sqliteKeys[i] !== ndjsonKeys[i]) return false;
+    const a = sqlite[sqliteKeys[i]];
+    const b = ndjson[ndjsonKeys[i]];
+    if (typeof a === "object" && a !== null && typeof b === "object" && b !== null) {
+      if (stableStringify(a) !== stableStringify(b)) return false;
+    } else if (a !== b) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** 键排序的稳定 JSON 序列化（对象字段序不影响相等性判定）。 */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .sort(([k1], [k2]) => (k1 < k2 ? -1 : k1 > k2 ? 1 : 0))
+      .map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
 }

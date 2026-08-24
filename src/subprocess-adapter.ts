@@ -307,22 +307,46 @@ function redactCredentials(text: string): string {
 /**
  * 流式日志落盘的凭据脱敏器：chunk 按任意边界到达，key 可能被切分在两个 chunk 之间。
  * 保留上一 chunk 末尾 TAIL_BYTES 字节与当前 chunk 拼接后再脱敏，只把属于当前 chunk
- * 的部分写盘。跨边界 key 的前缀（≤16 字节，如 `sk-ant-api03-`）可能已在上一轮原样
- * 写出，但正则要求先匹配常量前缀才替换，因此泄漏的仅是非随机前缀，不含熵。
+ * 的部分写盘。
+ *
+ * 边界语义（与注释/README 声称对齐）：
+ * - 首 chunk 不立即写盘，而是完整存入 pending，与下一 chunk 头尾重叠后再落盘——
+ *   否则落在首 chunk 尾部的 key 前缀（无 tail 可重叠）会原样写出，泄漏其随机熵。
+ * - TAIL_BYTES 取 64，覆盖最长凭据常量前缀（PEM 头 `-----BEGIN OPENSSH PRIVATE
+ *   KEY-----` 35 字符 + 余量），确保任何跨 chunk 的 key 头都能与常量前缀一起被
+ *   正则识别并整体替换，不残留熵。
  */
-const TAIL_BYTES = 16;
+const TAIL_BYTES = 64;
 
 class LogRedactor {
   private tail = "";
+  private pending: string | undefined;
 
   write(sink: (text: string) => void, text: string): void {
-    const redacted = redactCredentials(this.tail + text);
-    const cut = this.tail.length;
-    // 仅当本次替换使拼接文本收缩到小于 tail 时才出现：整个 chunk 被 key 占满且 key
-    // 跨越边界。此时不写字节会丢失日志内容，补写占位符既保留痕迹又避免泄漏。
-    if (redacted.length > cut) sink(redacted.slice(cut));
-    else if (redacted.length < cut) sink(REDACTED_TOKEN);
+    if (this.pending === undefined) {
+      // 首 chunk：暂存不写盘，等待与下一 chunk 头尾重叠。
+      this.pending = text;
+      this.tail = text.slice(-TAIL_BYTES);
+      return;
+    }
+    const combined = this.pending + text;
+    const redacted = redactCredentials(combined);
+    const cut = this.pending.length;
+    // 脱敏后长度可能收缩（key→占位符）或持平；pending 部分已被上一轮 tail 重叠
+    // 覆盖，这里只写出当前 chunk 中未被上一轮覆盖的部分。
+    if (redacted.length >= cut) sink(redacted.slice(cut));
+    else sink(REDACTED_TOKEN);
+    this.pending = undefined;
     this.tail = text.slice(-TAIL_BYTES);
+  }
+
+  /** 流结束：落盘最后一段（pending + 当前 tail 已无后续重叠，直接写剩余）。 */
+  flush(sink: (text: string) => void): void {
+    if (this.pending !== undefined) {
+      sink(redactCredentials(this.pending));
+      this.pending = undefined;
+    }
+    this.tail = "";
   }
 }
 
@@ -462,8 +486,8 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
       }
     }
 
-    // 落盘日志经流式脱敏（跨 chunk 边界保留 16 字节重叠）后再写 logFile，
-    // 防止执行器输出回显的凭据原样持久化；内存 output 保持原样。
+    // 落盘日志经流式脱敏（首 chunk 延迟写 + 64 字节跨 chunk 重叠，见 LogRedactor）
+    // 后再写 logFile，防止执行器输出回显的凭据原样持久化；内存 output 保持原样。
     // 磁盘侧设硬上限：内存 BoundedOutput 只保尾部 4MB，但逐 chunk append 不设限
     // 会让 chatty 执行器把 agent.log/test.log 写到数百 MB（evidence 哈希、artifact
     // 读取、SSE 回放全部跟着遭殃）。超限后停止落盘并留标记，内存采集不受影响。
@@ -560,6 +584,15 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
     } finally {
       clearTimeout(timeoutTimer);
       if (hardTimerHandle !== undefined) clearTimeout(hardTimerHandle);
+      // 落盘最后一段（LogRedactor 首 chunk 延迟写的 pending）：任何退出路径
+      // （正常/超时/取消/错误）都不能丢失已采集的日志尾部。
+      if (logFile && !logCapped) {
+        try {
+          logRedactor.flush((redacted) => appendFileSync(logFile, redacted));
+        } catch {
+          /* 磁盘满等：静默 */
+        }
+      }
       if (!preserveTracking) {
         if (jobStore) jobStore.handles.delete(active);
         if (pidFile) {

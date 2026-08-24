@@ -7,6 +7,7 @@
  */
 import path from "node:path";
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { normalizeAdaptiveOptions } from "../adaptive-manager.js";
 import { isMissing } from "./io.js";
 
@@ -565,16 +566,18 @@ const KEY_LINE =
 // 常见凭据形状的全文兜底正则（字符串形式，供 new RegExp 使用）。行级键名正则
 // KEY_LINE 抓不到句中内嵌密钥（如 "use sk-xxx here"），无论 governance.redactPatterns
 // 是否配置都叠加这些，关闭 inline 凭据的落盘/上下文泄漏面。
+// 带 \b 词边界：与 subprocess-adapter 的 LogRedactor 同款——无边界时 `sk-xxx` 会命中
+// 更长 base64 子串（如 base64 编码的整块内容含 sk- 片段）过度脱敏、损伤产物文本。
 const DEFAULT_REDACT_PATTERNS: string[] = [
-  "sk-[A-Za-z0-9_\\-]{16,}",
-  "gh[pousr]_[A-Za-z0-9]{20,}",
+  "\\bsk-[A-Za-z0-9_\\-]{16,}\\b",
+  "\\bgh[pousr]_[A-Za-z0-9]{20,}\\b",
   // 细粒度 PAT（github_pat_ 前缀）与经典 ghp_/gho_/ghu_/ghs_/ghr_ 形状不同，单列。
-  "github_pat_[A-Za-z0-9_]{20,}",
-  "xox[baprs]-[A-Za-z0-9\\-]{10,}",
-  "AIza[0-9A-Za-z_\\-]{30,}",
-  "AKIA[0-9A-Z]{16}",
+  "\\bgithub_pat_[A-Za-z0-9_]{20,}\\b",
+  "\\bxox[baprs]-[A-Za-z0-9\\-]{10,}\\b",
+  "\\bAIza[0-9A-Za-z_\\-]{30,}\\b",
+  "\\bAKIA[0-9A-Z]{16}\\b",
   "-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----[\\s\\S]*?-----END (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----",
-  "Bearer\\s+[A-Za-z0-9._~+/\\-=]{20,}",
+  "\\bBearer\\s+[A-Za-z0-9._~+/\\-=]{20,}\\b",
 ];
 
 export function redactText(
@@ -600,4 +603,29 @@ export function redactText(
   for (const pattern of [...DEFAULT_REDACT_PATTERNS, ...patterns])
     out = out.replace(new RegExp(pattern, "g"), "[REDACTED]");
   return out;
+}
+
+/**
+ * 安全关键策略字段的稳定指纹（sha256）。用途：把任务**创建时**的 `.cbx.json`
+ * 安全策略（成本闸/插件白名单/review stop-gate 开关/环境白名单）固定下来，
+ * 执行期现读 `.cbx.json` 后重算比对——非隔离执行器 cwd=workspace 可中途改写
+ * `.cbx.json`（调高成本上限、拆插件白名单、设 failOpen=true 等），指纹漂移即
+ * 拒绝执行（fail-closed），防止静默拆掉安全/成本控制。
+ *
+ * 字段选择：只覆盖"被改写会削弱安全/成本控制"的策略；testCommand 等业务字段
+ * 不在此列（那是任务内容不是安全闸）。
+ */
+export function securityPolicyFingerprint(
+  config: Pick<RuntimeConfig, "cost" | "plugins" | "reviewGate" | "executors">,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        cost: config.cost ?? null,
+        plugins: config.plugins ?? null,
+        reviewGate: config.reviewGate ?? null,
+        executors: config.executors ?? null,
+      }),
+    )
+    .digest("hex");
 }

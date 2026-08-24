@@ -264,6 +264,8 @@ function runChildRaw(
     let cleaned = false;
     let preservePidFile = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    /** 超时后 killTree 仍不退出时的强制 settle 死线（防 Promise 永久挂起）。 */
+    let hardDeadline: ReturnType<typeof setTimeout> | undefined;
     let abortListener: (() => void) | undefined;
     let resolveChildExit!: () => void;
     let childExited = false;
@@ -286,6 +288,7 @@ function runChildRaw(
     };
     const stopCancellationSources = () => {
       if (timer !== undefined) clearTimeout(timer);
+      if (hardDeadline !== undefined) clearTimeout(hardDeadline);
       if (signal && abortListener) {
         signal.removeEventListener("abort", abortListener);
       }
@@ -370,10 +373,25 @@ function runChildRaw(
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);
+    // 超时硬死线：killTree 后若子进程仍不退出（不可中断 IO / 句柄泄漏），close 永不
+    // 触发会让 Promise 永久挂起。与 subprocess-adapter 的 hardTimer 同款兜底——到点
+    // 强制 settle 为合成超时结果，不让调用方无限等。
     timer = setTimeout(() => {
       if (settled) return;
       timedOut = true;
       if (child.pid) killTree(child.pid, "SIGKILL", child);
+      hardDeadline = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve({
+          code: -1,
+          timedOut: true,
+          output: output.text(),
+          ...(output.truncated ? { outputTruncated: true } : {}),
+        });
+      }, 5_000);
+      hardDeadline.unref?.();
     }, timeoutMs);
     child.on("error", (error) => {
       markChildExit();

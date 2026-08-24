@@ -139,10 +139,24 @@ export async function inspectExecutorPlugin(
     workspace,
     policy,
   );
-  const module = (await import(pathToFileURL(file).href)) as {
+  // 边界说明：此 import 发生在编排器主进程，插件顶层代码（含顶层 throw/副作用）
+  // 会在主进程执行——插件路径已强制位于工作区内且 enforce 默认 fail-closed
+  // （白名单），通过校验的插件是 operator 显式信任的代码，与 dsh 自身在主进程
+  // 加载的插件同构。真正的**崩溃隔离**由 plugin-host 子进程承担（运行期二次加载
+  // + run）；这里 try/catch 兜住顶层 throw，避免插件损坏时打挂整个 harness 进程
+  // （调用方会收到可诊断的错误而非未处理异常）。
+  let module: {
     default?: ExecutorPlugin;
     run?: ExecutorPlugin["run"];
+    manifest?: ExecutorPluginManifest;
   };
+  try {
+    module = (await import(pathToFileURL(file).href)) as typeof module;
+  } catch (error) {
+    throw new Error(
+      `executor 插件加载失败（顶层代码抛错）：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   const plugin =
     module.default ??
     (module.run

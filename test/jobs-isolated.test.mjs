@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import os from "node:os";
@@ -76,27 +77,33 @@ test("isolated=true 且工作区不是 Git 仓库时创建即报错并给出修�
 
 test("isolated=true + 脏仓库 + 未 carryDirty → 创建即报错并列出可操作补救", async () => {
   const workspace = await makeDirtyRepo();
+  const jobId = "dirty-retry";
+  const directory = path.join(workspace, ".cbx", "jobs", jobId);
+  const options = {
+    workspace,
+    task: "t",
+    review: false,
+    isolated: true,
+    permissionMode: "default",
+    maxTurns: 10,
+    maxRetries: 0,
+    jobId,
+  };
   try {
-    await assert.rejects(
-      () =>
-        createJob({
-          workspace,
-          task: "t",
-          review: false,
-          isolated: true,
-          permissionMode: "default",
-          maxTurns: 10,
-          maxRetries: 0,
-        }),
-      (error) => {
+    const assertDirtyRejection = () =>
+      assert.rejects(() => createJob(options), (error) => {
         const message = String(error.message);
         assert.match(message, /隔离任务无法携带创建时的未提交内容/);
         assert.match(message, /carryDirty: true/);
         assert.match(message, /isolated: false/);
         assert.match(message, /git commit \/ stash/);
+        assert.doesNotMatch(message, /任务已存在/);
         return true;
-      },
-    );
+      });
+    await assertDirtyRejection();
+    assert.equal(existsSync(directory), false);
+    await assertDirtyRejection();
+    assert.equal(existsSync(directory), false);
   } finally {
     await closeDatabaseConnections();
     await rm(workspace, { recursive: true, force: true });

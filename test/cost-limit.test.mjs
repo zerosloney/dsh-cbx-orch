@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { invokeExecutor } from "../lib/runner.js";
-import { ExecutorCostLimitError } from "../lib/errors.js";
+import { ExecutorCostLimitError, ExecutorPolicyDriftError } from "../lib/errors.js";
 import { closeDatabaseConnections, savePersistedState } from "../lib/storage.js";
 import { loadConfig } from "../lib/state.js";
 import { createJob } from "../lib/jobs.js";
@@ -128,4 +128,43 @@ test("createJob: cost 参数持久化进 context.json（per-job 覆盖）", asyn
   const context = await loadJson(path.join(directory, "context.json"));
   assert.equal(context.cost.maxExecutorInvocations, 7);
   assert.equal(jobId.length > 0, true);
+});
+
+test("策略漂移: 任务创建后 .cbx.json 的 cost 被改 → 拒绝执行器调用（ExecutorPolicyDriftError）", async () => {
+  const workspace = mkdtempSync(path.join(tmpdir(), "cbx-cost-"));
+  fixtures.push(workspace);
+  writeFileSync(path.join(workspace, ".cbx.json"), JSON.stringify({
+    cost: { maxExecutorInvocations: 5 },
+  }), "utf8");
+  // 经 createJob 创建：state 记录 securityFingerprint（创建时的 cost=5）
+  const { jobId, directory } = await createJob({
+    workspace,
+    task: "t",
+    review: false,
+    isolated: false,
+    permissionMode: "default",
+    maxTurns: 5,
+    maxRetries: 0,
+  });
+  // 执行器（不可信）改写 .cbx.json：调高成本上限（拆闸）
+  writeFileSync(path.join(workspace, ".cbx.json"), JSON.stringify({
+    cost: { maxExecutorInvocations: 999 },
+  }), "utf8");
+  await assert.rejects(
+    () => invokeExecutor(
+      "codebuddy",
+      workspace,
+      directory,
+      workspace,
+      "test prompt",
+      "auto",
+      1,
+      5_000,
+      { role: "stage", jobId, stageIndex: 0 },
+    ),
+    (error) => {
+      assert.equal(error instanceof ExecutorPolicyDriftError, true);
+      return true;
+    },
+  );
 });

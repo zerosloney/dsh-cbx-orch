@@ -6,10 +6,10 @@ import { inspectExecutorPlugin, type ExecutorResult, type ExecutorRequest } from
 import { findExecutable, resolveExecutor } from "./executors/builtin.js";
 import { recordExecutorOutcome } from "./executor-health.js";
 import { bumpInvocationCount, loadConfig, loadState, mirrorJobEventToSqlite } from "./state.js";
-import { loadJobContext } from "./storage.js";
+import { loadJobContext, securityPolicyFingerprint } from "./storage.js";
 import { validateTestCommand } from "./validation.js";
 import { runProcess, runShell, type ProcessResult } from "./process-runner.js";
-import { ExecutorCostLimitError } from "./errors.js";
+import { ExecutorCostLimitError, ExecutorPolicyDriftError, isUnretryableInvocationError } from "./errors.js";
 import { redactText, saveJson } from "./storage.js";
 import { APP_VERSION } from "./version.js";
 import { jobContext } from "./job-runtime.js";
@@ -51,11 +51,18 @@ function jobIdentityFromEventsFile(eventsFile: string): { workspace: string; job
 }
 
 function appendEvent(eventsFile: string, payload: Record<string, unknown>): void {
-  appendFileSync(eventsFile, redactText(JSON.stringify(truncateDeep(payload))) + "\n", "utf8");
+  // 与 logJobEvent 同一边界：先脱敏（redactText 全文凭据形状 + truncateDeep 长字段
+  // 截断）再落盘；SQLite 镜像复用同一份脱敏结果——执行器可改 ndjson 但改不了
+  // events 表（审计权威），若镜像存原始 payload，凭据会从权威副本经 SSE/timeline
+  // 原样读出，绕过 ndjson 侧脱敏。
+  const redacted = JSON.parse(
+    redactText(JSON.stringify(truncateDeep(payload))),
+  ) as Record<string, unknown>;
+  appendFileSync(eventsFile, JSON.stringify(redacted) + "\n", "utf8");
   // SQLite 镜像（审计权威）：执行器可改 ndjson，改不了 events 表。
   const identity = jobIdentityFromEventsFile(eventsFile);
   if (identity) {
-    mirrorJobEventToSqlite(identity.workspace, identity.jobId, String(payload.event ?? "event"), payload);
+    mirrorJobEventToSqlite(identity.workspace, identity.jobId, String(payload.event ?? "event"), redacted);
   }
 }
 
@@ -259,6 +266,16 @@ async function invokeExecutorCore(executor: string, workspace: string, directory
           () => undefined,
         ),
       ]);
+      // 安全策略指纹校验（fail-closed）：任务创建时固定的 .cbx.json 安全指纹
+      // （成本闸/插件白名单/reviewGate/环境白名单，存 SQLite 权威）与执行期现读值
+      // 比对。非隔离执行器 cwd=workspace 可中途改写 .cbx.json（调高成本上限、拆
+      // 插件白名单、设 reviewGate.failOpen=true 等）——指纹漂移即拒绝调用，
+      // 防静默拆掉安全/成本控制。旧任务（无 securityFingerprint 字段）跳过校验。
+      if (typeof state.securityFingerprint === "string") {
+        const currentFingerprint = securityPolicyFingerprint(config);
+        if (currentFingerprint !== state.securityFingerprint)
+          throw new ExecutorPolicyDriftError();
+      }
       const limit =
         context?.cost?.maxExecutorInvocations ??
         config.cost?.maxExecutorInvocations;
@@ -271,8 +288,8 @@ async function invokeExecutorCore(executor: string, workspace: string, directory
         if (current >= limit) throw new ExecutorCostLimitError(limit, current);
       }
     } catch (error) {
-      // 只有成本闸本身抛错才向上传播；读取/配置失败不能阻塞执行器调用（既有语义）。
-      if (error instanceof ExecutorCostLimitError) throw error;
+      // 只有成本闸/策略漂移本身抛错才向上传播；读取/配置失败不能阻塞执行器调用（既有语义）。
+      if (isUnretryableInvocationError(error)) throw error;
     }
     try {
       await bumpInvocationCount(

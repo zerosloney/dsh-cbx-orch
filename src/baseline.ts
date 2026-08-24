@@ -13,7 +13,7 @@ import { invokeExecutor, promptFor } from "./runner.js";
 import { writeResult } from "./result.js";
 import { createExecutorContextPack } from "./context-pack.js";
 import { createHumanGate } from "./human-gate.js";
-import { ExecutorCostLimitError } from "./errors.js";
+import { ExecutorCostLimitError, isUnretryableInvocationError } from "./errors.js";
 import { contextArtifacts } from "./artifacts.js";
 import { resolveExecutor } from "./executors/builtin.js";
 import { captureAsync } from "./process-runner.js";
@@ -195,16 +195,16 @@ export async function performContextHandshake(
       { role: "gate", jobId: context.jobId },
     );
   } catch (error) {
-    // 成本硬闸：握手阶段的执行器调用已达上限——转 cost_limit 而非普通握手失败。
-    if (error instanceof ExecutorCostLimitError) {
+    // 成本硬闸/策略漂移：握手阶段的执行器调用已达上限或配置被改——转 needs_fix 而非普通握手失败。
+    if (isUnretryableInvocationError(error)) {
       return finish({
         status: "needs_fix",
-        phase: "cost_limit",
+        phase: error instanceof ExecutorCostLimitError ? "cost_limit" : "policy_drift",
         contextIssue: true,
         error: error.message,
         humanGate: createHumanGate("needs_input", {
           detail: error.message,
-          questions: ["提高 max_executor_invocations 后继续，或取消任务。"],
+          questions: ["确认 .cbx.json 配置变更意图后继续，或取消任务。"],
         }),
       });
     }

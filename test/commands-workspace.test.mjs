@@ -205,11 +205,47 @@ test("/cbx-web 解析会话 cwd 工作区并输出仪表盘链接（无 webServe
   }
 });
 
+test("/cbx-web cbxWeb 服务存在但路由未挂载（mounted=false）→ 给未挂载提示而非误导为可访问", async () => {
+  const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-command-web-unmounted-"));
+  const harness = fakeHarness({
+    // cbxWeb 服务存在但 mounted=false：模拟 token fail-closed / 轮询等待中 /
+    // 策略解析失败的真实场景——服务已注册但 /cbx 路由不存在，打开浏览器只会 404。
+    services: { webServer: { port: 3456, host: "127.0.0.1" }, cbxWeb: { mounted: false } },
+    subprocess: {
+      spawn() {
+        return { done: Promise.resolve({ exitCode: 0, signal: null }) };
+      },
+    },
+  });
+  try {
+    new CbxOrchestrator(harness.context, {
+      executor: "codebuddy",
+      review: true,
+      isolated: true,
+      workspaces: [allowed],
+    });
+
+    const command = harness.commands.get("cbx-web");
+    assert.ok(command, "应捕获 cbx-web 命令");
+    const result = await command.handler({ rawInput: allowed });
+    assert.equal(result.kind, "success");
+    // 未挂载：提示路由未挂载（而非 Web token 提示，那是已挂载分支）
+    assert.match(result.text, /cbx web 路由尚未挂载/);
+    assert.equal(result.text.includes("Web token"), false);
+  } finally {
+    await harness.dispose();
+    await rm(allowed, { recursive: true, force: true });
+  }
+});
+
 test("/cbx-web 显式 workspace 命中白名单并尝试在系统浏览器打开（实际端口 + cbxWeb 激活）", async () => {
   const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-command-web-"));
   const spawned = [];
   const harness = fakeHarness({
-    services: { webServer: { port: 3456, host: "127.0.0.1" }, cbxWeb: {} },
+    // cbxWeb.mounted=true：模拟仪表盘路由已真实挂载（新语义下 webPluginActive
+    // 读 mounted 而非服务存在——服务存在但路由未挂载（token fail-closed/轮询中）
+    // 时 /cbx-web 应给"未挂载"提示而非误导为可访问）。
+    services: { webServer: { port: 3456, host: "127.0.0.1" }, cbxWeb: { mounted: true } },
     subprocess: {
       spawn(spec) {
         spawned.push(spec);

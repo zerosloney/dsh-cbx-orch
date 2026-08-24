@@ -151,13 +151,35 @@ export function resolveExecutor(name: string): BuiltinExecutor | undefined {
   return BY_NAME.get(name);
 }
 
-// intentional-simple: 进程级缓存，只对单进程内重复调用生效。环境变量/安装变更需重启进程。
-const resolvedPathCache = new Map<string, string>();
+// 进程级 Get-Command 解析缓存，带 TTL：正结果（解析成功）缓存较长，负结果
+// （解析失败/未安装）缓存很短——运行期新装 CLI 后能较快重新探测到，不再
+// 永久冻结"未安装"（旧实现负结果无条件缓存，30s 探测 TTL 到期也拿不到新值）。
+// 键同时含主候选名，避免不同执行器共用解析结果。
+const resolvedPathCache = new Map<
+  string,
+  { command: string; at: number; negative: boolean }
+>();
+/** 正结果缓存 TTL（安装后通常不再变，取 5 分钟减少 Get-Command 同步开销）。 */
+const RESOLVED_POSITIVE_TTL_MS = 5 * 60_000;
+/** 负结果缓存 TTL（未安装时短缓存，允许运行期安装后较快生效）。 */
+const RESOLVED_NEGATIVE_TTL_MS = 30_000;
+
+function cachedResolvedPath(primary: string): { command: string; negative: boolean } | undefined {
+  const entry = resolvedPathCache.get(primary);
+  if (!entry) return undefined;
+  const ttl = entry.negative ? RESOLVED_NEGATIVE_TTL_MS : RESOLVED_POSITIVE_TTL_MS;
+  if (Date.now() - entry.at >= ttl) {
+    resolvedPathCache.delete(primary);
+    return undefined;
+  }
+  return { command: entry.command, negative: entry.negative };
+}
 
 /**
  * 返回 [command, ...rest] 形式的可执行命令：
  * - 优先采用 envVar 指定的覆盖路径；
- * - Windows 上用 PowerShell Get-Command 解析 bin 名的真实来源（结果缓存，避免每次 spawn 同步阻塞事件循环）；
+ * - Windows 上用 PowerShell Get-Command 解析 bin 名的真实来源（结果带 TTL 缓存，
+ *   避免每次 spawn 同步阻塞事件循环；负结果短 TTL 让新装 CLI 快速可见）；
  * - 兜底直接把候选名交给 spawn；
  * - .ps1/.js/.mjs/.cjs 会被包装成 powershell/node 调用。
  */
@@ -167,11 +189,19 @@ export function findExecutable(spec: BuiltinExecutor): string[] {
   if (configured) candidates.push(configured);
   if (process.platform === "win32") {
     const primary = spec.candidates[0];
-    let resolved = resolvedPathCache.get(primary);
-    if (resolved === undefined) {
-      const ps = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-Command ${primary}).Source`], { encoding: "utf8", windowsHide: true, env: syncEnvForChild(process.cwd()) });
+    const cached = cachedResolvedPath(primary);
+    let resolved = cached?.negative ? "" : (cached?.command ?? "");
+    if (cached === undefined) {
+      // 与 resolveCandidateOnSystem 同款转义：primary 是候选 bin 名（受控常量），
+      // 但 envVar 覆盖路径可能含特殊字符，一律单引号字面量包裹防命令注入。
+      const escaped = primary.replace(/'/g, "''");
+      const ps = spawnSync("powershell.exe", ["-NoProfile", "-Command", `Get-Command -Name '${escaped}' | Select-Object -ExpandProperty Source`], { encoding: "utf8", windowsHide: true, env: syncEnvForChild(process.cwd()) });
       resolved = ps.status === 0 ? String(ps.stdout).trim() : "";
-      resolvedPathCache.set(primary, resolved);
+      resolvedPathCache.set(primary, {
+        command: resolved,
+        at: Date.now(),
+        negative: resolved === "",
+      });
     }
     if (resolved) candidates.push(resolved);
   }
@@ -229,8 +259,9 @@ function resolveCandidateOnSystem(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): string | undefined {
   if (process.platform === "win32") {
-    let resolved = resolvedPathCache.get(primary);
-    if (resolved === undefined) {
+    const cached = cachedResolvedPath(primary);
+    let resolved = cached?.negative ? "" : (cached?.command ?? "");
+    if (cached === undefined) {
       // 安全：envVar 覆盖的裸名是外部可控值，绝不能拼进 PowerShell 字符串再解析，
       // 否则值含 `;`、`()`、反引号等即可在本机执行任意命令（命令注入）。
       // 用单引号字面量包裹 + 内部单引号加倍，使 primary 始终被当作 Get-Command
@@ -242,7 +273,11 @@ function resolveCandidateOnSystem(
         { encoding: "utf8", windowsHide: true, env: syncEnvForChild(process.cwd()) },
       );
       resolved = ps.status === 0 ? String(ps.stdout).trim() : "";
-      resolvedPathCache.set(primary, resolved);
+      resolvedPathCache.set(primary, {
+        command: resolved,
+        at: Date.now(),
+        negative: resolved === "",
+      });
     }
     return resolved || undefined;
   }

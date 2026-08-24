@@ -65,7 +65,7 @@ async function approveJobLocked(
   if (state.phase === "before_run" && gate.reason === "before_run") {
     // 写盘前再核取消标记：避免把已取消任务写回 queued 造成状态撕裂（队列条目已被取消）。
     if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
-      throw new Error(`任务已取消，不能批准：${jobId}`);
+      throw new CbxError("E_INVALID_STATE", `任务已取消，不能批准：${jobId}`);
     // 原子重入队：状态回 queued 与 awaiting_approval 队列条目重新激活同事务落盘，
     // 不再依赖调用方补 startBackground（两段式中间崩溃 = 永不调度的 queued 任务）。
     const requeued = await writeApprovalRequeueState(
@@ -84,7 +84,7 @@ async function approveJobLocked(
     return requeued;
   }
   if (state.phase !== "before_complete" || gate.reason !== "completion")
-    throw new Error("审批状态与 Human Gate 不一致。");
+    throw new CbxError("E_INVALID_STATE", "审批状态与 Human Gate 不一致。");
   const directory = jobDir(workspace, jobId);
   const context = await loadJobContext(directory);
   const pending = parsePendingCompletion(state.pendingCompletion);
@@ -143,7 +143,7 @@ async function approveJobLocked(
   // 提交前核取消：原实现 commit 之后才复查，窗口内取消的任务会留下已提交的
   // commit（autoBranch 分支存活，与用户"取消"意图相反）。落盘前还有最后一道复验。
   if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
-    throw new Error(`任务已取消，不能批准：${jobId}`);
+    throw new CbxError("E_INVALID_STATE", `任务已取消，不能批准：${jobId}`);
   if (context.autoCommit) {
     // 到达此处必然已通过证据门（snapshotMatches 为 true ⇒ workdir 存在）。
     // 显式守卫代替 `workdir!`：若未来门管线改动破坏了这一不变量，这里给出可诊断的错误而非静默的 undefined 传参。
@@ -179,7 +179,7 @@ async function approveJobLocked(
   }
   // 完成态写盘前最后一次取消核验（竞态窗口最小化；窗口内取消先落盘则 cancelled 获胜）。
   if (existsSync(path.join(jobDir(workspace, jobId), "cancel.requested")))
-    throw new Error(`任务已取消，不能批准：${jobId}`);
+    throw new CbxError("E_INVALID_STATE", `任务已取消，不能批准：${jobId}`);
   await writeApprovalState(workspace, jobId, updates, "done");
   if (!context.keepWorktree) {
     try {

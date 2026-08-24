@@ -96,20 +96,28 @@ export async function savePersistedStateCas(
 ): Promise<boolean> {
   const db = await database(workspace);
   const expectedJson = JSON.stringify(expected);
-  const updated = db
-    .prepare(
-      "UPDATE jobs SET state_json = ?, updated_at = ? WHERE job_id = ? AND state_json = ?",
-    )
-    .run(JSON.stringify(value), now(), jobId, expectedJson);
-  if (updated.changes === 1) return true;
-  const exists = db.prepare("SELECT 1 FROM jobs WHERE job_id = ?").get(jobId);
-  if (!exists) {
-    db.prepare(
-      "INSERT INTO jobs(job_id, state_json, updated_at) VALUES (?, ?, ?)",
-    ).run(jobId, JSON.stringify(value), now());
-    return true;
-  }
-  return false;
+  // 三步（UPDATE 条件写 → SELECT 存在性 → INSERT 兜底）包进同一事务：跨进程双首写
+  // 在 SQLite 写锁下串行化，第二个写者不会再撞 PRIMARY KEY（旧实现 UPDATE→SELECT→
+  // INSERT 非原子，窄窗口内双写会 INSERT 冲突抛错）。
+  const cas = db.transaction((): boolean => {
+    const updated = db
+      .prepare(
+        "UPDATE jobs SET state_json = ?, updated_at = ? WHERE job_id = ? AND state_json = ?",
+      )
+      .run(JSON.stringify(value), now(), jobId, expectedJson);
+    if (updated.changes === 1) return true;
+    const exists = db
+      .prepare("SELECT 1 FROM jobs WHERE job_id = ?")
+      .get(jobId);
+    if (!exists) {
+      db.prepare(
+        "INSERT INTO jobs(job_id, state_json, updated_at) VALUES (?, ?, ?)",
+      ).run(jobId, JSON.stringify(value), now());
+      return true;
+    }
+    return false;
+  });
+  return cas();
 }
 /**
  * 列出持久化任务状态（按 updated_at 倒序）。

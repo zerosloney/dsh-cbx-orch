@@ -116,6 +116,7 @@ function errorStatus(error: unknown): number {
  * workspace query override must exactly select one of them.
  */
 export async function registerCbxWebRoutes(ctx: Context, options: {
+  webServer?: Context["webServer"];
   workspacePolicy?: WorkspacePolicy;
   workspaces?: readonly string[];
   token?: string;
@@ -290,13 +291,17 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
       if (pathname === "/") {
         const uiDir = resolveUiDir();
         const html = await readFile(path.join(uiDir, "index.html"), "utf8");
-        // 仪表盘不含内联脚本/样式，全走同源静态文件与 API：default-src 'self'
-        // 足够，同时给未来可能的注入一个硬边界（也阻止被 iframe 嵌套的点击劫持面）。
+        // 仪表盘不含内联脚本，全走同源静态文件与 API：default-src 'self' 足够，
+        // 同时给未来可能的注入一个硬边界（也阻止被 iframe 嵌套的点击劫持面）。
+        // style-src 'unsafe-inline'：app.js 动态设置的内联 style（分布条分段宽度/
+        // 颜色、进度条、状态圆点）依赖它——无此指令现代浏览器会丢弃全部内联样式，
+        // 仪表盘部分渲染失效。
         res.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
           "x-content-type-options": "nosniff",
           "cache-control": "no-store",
-          "content-security-policy": "default-src 'self'; frame-ancestors 'none'",
+          "content-security-policy":
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
         });
         res.end(html);
         return;
@@ -549,7 +554,17 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
           try {
             created = await createJob(jobOptions);
           } catch (error) {
-            if (idempotencyKey) await abortIdempotentCreate(ws, idempotencyKey);
+            // 失败释放预留：不留毒键，同键重试可以真正重跑。abort 自身失败不能
+            // 掩盖 createJob 的真实失败原因，记日志供排障。
+            if (idempotencyKey) {
+              try {
+                await abortIdempotentCreate(ws, idempotencyKey);
+              } catch (abortError) {
+                ctx.logger("cbx").warn(
+                  `cbx 幂等预留释放失败（${abortError instanceof Error ? abortError.message : String(abortError)}）——同键 ${idempotencyKey} 重试将按 in-flight 处理。`,
+                );
+              }
+            }
             throw error;
           }
           if (idempotencyKey) await commitIdempotentCreate(ws, idempotencyKey, created.jobId);
@@ -642,7 +657,7 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
   }, 1500);
   heartbeat.unref();
 
-  const disposeRoute = ctx.webServer.register({
+  const disposeRoute = (options.webServer ?? ctx.webServer).register({
     kind: "prefix",
     path: CBX_MOUNT,
     handler: (req, res) => {

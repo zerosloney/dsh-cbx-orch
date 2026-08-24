@@ -63,8 +63,16 @@ export interface HealthWindowStats {
   crashStreak: number;
   /** 窗口尾部连续超时长度：路由中罚输入。 */
   timeoutStreak: number;
+  /** 全部样本延迟合计（成败都计，路由延迟罚用——真实延迟含失败）。 */
   latencySamples: number;
   totalLatencyMs: number;
+  /** 仅成功样本的延迟统计（速度档校准用）：失败/超时样本的延迟（超时≈整个
+   *  timeoutMs）会污染档位推导——fail-fast 崩溃执行器的平均延迟会因失败样本而
+   *  虚低，被 executor-catalog 推导出最高 speedTier，fastest 策略反而首选间歇
+   *  崩溃者。失败代价已由 crashStreak/timeoutStreak 独立重罚，档位校准只应
+   *  反映"成功时的真实速度"。 */
+  successLatencySamples: number;
+  successTotalLatencyMs: number;
 }
 
 /**
@@ -83,6 +91,8 @@ export function windowStats(rec: ExecutorHealthRecord | undefined): HealthWindow
     let timeouts = 0;
     let latencySamples = 0;
     let totalLatencyMs = 0;
+    let successLatencySamples = 0;
+    let successTotalLatencyMs = 0;
     for (const sample of recent) {
       if (sample.s === 1) successes += 1;
       else failures += 1;
@@ -90,6 +100,10 @@ export function windowStats(rec: ExecutorHealthRecord | undefined): HealthWindow
       if (typeof sample.ms === "number" && sample.ms >= 0) {
         latencySamples += 1;
         totalLatencyMs += sample.ms;
+        if (sample.s === 1) {
+          successLatencySamples += 1;
+          successTotalLatencyMs += sample.ms;
+        }
       }
     }
     // 尾部连败构成：从最新往回走完整个失败段（遇成功即停），段内分别累计
@@ -112,9 +126,12 @@ export function windowStats(rec: ExecutorHealthRecord | undefined): HealthWindow
       timeoutStreak,
       latencySamples,
       totalLatencyMs,
+      successLatencySamples,
+      successTotalLatencyMs,
     };
   }
-  // 旧格式回退：无窗口证据，按累计字段近似。
+  // 旧格式回退：无窗口证据，按累计字段近似。成功延迟无法从旧累计字段分离，
+  // 用全样本延迟近似（无 recent 时二者等价——旧字段本就只分 success/failure 计数）。
   const totalStreak = rec?.consecutiveFailures ?? 0;
   const timeoutStreak = Math.min(rec?.consecutiveTimeouts ?? 0, totalStreak);
   return {
@@ -126,6 +143,8 @@ export function windowStats(rec: ExecutorHealthRecord | undefined): HealthWindow
     timeoutStreak,
     latencySamples: rec?.latencySamples ?? 0,
     totalLatencyMs: rec?.totalLatencyMs ?? 0,
+    successLatencySamples: rec?.latencySamples ?? 0,
+    successTotalLatencyMs: rec?.totalLatencyMs ?? 0,
   };
 }
 
@@ -230,7 +249,12 @@ function scheduleFlush(workspace: string): void {
 }
 
 async function flushWorkspace(workspace: string): Promise<void> {
-  if (DIRTY.has(workspace)) return; // 上一次 flush 仍在写
+  if (DIRTY.has(workspace)) {
+    // 上一次 flush 仍在写：本次更新不立即落盘，但**不能丢**——安排一次延迟重刷
+    // （旧实现直接 return，若此后无新更新，这批数据永远停留在内存、重启即失）。
+    scheduleFlush(workspace);
+    return;
+  }
   DIRTY.add(workspace);
   const snap = MEM.get(workspace);
   if (!snap) {

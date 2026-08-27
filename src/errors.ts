@@ -42,6 +42,26 @@ export class ExecutorCostLimitError extends Error {
 }
 
 /**
+ * 进程级全局执行器调用预算耗尽（governance.maxGlobalInvocations，全工作区累计）。
+ * extends ExecutorCostLimitError：既有调用方（stage-runner / review-gate / handshake /
+ * adaptive）的 `instanceof ExecutorCostLimitError` 与 `isUnretryableInvocationError`
+ * 自动命中，无需改动即按 cost_limit + human gate 处理。`scope` 供展示面区分来源。
+ * 解法与 per-job 闸不同：调高/清除插件配置 governance.maxGlobalInvocations（或 cbx
+ * settings 对应项）后经 cbx_continue 继续——闸在调用前重查，fail-closed 无绕过。
+ */
+export class GlobalCostLimitError extends ExecutorCostLimitError {
+  readonly scope: "global";
+  constructor(limit: number, used: number) {
+    super(limit, used);
+    this.scope = "global";
+    this.message =
+      `进程级全局执行器调用预算已耗尽（上限 ${limit} 次，全工作区已用 ${used} 次）。` +
+      `请调高插件配置 governance.maxGlobalInvocations（或 cbx settings 的对应项）后经 cbx_continue 继续，或取消任务。`;
+    this.name = "GlobalCostLimitError";
+  }
+}
+
+/**
  * 安全策略漂移：任务创建时的 `.cbx.json` 安全指纹（成本闸/插件白名单/reviewGate/
  * 环境白名单）与执行期现读值不一致——工作区 `.cbx.json` 在任务创建后被修改
  * （非隔离执行器 cwd=workspace 可改写，静默拆掉安全/成本控制即此场景）。fail-closed：

@@ -9,6 +9,7 @@ import {
   updateJobContext,
   withFileLock,
   securityPolicyFingerprint,
+  verifyJobAudit,
 } from "./storage.js";
 import { finishSpan, startSpan } from "./observability.js";
 import {
@@ -263,7 +264,42 @@ async function executeJobLocked(
   let attemptExtra = extra;
   const cancelMarker = path.join(directory, "cancel.requested");
 
-  const finish = async (updates: Json): Promise<JobState> => {
+  const finish = async (updatesInput: Json): Promise<JobState> => {
+    let updates = updatesInput;
+    // 审计强制动作（audit.failOnTamper，fail-closed）：done 收口前核对 events.ndjson
+    // 与 SQLite 镜像一致性。检测到篡改即把 done 改写为 needs_fix/audit_tamper +
+    // Human Gate——展示面的「篡改!」升级为拦截（result.json 的 auditIntegrity 仍是
+    // 只读展示，此处是强制面）。验证失败（镜像不可用/IO 异常）不拦截——与展示面
+    // 同语义：无法验证 ≠ 篡改。执行器改写 .cbx.json 关掉本开关会先撞策略指纹漂移。
+    if (String(updates.status ?? "") === "done") {
+      try {
+        const runtimeConfig = await loadConfig(workspace);
+        if (runtimeConfig.audit?.failOnTamper === true) {
+          const audit = await verifyJobAudit(workspace, jobId);
+          if (audit.tampered && !audit.valid) {
+            const detail =
+              `审计完整性检测到 events.ndjson 被篡改（与 SQLite 镜像漂移）：${audit.reason ?? "未知原因"}。` +
+              `audit.failOnTamper 已拦截任务完成。修复：从备份/轮转代核对并复原 events.ndjson，` +
+              `或确认不再需要审计拦截后在 .cbx.json 设 "audit": { "failOnTamper": false } 并显式续跑（cbx_continue 接受当前配置并刷新指纹）。`;
+            updates = {
+              ...updates,
+              status: "needs_fix",
+              phase: "audit_tamper",
+              error: detail,
+              humanGate: createHumanGate("needs_input", {
+                detail,
+                questions: ["修复审计文件后继续（cbx_continue），或关闭该任务的 failOnTamper。"],
+              }),
+            };
+            logJobEvent(workspace, jobId, "audit_tamper_gate", {
+              detail: audit.reason ?? "",
+            });
+          }
+        }
+      } catch {
+        /* 验证失败不拦截（无法验证 ≠ 篡改） */
+      }
+    }
     // 完成收口前核取消：证据哈希/审批/提交可耗时数秒，窗口内用户取消的 done 会
     // 与 cancelJob 的覆写交错（state=done 而 entry=cancelled 的撕裂）。有标记的
     // done 一律改走取消收口，保持 state 与 entry 一致。

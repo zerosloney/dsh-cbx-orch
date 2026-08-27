@@ -56,6 +56,13 @@ export function getRunningJob(workspace: string, jobId: string): JobRuntimeConte
   return runningJobs.get(contextKey(workspace, jobId));
 }
 
+/** 进程内正在运行的任务总数（全工作区合计）。全局并发闸以此计数为权威：
+ *  registerRunningJob 在 spawn 返回前同步完成，取消/回收/完成经 unregisterRunningJob
+ *  自动收缩——无需额外的释放钩子。 */
+export function countRunningJobs(): number {
+  return runningJobs.size;
+}
+
 /**
  * Cancel an in-process job: signal its controller and terminate every active
  * subprocess handle it owns. Returns whether the job was running in-process.

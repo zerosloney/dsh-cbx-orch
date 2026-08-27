@@ -87,6 +87,11 @@ export interface RuntimeConfig {
     redactPatterns?: string[];
   };
   reviewGate?: { enabled?: boolean; failOpen?: boolean };
+  /** 审计强制动作：终态收口前检测到 events.ndjson 被篡改（与 SQLite 镜像漂移）时
+   *  fail-closed 拦截完成（done → needs_fix/audit_tamper + Human Gate），而不是只
+   *  在展示面标「篡改!」。缺省 false = 仅展示（向后兼容）。执行器可写 .cbx.json，
+   *  故本字段纳入安全策略指纹（改回 false 会触发 policy_drift）。 */
+  audit?: { failOnTamper?: boolean };
   /** 成本治理：执行器调用上限（硬闸，防 API 配额烧穿）。缺省 = 无上限（向后兼容）。 */
   cost?: {
     /** 单个任务累计执行器调用（stage + review + manager + gate 全部角色）的上限。 */
@@ -106,6 +111,10 @@ export interface RuntimeConfig {
    *  `executors.envAllowlist`；缺省/未配置时回落到全局（插件 config 或缺省=完整继承）。 */
   executors?: {
     envAllowlist?: string[];
+    /** 内置执行器 CLI 参数覆盖：键为注册名/别名（codebuddy/opencode/omp/cline/qwen），
+     *  值追加到内置参数序列末尾（通常为 flag/value 形式）。外部 CLI 版本参数漂移时
+     *  的工作区逃生门，无需发版插件。纳入安全策略指纹（executors 整对象）。 */
+    cliArgs?: Record<string, string[]>;
   };
 }
 
@@ -113,14 +122,6 @@ function object(value: unknown, name: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error(`${name} 必须是对象。`);
   return value as Record<string, unknown>;
-}
-function known(
-  value: Record<string, unknown>,
-  name: string,
-  keys: string[],
-): void {
-  for (const key of Object.keys(value))
-    if (!keys.includes(key)) throw new Error(`${name} 不支持字段：${key}`);
 }
 function optionalBoolean(value: unknown, name: string): void {
   if (value !== undefined && typeof value !== "boolean")
@@ -146,6 +147,61 @@ function optionalInteger(
 }
 
 /** Strict runtime validation prevents unknown policy fields from silently weakening controls. */
+
+/** 当前 .cbx.json 配置格式版本（配置作者在 configCompat.schemaVersion 声明）。
+ *  声明值大于本值 → 加载期拒绝（配置由更新版本的 cbx 编写，需要升级插件）。
+ *  降级场景（新字段落到旧版本）用 strict:false 逃生门接管，见 configCompat。 */
+export const CURRENT_CONFIG_SCHEMA_VERSION = 1;
+
+/** 安全关键字段名（模糊匹配）：strict:false 模式下仍拒绝"疑似拼错的安全字段"——
+ *  逃生门不能静默吞掉成本闸/插件白名单/审查闸/审计闸/执行器白名单的拼写错误。 */
+const SECURITY_FIELD_KEYS = new Set(["cost", "plugins", "reviewgate", "audit", "executors"]);
+
+/** 归一化键名（去非字母小写化），供安全字段模糊匹配。 */
+function fuzzySecurityKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z]/g, "");
+}
+
+/** 宽松命中：归一化后与安全字段相等，或只差一个字符（costs/pluginz/reviewgatee/
+ *  audits 之类拼写变体）。±1 之外（如 coast）不算安全字段拼写，仍按普通未知键警告。 */
+function isSecurityFieldTypo(key: string): boolean {
+  const normalized = fuzzySecurityKey(key);
+  for (const field of SECURITY_FIELD_KEYS) {
+    if (normalized === field) return true;
+    if (normalized.startsWith(field) && normalized.length <= field.length + 1)
+      return true;
+    if (field.startsWith(normalized) && field.length <= normalized.length + 1)
+      return true;
+  }
+  return false;
+}
+
+/** 当前加载期的未知键收集器与严格模式开关。仅 loadRuntimeConfig 的同步校验段内
+ *  有效（Node 单线程：该段无 await，无并发交错风险）。 */
+let strictModeActive = true;
+let unknownKeys: string[] = [];
+
+function known(
+  value: Record<string, unknown>,
+  name: string,
+  keys: string[],
+): void {
+  for (const key of Object.keys(value)) {
+    if (keys.includes(key)) continue;
+    if (!strictModeActive) {
+      // 逃生门（configCompat.strict=false）：未知键降级为警告；安全字段拼写仍拒绝。
+      if (isSecurityFieldTypo(key)) {
+        throw new Error(
+          `${name} 不支持字段：${key}（疑似安全字段拼写错误，strict:false 不豁免安全闸）。`,
+        );
+      }
+      unknownKeys.push(`${name}.${key}`);
+      continue;
+    }
+    throw new Error(`${name} 不支持字段：${key}`);
+  }
+}
+
 export async function loadRuntimeConfig(
   workspaceInput: string,
 ): Promise<RuntimeConfig> {
@@ -159,6 +215,51 @@ export async function loadRuntimeConfig(
     throw error;
   }
   const config = object(parsed, ".cbx.json");
+  // configCompat：配置格式兼容声明，必须先于严格校验读取（逃生门本身必须永远可解析）。
+  //   - schemaVersion > 当前版本 → 拒绝（配置由更新版本编写，fail-closed，strict:false 不豁免）；
+  //   - strict: false → 未知键降级为警告（安全字段拼写仍拒绝），供升级后需降级/快速恢复场景。
+  const configCompat = (config.configCompat ?? {}) as Record<string, unknown>;
+  if (
+    configCompat.schemaVersion !== undefined &&
+    (!Number.isInteger(configCompat.schemaVersion) ||
+      Number(configCompat.schemaVersion) < 1)
+  )
+    throw new Error("configCompat.schemaVersion 必须是正整数（≥1）。");
+  if (
+    Number(configCompat.schemaVersion) > CURRENT_CONFIG_SCHEMA_VERSION
+  ) {
+    throw new Error(
+      `.cbx.json 声明 configCompat.schemaVersion=${Number(configCompat.schemaVersion)}，高于当前 cbx 支持的 ${CURRENT_CONFIG_SCHEMA_VERSION}——配置由更新版本编写，请升级插件（或删除该字段后重试）。`,
+    );
+  }
+  const warnedStrict =
+    configCompat.strict !== undefined &&
+    configCompat.strict !== false &&
+    configCompat.strict !== true;
+  if (warnedStrict)
+    throw new Error("configCompat.strict 必须是布尔值（缺省 true = 严格拒绝未知字段）。");
+  // 同步校验段：设置逃生门开关并收集未知键，finally 还原（该段无 await，无交错）。
+  const previousStrict = strictModeActive;
+  strictModeActive = configCompat.strict !== false;
+  unknownKeys = [];
+  try {
+    return await validateRuntimeConfig(config);
+  } finally {
+    if (!strictModeActive && unknownKeys.length > 0) {
+      console.error(
+        `cbx 警告：.cbx.json 配置了 configCompat.strict=false，以下未知字段被忽略（可能已失效或拼写错误）：${unknownKeys.join(", ")}。` +
+          `安全字段（cost/plugins/reviewGate/audit/executors）拼写不受此豁免。`,
+      );
+    }
+    strictModeActive = previousStrict;
+    unknownKeys = [];
+  }
+}
+
+/** loadRuntimeConfig 的同步校验体（strict 开关已就位）。 */
+async function validateRuntimeConfig(
+  config: Record<string, unknown>,
+): Promise<RuntimeConfig> {
   known(config, ".cbx.json", [
     "testCommand",
     "review",
@@ -186,6 +287,8 @@ export async function loadRuntimeConfig(
     "telemetry",
     "governance",
     "reviewGate",
+    "audit",
+    "configCompat",
     "cost",
     "adaptive",
     "dependencyGuard",
@@ -414,6 +517,11 @@ export async function loadRuntimeConfig(
     optionalBoolean(value.enabled, "reviewGate.enabled");
     optionalBoolean(value.failOpen, "reviewGate.failOpen");
   }
+  if (config.audit !== undefined) {
+    const value = object(config.audit, "audit");
+    known(value, "audit", ["failOnTamper"]);
+    optionalBoolean(value.failOnTamper, "audit.failOnTamper");
+  }
   if (config.cost !== undefined) {
     const value = object(config.cost, "cost");
     known(value, "cost", ["maxExecutorInvocations"]);
@@ -442,7 +550,7 @@ export async function loadRuntimeConfig(
   }
   if (config.executors !== undefined) {
     const value = object(config.executors, "executors");
-    known(value, "executors", ["envAllowlist"]);
+    known(value, "executors", ["envAllowlist", "cliArgs"]);
     if (value.envAllowlist !== undefined) {
       if (
         !Array.isArray(value.envAllowlist) ||
@@ -453,6 +561,24 @@ export async function loadRuntimeConfig(
         throw new Error(
           "executors.envAllowlist 必须是非空字符串数组（可留空数组=显式继承宿主 env）。",
         );
+    }
+    if (value.cliArgs !== undefined) {
+      const cliArgs = object(value.cliArgs, "executors.cliArgs");
+      for (const [name, args] of Object.entries(cliArgs)) {
+        if (
+          !Array.isArray(args) ||
+          args.length > 64 ||
+          args.some(
+            (item) =>
+              typeof item !== "string" ||
+              !item.trim() ||
+              item.length > 512,
+          )
+        )
+          throw new Error(
+            `executors.cliArgs.${name} 必须是最多 64 个非空字符串（每个 ≤512 字符）的数组。`,
+          );
+      }
     }
   }
   if (config.templates !== undefined) {
@@ -616,7 +742,7 @@ export function redactText(
  * 不在此列（那是任务内容不是安全闸）。
  */
 export function securityPolicyFingerprint(
-  config: Pick<RuntimeConfig, "cost" | "plugins" | "reviewGate" | "executors">,
+  config: Pick<RuntimeConfig, "cost" | "plugins" | "reviewGate" | "audit" | "executors">,
 ): string {
   return createHash("sha256")
     .update(
@@ -624,6 +750,7 @@ export function securityPolicyFingerprint(
         cost: config.cost ?? null,
         plugins: config.plugins ?? null,
         reviewGate: config.reviewGate ?? null,
+        audit: config.audit ?? null,
         executors: config.executors ?? null,
       }),
     )

@@ -11,6 +11,7 @@ import { registerCbxCommands } from "./commands.js";
 import { acquireScheduler, type SchedulerHandle } from "./queue-api.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
 import { installCbxSettings } from "./settings-integration.js";
+import { resetGlobalGate, setGlobalLimits } from "./global-gate.js";
 
 declare module "@deepseek-ai/cordis" {
   interface Context {
@@ -40,6 +41,14 @@ export interface Config {
   executors?: {
     envAllowlist?: string[];
   };
+  /** 进程级全局治理（跨工作区）：经 setGlobalLimits 运行时替换，即时生效。
+   *  刻意不进 .cbx.json——工作区配置对"进程级策略"没有权威性（见 global-gate.ts）。 */
+  governance?: {
+    /** 进程级并发上限：所有工作区同时 running 的任务总数上限。缺省 = 不限制。 */
+    maxGlobalConcurrent?: number;
+    /** 进程级执行器调用预算：所有工作区累计调用硬上限。缺省 = 不限制。 */
+    maxGlobalInvocations?: number;
+  };
 }
 
 /**
@@ -58,6 +67,11 @@ export default class CbxOrchestrator extends Service {
     workspaces: z.array(z.string()).default([]),
     executors: z.object({
       envAllowlist: z.array(z.string()).default([]),
+    }),
+    governance: z.object({
+      // min(1) 表意，整数性由 setGlobalLimits 运行时校验兜底（fail-closed 拒绝启动）。
+      maxGlobalConcurrent: z.number().min(1),
+      maxGlobalInvocations: z.number().min(1),
     }),
   });
 
@@ -80,6 +94,9 @@ export default class CbxOrchestrator extends Service {
     const disposeEnvAllowlist = setExecutorEnvAllowlist(
       envAllowlist && envAllowlist.length > 0 ? envAllowlist : undefined,
     );
+    // 进程级全局治理（governance.maxGlobalConcurrent / maxGlobalInvocations）：
+    // 应用到进程级闸（队列派发与执行器调用都会读取）。settings 集成可运行时替换。
+    setGlobalLimits(config.governance ?? {});
     registerCbxTools(ctx, defaults);
     registerCbxCommands({ ctx, defaults });
     // ctx.settings 集成（可选）：settings 服务存在时把插件默认配置暴露为用户设置
@@ -117,9 +134,14 @@ export default class CbxOrchestrator extends Service {
                   resetHealthStore();
                 } finally {
                   try {
-                    await closeDatabaseConnections();
+                    // 全局治理闸是进程级单例：卸载时还原为"无限"（插件已不在运行）。
+                    resetGlobalGate();
                   } finally {
-                    disposeObservability();
+                    try {
+                      await closeDatabaseConnections();
+                    } finally {
+                      disposeObservability();
+                    }
                   }
                 }
               }

@@ -67,6 +67,7 @@ export function phaseExplanation(status?: string, phase?: string): string {
     case "needs_fix":
       if (p.includes("clarification") || p.includes("input")) return "等待补充说明";
       if (p.includes("evidence")) return "完成证据已变化，需重跑验证";
+      if (p === "audit_tamper") return "审计篡改被 failOnTamper 拦截，等待处理";
       return "执行 / 测试未通过，等待修复续跑";
     case "review_failed":
       return "审查未通过，等待处理";
@@ -95,6 +96,12 @@ export function nextActionHint(status?: string, phase?: string, jobId?: string):
         return [`补充说明后续跑：${cmd("cbx_continue")} <说明>`];
       }
       if (p.includes("evidence")) return [`重跑验证：${cmd("cbx_continue")}`];
+      if (p === "audit_tamper") {
+        return [
+          `修复审计文件（events.ndjson 与 SQLite 核对复原）后续跑：${cmd("cbx_continue")}`,
+          `或改 .cbx.json 的 audit.failOnTamper=false 后显式续跑`,
+        ];
+      }
       return [
         `按失败原因修复续跑：${cmd("cbx_continue")} <修复指令>`,
         `或重试：${cmd("cbx_retry")}`,

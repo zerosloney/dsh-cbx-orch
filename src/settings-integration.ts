@@ -2,6 +2,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import type { CbxDefaults } from "./tools.js";
 import { setExecutorEnvAllowlist } from "./subprocess-adapter.js";
+import { setGlobalLimits } from "./global-gate.js";
 
 /**
  * ctx.settings 集成（最小面）：把 cbx 的插件级默认配置（executor/review/isolated/
@@ -30,6 +31,7 @@ export interface CbxSettingsSection {
   isolated?: boolean;
   carryDirty?: boolean;
   executors?: { envAllowlist?: string[] };
+  governance?: { maxGlobalConcurrent?: number; maxGlobalInvocations?: number };
 }
 
 /** 插件 composition config 的可覆盖字段子集（installCbxSettings 的 base 层）。 */
@@ -39,6 +41,7 @@ export interface CbxSettingsConfig {
   isolated?: boolean;
   carryDirty?: boolean;
   executors?: { envAllowlist?: string[] };
+  governance?: { maxGlobalConcurrent?: number; maxGlobalInvocations?: number };
 }
 
 /**
@@ -99,6 +102,11 @@ export async function installCbxSettings(
     executors: z.object({
       envAllowlist: z.array(z.string()),
     }),
+    governance: z.object({
+      // min(1) 表意，整数性由 setGlobalLimits 运行时校验兜底（拒绝时保持上一份有效配置）。
+      maxGlobalConcurrent: z.number().min(1),
+      maxGlobalInvocations: z.number().min(1),
+    }),
   });
 
   /** 当前权威配置源 thunk（installSettingsSection 在 attach/detach 时设置）。 */
@@ -107,6 +115,14 @@ export async function installCbxSettings(
   let latestEnvDisposer: (() => void) | undefined;
 
   const apply = (section: CbxSettingsSection | undefined): void => {
+    // 进程级全局治理：字段级合并（settings 覆盖 config 的同名字段，未配字段回落
+    // config / 缺省无限），换值即 setGlobalLimits 替换、即时生效；非法值在
+    // setGlobalLimits 内抛错，由 onChange 的 catch 兜底——保持上一份有效配置。
+    const governance = {
+      ...(config.governance ?? {}),
+      ...((section ?? {}).governance ?? {}),
+    };
+    setGlobalLimits(governance);
     if (!applySettingsSection(defaults, config, section)) return;
     // envAllowlist 被 settings 或 config 配置：重新应用（先还原上一次的 disposer）。
     const s = section ?? {};
@@ -134,6 +150,7 @@ export async function installCbxSettings(
       isolated: config.isolated,
       carryDirty: config.carryDirty,
       executors: config.executors,
+      governance: config.governance,
     } satisfies CbxSettingsSection,
     {
       setSource: (current) => {
@@ -151,6 +168,8 @@ export async function installCbxSettings(
   // 初始应用（attach 时 installSettingsSection 已调 onChange，这里幂等兜底）。
   return () => {
     currentSource = undefined;
+    // 还原为插件 composition config 的治理配置（settings 层已摘除）。
+    setGlobalLimits(config.governance ?? {});
     latestEnvDisposer?.();
     latestEnvDisposer = undefined;
   };

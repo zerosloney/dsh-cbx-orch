@@ -6,8 +6,9 @@ import { isCbxError } from "./errors.js";
 import { logJobEvent } from "./state.js";
 import { terminateTree } from "./process-runner.js";
 import { pidRecordOwnsProcess, readPidRecord } from "./pid-guard.js";
-import { abortRunningJob, getRunningJob } from "./job-runtime.js";
+import { abortRunningJob, countRunningJobs, getRunningJob } from "./job-runtime.js";
 import { startInProcessJob } from "./worker.js";
+import { withSpawnSlot } from "./global-gate.js";
 
 export type QueueEntryStatus = "queued" | "running" | "done" | "failed" | "awaiting_approval" | "cancelled" | "needs_fix";
 export interface QueueEntry {
@@ -17,6 +18,9 @@ export interface QueueEntry {
   reclaimCount?: number;
   /** 最近一次回收时间（ISO）；重派按 reclaimCount 指数退避，避免熔断前高频重放执行器。 */
   lastReclaimAt?: string;
+  /** 排队滞留原因（仅排障展示，不参与状态机）：`global_cap` = 进程级全局并发闸
+   *  （governance.maxGlobalConcurrent）已满，等待其他工作区任务释放槽位。 */
+  deferReason?: string;
 }
 export interface QueueFile { maxConcurrent: number; paused: boolean; entries: QueueEntry[]; updatedAt: string; }
 
@@ -202,8 +206,27 @@ export async function dispatchQueue(runtime: QueueRuntime, workspaceInput: strin
           if (active >= maxConcurrent) break;
           // 回收退避中的条目本轮跳过：给上次崩溃留出指数退避窗口再重放执行器。
           if (reclaimBackoffRemainingMs(entry) > 0) continue;
-          try { entry.pid = await spawnQueueWorker(runtime, workspace, entry); entry.status = "running"; entry.startedAt = now(); active += 1; }
-          catch (error) {
+          try {
+            // 进程级全局并发闸（governance.maxGlobalConcurrent）：检查 + spawn 在
+            // 进程级互斥内原子完成（win 注册表计数）。闸满返回 null——本 tick 不再
+            // 派发任何条目（全局满即所有工作区都满），下个 tick / 入队时再试。
+            const pid = await withSpawnSlot(() => spawnQueueWorker(runtime, workspace, entry));
+            if (pid === null) {
+              if (entry.deferReason !== "global_cap") {
+                entry.deferReason = "global_cap";
+                logJobEvent(workspace, entry.jobId, "queue_deferred_global_cap", {
+                  globalActive: countRunningJobs(),
+                });
+              }
+              break;
+            }
+            entry.deferReason = undefined;
+            entry.pid = pid;
+            entry.status = "running";
+            entry.startedAt = now();
+            active += 1;
+          } catch (error) {
+            entry.deferReason = undefined;
             entry.status = "failed"; entry.error = String(error); entry.finishedAt = now();
             logJobEvent(workspace, entry.jobId, "queue_spawn_failed", { error: String(error) });
           }

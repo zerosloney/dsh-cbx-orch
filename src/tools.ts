@@ -213,6 +213,7 @@ function renderQueue(args: Record<string, unknown>, value: unknown): ContentBloc
     lines.push("");
     lines.push("| Queue ID           | Job ID              | Status   | Priority | Reclaims |");
     lines.push("|--------------------|---------------------|----------|----------|----------|");
+    const deferred: string[] = [];
     for (const entry of entries) {
       const e = entry as Record<string, unknown>;
       const qid = String(e.queueId ?? "—");
@@ -220,7 +221,12 @@ function renderQueue(args: Record<string, unknown>, value: unknown): ContentBloc
       const st = String(e.status ?? "—");
       const pri = typeof e.priority === "number" ? String(e.priority) : "0";
       const rec = typeof e.reclaimCount === "number" ? String(e.reclaimCount) : "0";
+      if (e.deferReason === "global_cap") deferred.push(jid);
       lines.push(`| ${qid.padEnd(18)} | ${jid.padEnd(19)} | ${st.padEnd(8)} | ${pri.padEnd(8)} | ${rec.padEnd(8)} |`);
+    }
+    if (deferred.length > 0) {
+      lines.push("");
+      lines.push(`⚠ ${deferred.length} 个排队任务等待进程级全局并发闸释放（governance.maxGlobalConcurrent 已满，其他工作区任务完成后自动续跑）：${deferred.join(", ")}`);
     }
   }
   return jsonContent(withDashboardFooter(lines.join("\n"), ws));

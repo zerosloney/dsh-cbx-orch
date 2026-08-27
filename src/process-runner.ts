@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { appendFileSync, unlinkSync } from "node:fs";
 import { writePidRecord } from "./pid-guard.js";
+import { createLogFileSink } from "./log-file-sink.js";
 
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 
@@ -347,29 +348,16 @@ function runChildRaw(
         );
       }
     };
-    // 磁盘日志硬上限（与 seam 适配器一致）：raw 回退路径同样不能让 agent.log/test.log 无界增长。
+    // 磁盘日志硬上限（与 seam 适配器一致）：raw 回退路径同样不能让 agent.log/test.log
+    // 无界增长。createLogFileSink：主文件达上限先轮转 .1 代，两代都满/无法轮转才
+    // 停止落盘并留标记；内存采集（BoundedOutput）始终保留尾部。
     const MAX_LOG_FILE_BYTES = 32 * 1024 * 1024;
-    let logBytes = 0;
-    let logCapped = false;
+    const logFileSink = logFile
+      ? createLogFileSink(logFile, (chunk) => appendFileSync(logFile, chunk), MAX_LOG_FILE_BYTES)
+      : { capped: () => false, append: () => undefined };
     const append = (chunk: Buffer) => {
       output.append(chunk);
-      if (logFile && !logCapped) {
-        logBytes += chunk.length;
-        if (logBytes > MAX_LOG_FILE_BYTES) {
-          logCapped = true;
-          try {
-            appendFileSync(
-              logFile,
-              `\n[cbx: 日志已达 ${MAX_LOG_FILE_BYTES} 字节上限，停止落盘；内存采集仍保留尾部]\n`,
-              "utf8",
-            );
-          } catch {
-            /* 磁盘已满等：静默 */
-          }
-          return;
-        }
-        appendFileSync(logFile, chunk);
-      }
+      logFileSink.append(chunk);
     };
     child.stdout.on("data", append);
     child.stderr.on("data", append);

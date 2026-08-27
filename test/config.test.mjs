@@ -15,6 +15,7 @@ test("CbxOrchestrator.Config: 空配置使用部署默认值", () => {
     carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: [] },
+    governance: {},
   });
 });
 
@@ -26,6 +27,7 @@ test("CbxOrchestrator.Config: 部分配置补齐默认值", () => {
     carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: [] },
+    governance: {},
   });
 });
 
@@ -41,6 +43,7 @@ test("CbxOrchestrator.Config: 完整配置保持覆盖语义", () => {
     carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: [] },
+    governance: {},
   });
 });
 
@@ -53,6 +56,7 @@ test("CbxOrchestrator.Config: 显式 workspace 列表保持覆盖语义", () => 
     carryDirty: false,
     workspaces,
     executors: { envAllowlist: [] },
+    governance: {},
   });
 });
 
@@ -64,7 +68,22 @@ test("CbxOrchestrator.Config: executors.envAllowlist 覆盖各自定义", () => 
     carryDirty: false,
     workspaces: [],
     executors: { envAllowlist: ["MY_TOKEN"] },
+    governance: {},
   });
+});
+
+test("CbxOrchestrator.Config: governance 全局治理覆盖", () => {
+  assert.deepEqual(CbxOrchestrator.Config({
+    governance: { maxGlobalConcurrent: 3, maxGlobalInvocations: 40 },
+  }).governance, {
+    maxGlobalConcurrent: 3,
+    maxGlobalInvocations: 40,
+  });
+  // min(1)：0 在 schema 层即拒绝
+  assert.throws(
+    () => CbxOrchestrator.Config({ governance: { maxGlobalConcurrent: 0 } }),
+    /maxGlobalConcurrent/,
+  );
 });
 
 test("服务注册工具共享配置的 workspace 策略", async () => {

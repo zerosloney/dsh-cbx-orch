@@ -847,6 +847,21 @@ tr.job.selected {
   color: var(--text-secondary);
 }
 
+/* 排队滞留徽章：进程级全局并发闸（governance.maxGlobalConcurrent）满时排队任务 */
+.defer-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: var(--radius-sm);
+  background: var(--status-running-bg);
+  border: 1px solid var(--status-running-border);
+  color: var(--status-running);
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: 1px;
+  white-space: nowrap;
+}
+
 /* Status Badges */
 .s-done { color: var(--status-done); font-weight: 500; }
 .s-failed, .s-needs_fix, .s-review_failed { color: var(--status-failed); font-weight: 500; }

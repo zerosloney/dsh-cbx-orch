@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **进程级全局治理（跨工作区）**：插件 config / settings 新增 `governance.maxGlobalConcurrent`（所有工作区同时 running 任务总数上限）与 `governance.maxGlobalInvocations`（全工作区累计执行器调用硬上限，stage/review/manager/gate 全角色）。新增 `src/global-gate.ts`：全局并发闸以进程内 job 注册表计数，"检查 + spawn"在进程级互斥内原子完成（两个工作区的派发循环不会交错越界），闸满时排队条目保持 queued 并带 `deferReason:"global_cap"`（`cbx_queue` 视图、仪表盘任务行 **⏳ 等待全局并发闸** 徽章均可见，其他工作区任务收口后自动续跑）；全局预算闸在每次调用前的既有成本闸检查点同步原子消费，耗尽即抛 `GlobalCostLimitError`（extends `ExecutorCostLimitError` → 复用 `needs_fix` + `cost_limit` + Human Gate 路径，消息标明"进程级全局预算"），调高预算后 `cbx_continue` 即恢复（fail-closed 无绕过）。`cbx_health` / `/cbx/healthz` / `/cbx/api/metrics` 附带 `global` 块（上限 / 活跃数 / 预算 / 已用）。缺省均不配置 = 无上限（完全向后兼容）；active/used 为进程内存态（重启归零）。**已知边界**：全局闸是进程内语义（同机两个 dsh 进程互不相见，跨进程治理留作未来工作）；配置刻意不进 `.cbx.json`（工作区配置对"进程级策略"没有权威性，且会扩大策略指纹范围）。
+- **审计强制动作（`audit.failOnTamper`，fail-closed）**：展示面（`篡改!` 列 / `__audit` / `auditIntegrity`）只记录，不拦截——现在可选升级为强制面：`done` 收口前核对 events.ndjson 与 SQLite 镜像，检测到篡改即把完成改写为 `needs_fix` + `audit_tamper` phase + Human Gate（复原 ndjson 或显式关闭开关后续跑），`cbx_status`/会话消息给出人话与下一步。`audit` 纳入安全策略指纹（执行器改写开关先撞 policy_drift）；验证失败不拦截（无法验证 ≠ 篡改）；缺省 false = 仅展示（向后兼容）。
+- **执行器 CLI 参数覆盖（`.cbx.json` 的 `executors.cliArgs`）**：键为内置注册名或别名，值（最多 64 个非空字符串）追加到内置参数序列末尾——外部 CLI 版本参数漂移时的工作区逃生门，无需发版插件；参数追加而非替换，纳入安全策略指纹。
+- **配置兼容逃生门（`configCompat`）**：`.cbx.json` 顶层 `configCompat: { strict: false, schemaVersion }`——升级后需降级/快速恢复场景不再死锁：`strict: false` 时未知字段降级为警告（加载时打印忽略清单），但**安全字段（cost/plugins/reviewGate/audit/executors）的拼写变体仍被拒绝**（±1 字符模糊匹配，如 `costs`/`reviewgatee`）；`schemaVersion` 声明配置编写版本，高于当前（=1）仍 fail-closed 拒绝。缺省 strict=true（既有严格行为不变）。
+
+### Improved
+
+- **`agent.log` / `test.log` 达上限改为轮转 `.1` 代再停止**（`src/log-file-sink.ts`，与 events.ndjson 的单代轮转语义一致）：主文件 32MB 达上限先轮转到 `agent.log.1` 并继续落盘（长任务后半程日志不再丢失），两代都满或文件被占用（Windows 文件锁）无法轮转时才留标记停止；内存采集始终保留尾部 4MB。
+- **审计验证分块流式**（`src/storage/events.ts`）：SQLite 侧 COUNT 锚点 + 从尾部 5000 行一页 DESC 回放比对，事件超 5 万条也能完整验证——不再整读截断返回「无法验证」；追加伪造行检测口径不变。
+
 ### Docs / 工程化
 
 - **发布流程迁移：删除 GitHub 发布 workflow，改为本机发布**：`.github/workflows/publish.yml`（`v*` tag 自动发布）已删除，不再有 `v*` tag 触发与 `NPM_TOKEN` 注入；`.github/workflows/ci.yml`（push/PR 的测试 + e2e + pack 冒烟）**保留**继续在 GitHub 上跑。新增 `scripts/release.sh`（`npm run release [-- patch|minor|major]`）在本机完成 前置检查（Node ≥ 22 / npm 登录态）→ 升版打 tag → lint/构建/单测 → 发布物冒烟 → `npm publish`；`prepublishOnly`/`preversion` 钩子守卫裸 `npm publish` 与 `npm version`；新增跨平台 bash 解析器 `scripts/bash.mjs`（Windows 未把 Git 的 bash 加入 PATH 也能直接跑 `release`/`smoke:*`）。

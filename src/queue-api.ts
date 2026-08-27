@@ -24,6 +24,7 @@ import { publishEvent } from "./observability.js";
 import { isCbxError } from "./errors.js";
 import type { JobState } from "./types.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
+import { globalStats } from "./global-gate.js";
 
 async function saveStateAndQueue(
   workspace: string,
@@ -212,6 +213,7 @@ export async function health(
   status: "ok";
   metrics: Awaited<ReturnType<typeof persistedMetrics>>;
   audit?: { checked: number; tampered: number };
+  global: ReturnType<typeof globalStats>;
 }> {
   const workspace = path.resolve(workspaceInput);
   // prune 含全表扫描 + 目录删除；公开探针（/healthz）应传 { prune: false } 只读指标，
@@ -248,6 +250,9 @@ export async function health(
     status: "ok",
     metrics,
     ...(checked > 0 || tampered > 0 ? { audit: { checked, tampered } } : {}),
+    // 进程级全局治理快照（governance.maxGlobalConcurrent / maxGlobalInvocations）：
+    // 只读，不触发保留期清理。active/used 为进程内存态，重启归零。
+    global: globalStats(),
   };
 }
 

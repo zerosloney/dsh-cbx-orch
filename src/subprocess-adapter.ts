@@ -4,6 +4,7 @@ import type { SubprocessRuntime } from "@deepseek-ai/dsh-subprocess";
 import { loadRuntimeExecutorsAllowlist } from "./storage.js";
 import { jobContext, type ActiveProcessHandle } from "./job-runtime.js";
 import { writePidRecord } from "./pid-guard.js";
+import { createLogFileSink } from "./log-file-sink.js";
 import {
   MAX_CAPTURE_BYTES,
   ProcessTreeTerminationError,
@@ -488,35 +489,22 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
 
     // 落盘日志经流式脱敏（首 chunk 延迟写 + 64 字节跨 chunk 重叠，见 LogRedactor）
     // 后再写 logFile，防止执行器输出回显的凭据原样持久化；内存 output 保持原样。
-    // 磁盘侧设硬上限：内存 BoundedOutput 只保尾部 4MB，但逐 chunk append 不设限
-    // 会让 chatty 执行器把 agent.log/test.log 写到数百 MB（evidence 哈希、artifact
-    // 读取、SSE 回放全部跟着遭殃）。超限后停止落盘并留标记，内存采集不受影响。
+    // 磁盘侧设硬上限（createLogFileSink：主文件 32MB 达上限先轮转到 .1 代，两代都满
+    // 或无法轮转才停止落盘并留标记）——chatty 执行器不能把 agent.log/test.log 写到
+    // 数百 MB（evidence 哈希、artifact 读取、SSE 回放全部跟着遭殃）；内存采集不受影响。
     const MAX_LOG_FILE_BYTES = 32 * 1024 * 1024;
     const logRedactor = new LogRedactor();
-    let logBytes = 0;
-    let logCapped = false;
+    const logFileSink = logFile
+      ? createLogFileSink(logFile, (chunk) => {
+          logRedactor.write(
+            (redacted) => appendFileSync(logFile, redacted),
+            chunk.toString("utf8"),
+          );
+        }, MAX_LOG_FILE_BYTES)
+      : { capped: () => false, append: () => undefined };
     const append = (chunk: Buffer): void => {
       output.append(chunk);
-      if (logFile && !logCapped) {
-        logBytes += chunk.length;
-        if (logBytes > MAX_LOG_FILE_BYTES) {
-          logCapped = true;
-          try {
-            appendFileSync(
-              logFile,
-              `\n[cbx: 日志已达 ${MAX_LOG_FILE_BYTES} 字节上限，停止落盘；内存采集仍保留尾部]\n`,
-              "utf8",
-            );
-          } catch {
-            /* 磁盘已满等：静默 */
-          }
-          return;
-        }
-        logRedactor.write(
-          (redacted) => appendFileSync(logFile, redacted),
-          chunk.toString("utf8"),
-        );
-      }
+      logFileSink.append(chunk);
     };
     handle.stdout?.on("data", append);
     handle.stderr?.on("data", append);
@@ -586,7 +574,7 @@ export function createSubprocessProvider(subprocess: SubprocessRuntime): Process
       if (hardTimerHandle !== undefined) clearTimeout(hardTimerHandle);
       // 落盘最后一段（LogRedactor 首 chunk 延迟写的 pending）：任何退出路径
       // （正常/超时/取消/错误）都不能丢失已采集的日志尾部。
-      if (logFile && !logCapped) {
+      if (logFile && !logFileSink.capped()) {
         try {
           logRedactor.flush((redacted) => appendFileSync(logFile, redacted));
         } catch {

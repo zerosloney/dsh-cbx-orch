@@ -12,6 +12,17 @@ export interface BuildArgsOptions {
   maxTurns: number;
 }
 
+/** 组装最终参数序列：内置翻译 + 工作区覆盖（executors.cliArgs，追加在末尾）。
+ *  覆盖参数通常为 flag/value 形式（如 ["--model","x"]）；追加位置在末尾，
+ *  若 CLI 对位置参数敏感请用 flag 形式。 */
+export function buildArgsWithExtras(
+  spec: BuiltinExecutor,
+  opts: BuildArgsOptions,
+  extraArgs: readonly string[] | undefined,
+): string[] {
+  return [...spec.buildArgs(opts), ...(extraArgs ?? [])];
+}
+
 /** 执行器能力声明：路由层据此过滤"不满足任务需求"的执行器（如需要 autoApprove 时排除 omp）。 */
 export interface ExecutorCapabilities {
   /** 支持非交互式自动放行（auto/dontAsk）。omp 无此 flag，故为 false。 */

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   closeDatabaseConnections,
+  database,
   jobEventsAfterCursor,
   verifyJobAudit,
 } from "../lib/storage.js";
@@ -127,6 +128,44 @@ test("verifyJobAudit: SQLite 无该 job 事件（旧任务/镜像缺失）不判
   assert.equal(result.tampered, false);
   assert.equal(result.valid, false); // 无锚点
   assert.match(result.reason ?? "", /无法验证/);
+});
+
+test("verifyJobAudit: 事件超 5 万条仍完整验证（分块流式，不再截断为无法验证）", async () => {
+  const { workspace, jobId, directory } = makeJob();
+  const TOTAL = 50_100; // 超过旧实现的单次读取上限 50000
+  const db = await database(workspace);
+  const insert = db.prepare(
+    "INSERT INTO events(workspace, seq, type, payload_json, at, job_id) VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  const at = new Date().toISOString();
+  const lines = [];
+  db.transaction(() => {
+    for (let i = 1; i <= TOTAL; i++) {
+      const payload = { event: "bulk", i, at };
+      insert.run(workspace, i, "bulk", JSON.stringify(payload), at, jobId);
+      lines.push(JSON.stringify(payload));
+    }
+  })();
+  writeFileSync(path.join(directory, "events.ndjson"), lines.join("\n") + "\n", "utf8");
+
+  const result = await verifyJobAudit(workspace, jobId);
+  assert.equal(result.valid, true, "超 5 万条应完整验证通过（分块尾部回放）");
+  assert.equal(result.tampered, false);
+  assert.equal(result.sqliteCount, TOTAL);
+  assert.equal(result.ndjsonCount, TOTAL);
+
+  // 尾部追加伪造行：仍被检测（与镜像总行数比对）
+  writeFileSync(
+    path.join(directory, "events.ndjson"),
+    lines.join("\n") +
+      "\n" +
+      JSON.stringify({ event: "fake_tail", jobId, at }) +
+      "\n",
+    "utf8",
+  );
+  const tampered = await verifyJobAudit(workspace, jobId);
+  assert.equal(tampered.tampered, true, "超 5 万条时追加伪造行仍应检测");
+  assert.equal(tampered.valid, false);
 });
 
 test("buildTimeline 优先 SQLite：镜像存在时用 SQLite（执行器篡改 ndjson 不影响 timeline）", async () => {

@@ -194,6 +194,87 @@ test("loadConfig: executorTiers 未知字段与非对象值抛错", async () => 
   await assert.rejects(loadConfig(b));
 });
 
+// executors.cliArgs：CLI 参数覆盖是执行器调用面的配置，结构/取值非法必须加载期拒绝。
+test("loadConfig: executors.cliArgs 合法配置可通过校验（注册名与别名均可为键）", async () => {
+  const ws = workspace();
+  writeFileSync(
+    path.join(ws, ".cbx.json"),
+    JSON.stringify({ executors: { cliArgs: { codebuddy: ["--model", "mock-x"], cbc: [], qwen: ["--yolo"] } } }),
+    "utf8",
+  );
+  const config = await loadConfig(ws);
+  assert.deepEqual(config.executors?.cliArgs?.codebuddy, ["--model", "mock-x"]);
+  assert.deepEqual(config.executors?.cliArgs?.qwen, ["--yolo"]);
+});
+
+test("loadConfig: executors.cliArgs 非法结构抛错", async () => {
+  const cases = [
+    [{ executors: { cliArgs: "codebuddy" } }, /cliArgs/],
+    [{ executors: { cliArgs: { codebuddy: "--model" } } }, /cliArgs\.codebuddy/],
+    [{ executors: { cliArgs: { codebuddy: ["ok", ""] } } }, /cliArgs\.codebuddy/],
+    [{ executors: { cliArgs: { codebuddy: new Array(65).fill("x") } } }, /cliArgs\.codebuddy/],
+    [{ executors: { cliArgs: { unknown: ["a".repeat(513)] } } }, /cliArgs\.unknown/],
+  ];
+  for (const [payload, pattern] of cases) {
+    const ws = workspace();
+    writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify(payload), "utf8");
+    await assert.rejects(loadConfig(ws), pattern, `应拒绝 ${JSON.stringify(payload)}`);
+  }
+});
+
+// configCompat：严格校验的逃生门（升级后需降级/快速恢复）+ schemaVersion 显式版本门。
+test("loadConfig: 缺省 strict=true——未知字段整体拒绝（既有行为）", async () => {
+  const ws = workspace();
+  writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ review: true, futureField: 1 }), "utf8");
+  await assert.rejects(loadConfig(ws), /futureField/);
+});
+
+test("loadConfig: configCompat.strict=false——未知字段降级为警告并忽略", async () => {
+  const ws = workspace();
+  writeFileSync(
+    path.join(ws, ".cbx.json"),
+    JSON.stringify({ review: true, futureField: "v2-only", configCompat: { strict: false } }),
+    "utf8",
+  );
+  const config = await loadConfig(ws);
+  assert.equal(config.review, true, "已知字段照常生效");
+});
+
+test("loadConfig: configCompat.strict=false 不豁免安全字段拼写（costs/pluginz 仍拒绝）", async () => {
+  for (const payload of [
+    { costs: { maxExecutorInvocations: 1 }, configCompat: { strict: false } },
+    { plugin: [{ path: "x" }], configCompat: { strict: false } },
+    { reviewGatee: { failOpen: true }, configCompat: { strict: false } },
+  ]) {
+    const ws = workspace();
+    writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify(payload), "utf8");
+    await assert.rejects(loadConfig(ws), /安全字段拼写/, `应拒绝 ${JSON.stringify(payload)}`);
+  }
+});
+
+test("loadConfig: configCompat.strict 非布尔值拒绝", async () => {
+  const ws = workspace();
+  writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ configCompat: { strict: "no" } }), "utf8");
+  await assert.rejects(loadConfig(ws), /strict 必须是布尔值/);
+});
+
+test("loadConfig: configCompat.schemaVersion 高于当前版本拒绝（fail-closed）", async () => {
+  const ws = workspace();
+  writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ configCompat: { schemaVersion: 99 } }), "utf8");
+  await assert.rejects(loadConfig(ws), /schemaVersion=99/);
+});
+
+test("loadConfig: configCompat.schemaVersion 非法值拒绝，当前版本放行", async () => {
+  for (const bad of [0, -1, 1.5, "x"]) {
+    const ws = workspace();
+    writeFileSync(path.join(ws, ".cbx.json"), JSON.stringify({ configCompat: { schemaVersion: bad } }), "utf8");
+    await assert.rejects(loadConfig(ws), /schemaVersion/, `应拒绝 schemaVersion=${bad}`);
+  }
+  const ok = workspace();
+  writeFileSync(path.join(ok, ".cbx.json"), JSON.stringify({ configCompat: { schemaVersion: 1, strict: false }, futureField: 1 }), "utf8");
+  await assert.doesNotReject(loadConfig(ok));
+});
+
 test("listPersistedStates: 分页 limit/offset 按 updated_at 倒序返回", async () => {
   const ws = workspace();
   // updated_at 列由 savePersistedState 以 now() 写入（真实时间），逐条写保证

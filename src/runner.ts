@@ -3,13 +3,14 @@ import { appendFile, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { inspectExecutorPlugin, type ExecutorResult, type ExecutorRequest } from "./executor.js";
-import { findExecutable, resolveExecutor } from "./executors/builtin.js";
+import { findExecutable, buildArgsWithExtras, resolveExecutor } from "./executors/builtin.js";
 import { recordExecutorOutcome } from "./executor-health.js";
 import { bumpInvocationCount, loadConfig, loadState, mirrorJobEventToSqlite } from "./state.js";
 import { loadJobContext, securityPolicyFingerprint } from "./storage.js";
 import { validateTestCommand } from "./validation.js";
 import { runProcess, runShell, type ProcessResult } from "./process-runner.js";
-import { ExecutorCostLimitError, ExecutorPolicyDriftError, isUnretryableInvocationError } from "./errors.js";
+import { ExecutorCostLimitError, ExecutorPolicyDriftError, GlobalCostLimitError, isUnretryableInvocationError } from "./errors.js";
+import { tryConsumeInvocation as consumeGlobalInvocation } from "./global-gate.js";
 import { redactText, saveJson } from "./storage.js";
 import { APP_VERSION } from "./version.js";
 import { jobContext } from "./job-runtime.js";
@@ -170,10 +171,10 @@ export function promptFor(phase: string, extra = "", _label: string, contextPack
   return `你是任务执行代理。\n\n只读取当前角色上下文包：\n- ${contextPack}\n\n上下文包是编排器生成的最小化脱敏投影；只可额外读取其中 artifacts 明确列出的文件，不要读取任何未列材料或历史轨迹。\n当前阶段：${phase}\n\n${extra}`;
 }
 
-async function invokeBuiltin(spec: ReturnType<typeof resolveExecutor> & {}, directory: string, workdir: string, prompt: string, permissionMode: string, maxTurns: number, timeoutMs: number, signal?: AbortSignal): Promise<ProcessResult> {
+async function invokeBuiltin(spec: ReturnType<typeof resolveExecutor> & {}, directory: string, workdir: string, prompt: string, permissionMode: string, maxTurns: number, timeoutMs: number, signal?: AbortSignal, extraArgs?: readonly string[]): Promise<ProcessResult> {
   signal?.throwIfAborted();
   const executable = findExecutable(spec);
-  const args = [...executable.slice(1), ...spec.buildArgs({ prompt, permissionMode, maxTurns })];
+  const args = [...executable.slice(1), ...buildArgsWithExtras(spec, { prompt, permissionMode, maxTurns }, extraArgs)];
   const command = executable[0];
   const eventsFile = path.join(directory, "events.ndjson");
   const outputLog = path.join(directory, "agent.log");
@@ -287,6 +288,14 @@ async function invokeExecutorCore(executor: string, workspace: string, directory
             : 0;
         if (current >= limit) throw new ExecutorCostLimitError(limit, current);
       }
+      // 进程级全局预算（governance.maxGlobalInvocations，全工作区累计）：同步原子
+      // 消费（JS 单线程使 check + bump 原子），超限抛 GlobalCostLimitError——
+      // extends ExecutorCostLimitError，调用方自动按 cost_limit + human gate 处理。
+      // 轻微超跑语义与 per-job 闸一致：消费先于 bumpInvocationCount，计数失败不阻塞调用。
+      const globalCheck = consumeGlobalInvocation();
+      if (!globalCheck.allowed) {
+        throw new GlobalCostLimitError(globalCheck.limit!, globalCheck.used);
+      }
     } catch (error) {
       // 只有成本闸/策略漂移本身抛错才向上传播；读取/配置失败不能阻塞执行器调用（既有语义）。
       if (isUnretryableInvocationError(error)) throw error;
@@ -310,10 +319,24 @@ async function invokeExecutorCore(executor: string, workspace: string, directory
     }
   }
   signal?.throwIfAborted();
-  const builtin = resolveExecutor(executor);
-  if (builtin) return invokeBuiltin(builtin, directory, workdir, prompt, permissionMode, maxTurns, timeoutMs, signal);
   const config = await loadConfig(workspace);
   signal?.throwIfAborted();
+  const builtin = resolveExecutor(executor);
+  if (builtin) {
+    // 工作区级 CLI 参数覆盖（executors.cliArgs）：键可为注册名、别名或请求串本身，
+    // 命中即追加到内置参数之后——外部 CLI 版本参数漂移时的逃生门，无需发版插件。
+    const cliArgs = config.executors?.cliArgs;
+    let extraArgs: readonly string[] | undefined;
+    if (cliArgs) {
+      for (const key of [executor, builtin.name, ...builtin.aliases]) {
+        if (key && cliArgs[key] !== undefined) {
+          extraArgs = cliArgs[key];
+          break;
+        }
+      }
+    }
+    return invokeBuiltin(builtin, directory, workdir, prompt, permissionMode, maxTurns, timeoutMs, signal, extraArgs);
+  }
   // 安全默认：`.cbx.json` 未显式配置 plugins.enforce 时按 enforce=true 处理（fail-closed）——
   // 插件路径 = 任意代码执行面，未经路径/SHA 白名单校验的插件默认拒绝加载。显式
   // `enforce: false` 可显式放行（遗留工作区逃生门），显式 `enforce: true` 维持严格。

@@ -3,6 +3,9 @@ var allWorkspaces=[];
 var currentWorkspace=null;
 var selected=null;
 var filterStatus='';
+// 队列条目的排队滞留原因（jobId → deferReason），refresh 时由 /api/queue 构建：
+// 进程级全局并发闸（governance.maxGlobalConcurrent）满时排队任务显示"等待全局并发闸"。
+var queueDefer={};
 
 // 主题状态管理：默认淡色简约风格 (light)
 var currentTheme = localStorage.getItem('cbx-theme') || 'light';
@@ -146,6 +149,8 @@ async function refresh(){
   var ws=encodeURIComponent(currentWorkspace||'');
   var jobs=await cbxFetch('api/jobs?workspace='+ws).then(safeJson)||[];
   var q=await cbxFetch('api/queue?workspace='+ws).then(safeJson)||{entries:[]};
+  queueDefer={};
+  (q.entries||[]).forEach(function(e){if(e.deferReason)queueDefer[e.jobId]=e.deferReason;});
   updateCards(jobs,q);
   var filtered=filterStatus?jobs.filter(matchesFilter):jobs;
   document.querySelector('#jobs').innerHTML=filtered.map(rowHtml).join('');
@@ -313,9 +318,13 @@ function rowHtml(j){
   var terminal=['done','failed','review_failed','cancelled','needs_fix'].indexOf(j.status)>=0;
   var elapsed = terminal && j.totalSeconds != null ? (j.totalSeconds < 60 ? j.totalSeconds + 's' : Math.floor(j.totalSeconds/60) + 'm ' + (j.totalSeconds%60) + 's') : fmtElapsed(j.createdAt);
   var audit = auditBadge(j.__audit);
+  var defer=queueDefer[j.jobId];
+  var deferHtml=(j.status==='queued'&&defer==='global_cap')
+    ? ' <span class="defer-badge" title="进程级全局并发闸（governance.maxGlobalConcurrent）已满：等待其他工作区的任务释放槽位，完成后自动续跑。">⏳ 等待全局并发闸</span>'
+    : '';
   return '<tr class="'+cls+'" data-id="'+esc(j.jobId)+'" data-created="'+esc(j.createdAt||'')+'" data-terminal="'+terminal+'">'
     + '<td><button type="button" class="job-select">'+esc(j.jobId)+'</button></td>'
-    + '<td class="s-'+esc(j.status)+'"><span class="status-dot"></span>'+esc(j.status)+'</td>'
+    + '<td class="s-'+esc(j.status)+'"><span class="status-dot"></span>'+esc(j.status)+deferHtml+'</td>'
     + '<td><span class="phase-tag">'+esc(j.phase||'—')+'</span></td>'
     + '<td>'+esc(String(j.attempt))+'</td>'
     + '<td class="v-'+esc(j.reviewVerdict||'')+'">'+esc(j.reviewVerdict||'—')+'</td>'

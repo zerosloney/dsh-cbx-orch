@@ -76,6 +76,22 @@ async function makeJob(workspace, task, jobId) {
   });
 }
 
+/** 终态 result.json 在 state 落 done 后稍晚一步写盘：轮询到「done 终态帧」为止
+ *  （否则可能读到 needs_fix 阶段的旧 result.json——防并行负载下的时序 flake）。 */
+async function readResultJson(workspace, jobId) {
+  const file = path.join(workspace, ".cbx", "jobs", jobId, "result.json");
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      const result = await loadJson(file);
+      if (result && result.status === "done") return result;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return loadJson(file);
+}
+
 /** 在执行器运行前向 job 级 events.ndjson 注入伪造行：真实事件只会追加在其后，
  *  ndjson 行数恒比 SQLite 镜像多 → verifyJobAudit 必然判定篡改（确定性）。 */
 async function injectFakeEvent(workspace, jobId) {
@@ -104,7 +120,7 @@ test("audit.failOnTamper 未配置：篡改落在展示面（auditIntegrity）�
     await enqueueJob(ws, jobId);
     const state = await waitStatus(ws, jobId, ["done"]);
     assert.equal(state.status, "done", "未配置 failOnTamper 时篡改不拦截完成");
-    const result = await loadJson(path.join(ws, ".cbx", "jobs", jobId, "result.json"));
+    const result = await readResultJson(ws, jobId);
     assert.equal(result.auditIntegrity.tampered, true, "展示面应标记篡改");
     assert.equal(result.auditIntegrity.valid, false);
   } finally {
@@ -132,7 +148,7 @@ test("audit.failOnTamper=true：篡改拦截 done → needs_fix/audit_tamper，�
     await restoreNdjson(ndjson);
     await retryQueueJob(ws, jobId);
     await waitStatus(ws, jobId, ["done"]);
-    const result = await loadJson(path.join(ws, ".cbx", "jobs", jobId, "result.json"));
+    const result = await readResultJson(ws, jobId);
     assert.equal(result.auditIntegrity.tampered, false, "复原后审计应通过");
     assert.equal(result.auditIntegrity.valid, true);
   } finally {

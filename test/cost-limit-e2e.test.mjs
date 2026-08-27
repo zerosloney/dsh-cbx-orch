@@ -16,6 +16,23 @@ function git(workspace, ...args) {
   });
 }
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Windows 下 SQLite WAL/SHM 句柄释放与目录删除存在竞态（closeDatabaseConnections
+ *  返回后句柄可能仍被占用一瞬间，rm 撞 ENOTEMPTY 属环境性 flake）：清理失败带
+ *  短重试再抛，真失败仍会浮出。 */
+async function removeWorkspace(ws) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(ws, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt === 4) throw error;
+      await delay(300);
+    }
+  }
+}
+
 /** 建一个干净 Git 仓库 + 假执行器 + 配置成本上限。 */
 async function makeJob({ maxExecutorInvocations, preInvocations }) {
   const workspace = await mkdtemp(path.join(os.tmpdir(), "cbx-cost-e2e-"));
@@ -83,7 +100,7 @@ test("成本闸 e2e: 已达上限时 executeJob 转 needs_fix/cost_limit + human
     }
   } finally {
     await closeDatabaseConnections();
-    await rm(workspace, { recursive: true, force: true });
+    await removeWorkspace(workspace);
   }
 });
 
@@ -98,6 +115,6 @@ test("成本闸 e2e: 未达上限时任务正常完成", async () => {
     assert.equal(finalState.status, "done");
   } finally {
     await closeDatabaseConnections();
-    await rm(workspace, { recursive: true, force: true });
+    await removeWorkspace(workspace);
   }
 });

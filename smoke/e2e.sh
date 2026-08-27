@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # dsh-cbx-orch 端到端冒烟：把手工验证固化为可重复脚本。
-# 前置：无——profile 不存在时自动创建（CI 可直接跑）。
+# 前置：无——profile 不存在时自动创建（本机可直接跑）。
 # 环境变量：CBX_SMOKE_PORT（默认 3180）、CBX_SMOKE_SKIP_JOB=1（跳过任务生命周期
-# 一节，用于无执行器 CLI 的环境，如 CI runner 默认）、CBX_SMOKE_MOCK=1（用内置 mock
+# 一节，用于无执行器 CLI 的环境）、CBX_SMOKE_MOCK=1（用内置 mock
 # 编码 CLI 跑全生命周期——无真实执行器也能验证 create→run→test→done/cancel）。
 # 用法：npm run smoke:e2e   （或 bash smoke/e2e.sh）
-set -u
+set -uo pipefail
+
+# npm ≥11.7 EALLOWSCRIPTS：npm script 链会把 allow-scripts 配置透传为
+# npm_config_allow_scripts 环境变量，嵌套的项目内 npm install 会直接报错。
+# 显式清空该变量再装。
+npm_install() { env -u npm_config_allow_scripts npm install --no-audit --no-fund "$@"; }
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SMOKE_WS="$PLUGIN_DIR/.smoke-ws"
@@ -38,7 +43,7 @@ check() { # name condition...
 ensure_built() {
   [ -e "$1/lib/index.js" ] && return 0
   echo "      $(basename "$1") 未构建，install+build"
-  (cd "$1" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1) \
+  (cd "$1" && npm_install >/dev/null 2>&1 && npm run build >/dev/null 2>&1) \
     && [ -e "$1/lib/index.js" ]
 }
 cleanup() {
@@ -51,7 +56,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "== 1. 前置检查（profile 不存在则自动创建，CI 可直接跑） =="
+echo "== 1. 前置检查（profile 不存在则自动创建，本机可直接跑） =="
 ensure_built "$PLUGIN_DIR" || { echo "FAIL  插件构建失败"; exit 1; }
 if [ ! -f "$PROFILE_DIR/package.json" ]; then
   mkdir -p "$PROFILE_DIR"
@@ -79,7 +84,7 @@ EOF
 EOF
   echo "已创建 profile $PROFILE_DIR"
 fi
-(cd "$PROFILE_DIR" && npm install --no-audit --no-fund 2>&1 | tail -1)
+(cd "$PROFILE_DIR" && npm_install 2>&1 | tail -1)
 check "profile 依赖就绪" test -e "$PROFILE_DIR/node_modules/dsh-cbx-orch"
 mkdir -p "$SMOKE_WS" || { echo "FAIL  无法创建冒烟工作区 $SMOKE_WS"; exit 1; }
 cd "$SMOKE_WS" || exit 2
@@ -212,7 +217,7 @@ cat > "$ALL3_PROFILE/package.json" <<EOF
 }
 EOF
 rm -rf "$ALL3_PROFILE/node_modules" "$ALL3_PROFILE/package-lock.json"
-(cd "$ALL3_PROFILE" && npm install --no-audit --no-fund 2>&1 | tail -2)
+(cd "$ALL3_PROFILE" && npm_install 2>&1 | tail -2)
 if [ ! -e "$ALL3_PROFILE/node_modules/dsh-cbx-orch" ]; then
   echo "FAIL  合体 profile 依赖安装失败"; FAIL=$((FAIL+1))
 else

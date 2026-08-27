@@ -90,12 +90,12 @@ function changedPaths(before = {}, after) {
 }
 
 function isCodePath(path) {
-  return /^(src|test|ui|\.github\/workflows)\//.test(path) || ["package.json", "package-lock.json", "tsconfig.json", "cordis.patch.yml"].includes(path);
+  return /^(src|test|ui|scripts|\.github\/workflows)\//.test(path) || ["package.json", "package-lock.json", "tsconfig.json", "cordis.patch.yml"].includes(path);
 }
 
 function isCriticalPath(path) {
   return path === "package.json" || path === "package-lock.json" || path === "cordis.patch.yml" ||
-    path.startsWith(".github/workflows/") ||
+    path.startsWith("scripts/") || path.startsWith(".github/workflows/") ||
     /^src\/(approval|execution|executor|git-ops|human-gate|process-runner|subprocess-adapter|tools|validation|web|workspace-policy|worktree)/.test(path);
 }
 

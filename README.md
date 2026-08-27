@@ -29,7 +29,7 @@
 
 ## 安装
 
-插件已发布到 npm registry（`dsh-cbx-orch`，随 `v*` tag 由 CI 自动发布）。在 DeepSeek Harness 中通过 npm 包路径安装——`dsh plugin add` 会安装依赖并自动把包名追加到 profile 的 `dsh.profile.bundles`：
+插件已发布到 npm registry（`dsh-cbx-orch`，本机发布，见「发布（本机发布）」节）。在 DeepSeek Harness 中通过 npm 包路径安装——`dsh plugin add` 会安装依赖并自动把包名追加到 profile 的 `dsh.profile.bundles`：
 
 ```sh
 dsh plugin add --profile web dsh-cbx-orch     # web profile（含 web 插件层）
@@ -59,6 +59,26 @@ dsh --profile web
 ```
 
 启动后访问 `http://127.0.0.1:3080/cbx/` 查看仪表盘。
+
+## 发布（本机发布）
+
+发布流程已从 GitHub Actions（`.github/workflows/publish.yml`，`v*` tag 触发、`NPM_TOKEN` secret 注入）迁移到**本机执行**——发布 workflow 已删除（CI `ci.yml` 保留，继续在 GitHub 上跑测试与冒烟），由发布者在开发者机器上运行 `npm run release` 完成检查与发布：
+
+```sh
+npm run release            # 以当前 package.json 版本发布（不升版）
+npm run release -- minor   # 先升 minor 版本再发布（patch / minor / major 同理）
+```
+
+`npm run release`（`scripts/release.sh`）在本机依次执行：
+
+1. **前置检查**：Node ≥ 22（`engines`）；`npm whoami` 已登录——registry 以本机 `npm config` 为准，可用 `.npmrc` 指向私有源/verdaccio；工作区有未提交改动时提醒。
+2. **升版（可选）**：传 `patch/minor/major` 时先 `npm version` 升版并打 `v*` tag，同步提交 `package.json`/`package-lock.json`；`preversion` 钩子自动跑 lint + 单测。
+3. **检查**：`npm run check`（lint + 构建 + 单测）。
+4. **发布物冒烟**：`smoke/pack.sh`——`npm pack` → tarball 完整性与安装、`better-sqlite3` native binding 真实加载，验证的就是即将发布的分发路径。依赖兄弟仓库并列布局 `../dsh-ralph-loop`、`../dsh-state-graph`（缺失时该节跳过并提醒，可事后单独 `npm run smoke:pack` 补验）。
+5. **发布**：`npm publish`——`prepublishOnly` 钩子自动再跑一遍 `npm run check`，裸 `npm publish` 同样被守卫。
+6. **收尾**：本地标签已就位，提示可选的 `git push origin HEAD --tags` 同步。
+
+> 发布 registry 默认取本机 `npm config`（`registry`）；默认源是镜像/私有源时，发布到 npmjs 用 `NPM_PUBLISH_REGISTRY=https://registry.npmjs.org npm run release` 覆盖。原 CI 流程的 `NPM_TOKEN` secret 不再需要——发布认证完全走本机 `npm` 登录态。
 
 ## 工具（`ctx.tools`）
 
@@ -256,7 +276,7 @@ npm run smoke:e2e    # 端到端冒烟：起 dsh profile → 静态面/鉴权/SS
 CBX_SMOKE_MOCK=1 bash smoke/e2e.sh
 ```
 
-`smoke/mock-executor/codebuddy.mjs` 是一个 npm-发布之外的冒烟假执行器，经 `CBX_CODEBUDDY` 注入 `findExecutable`，不依赖 PATH。CI 的 `e2e-mock` job 即用它跑通任务生命周期断言。
+`smoke/mock-executor/codebuddy.mjs` 是一个 npm-发布之外的冒烟假执行器，经 `CBX_CODEBUDDY` 注入 `findExecutable`，不依赖 PATH。CI 的 `e2e-mock` job 与本机冒烟 `CBX_SMOKE_MOCK=1 bash smoke/e2e.sh` 都用它跑通任务生命周期断言。
 
 ## 许可
 

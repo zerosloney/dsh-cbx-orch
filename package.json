@@ -36,8 +36,12 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "npm run build && node --test",
-    "smoke:e2e": "bash smoke/e2e.sh",
-    "smoke:pack": "bash smoke/pack.sh"
+    "check": "npm run lint && npm test",
+    "prepublishOnly": "npm run check",
+    "preversion": "npm run check",
+    "release": "node scripts/bash.mjs scripts/release.sh",
+    "smoke:e2e": "node scripts/bash.mjs smoke/e2e.sh",
+    "smoke:pack": "node scripts/bash.mjs smoke/pack.sh"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1-rc.1",

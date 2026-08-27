@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Docs / 工程化
+
+- **发布流程迁移：删除 GitHub 发布 workflow，改为本机发布**：`.github/workflows/publish.yml`（`v*` tag 自动发布）已删除，不再有 `v*` tag 触发与 `NPM_TOKEN` 注入；`.github/workflows/ci.yml`（push/PR 的测试 + e2e + pack 冒烟）**保留**继续在 GitHub 上跑。新增 `scripts/release.sh`（`npm run release [-- patch|minor|major]`）在本机完成 前置检查（Node ≥ 22 / npm 登录态）→ 升版打 tag → lint/构建/单测 → 发布物冒烟 → `npm publish`；`prepublishOnly`/`preversion` 钩子守卫裸 `npm publish` 与 `npm version`；新增跨平台 bash 解析器 `scripts/bash.mjs`（Windows 未把 Git 的 bash 加入 PATH 也能直接跑 `release`/`smoke:*`）。
+- **`smoke/pack.sh` tarball 名动态解析**：改为从 `npm pack --json` 读取实际产物文件名（原硬编码 `-0.1.0.tgz`，版本升到 0.2+ 后即失效）。
+- **冒烟脚本适配 npm ≥11.7 EALLOWSCRIPTS**：`npm run` 链会把 `allow-scripts` 配置透传为 `npm_config_allow_scripts` 环境变量，嵌套的项目内 `npm install`（profile/sibling 仓库）会直接报错——`pack.sh`/`e2e.sh`/`e2e.ps1` 显式清空该变量再装（`npm_install` 包装）；同时补 `set -o pipefail`（`npm install | tail` 掩盖失败导致「tarball 安装」误报 PASS 的隐患）。
+- **引用同步**：README「安装」节的发布说明改为「本机发布」并新增「发布（本机发布）」节；`.codex` 钩子的 `isCodePath`/`isCriticalPath`/扫描范围新增 `scripts/`（`.github/workflows` 保留，ci.yml 仍在校验范围）；冒烟脚本措辞统一（本机/CI 均可直接跑）。
+
 ## 0.4.4 (2026-08-24)
 
 ### Fixed & Improved
@@ -44,7 +53,6 @@ Web 仪表盘 UI 全面现代化重构与体验美化（对齐 DeepSeek Harness 
   - Diff、Test、Review、agent.log 代码与日志区域新增标题工具条与 **📋 一键复制（Copy to Clipboard）** 功能。
   - 实时事件流控制台重构为 macOS/VS Code 风格终端窗口（红黄绿三色圆点装饰、状态流向徽标）。
   - 键盘无障碍与快捷键支持：按 `/` 键快速聚焦新建任务输入框，按 `Esc` 键关闭任务详情面板。
-
 ## 0.4.0 (2026-08-24)
 
 本会话的加固与集成轮：全面代码审查（6 子代理深读 + 逐条验证）后的修复、ctx.settings 集成、安全策略指纹。

@@ -97,7 +97,14 @@ try {
     Write-Host "      已创建 profile $ProfileDir"
   }
   Push-Location $ProfileDir
-  try { npm install --no-audit --no-fund 2>&1 | Out-Null } finally { Pop-Location }
+  # npm ≥11.7 EALLOWSCRIPTS：npm script 链透传的 npm_config_allow_scripts 会让嵌套 install 报错，先清空
+  $prevAllowScripts = $env:npm_config_allow_scripts
+  try {
+    $env:npm_config_allow_scripts = $null
+    try { npm install --no-audit --no-fund 2>&1 | Out-Null } finally { Pop-Location }
+  } finally {
+    $env:npm_config_allow_scripts = $prevAllowScripts
+  }
   Check "profile 依赖就绪" { Test-Path (Join-Path $ProfileDir "node_modules\dsh-cbx-orch") }
 
   # 冒烟工作区：干净 git 仓库

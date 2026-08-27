@@ -2,8 +2,13 @@
 # 发布物冒烟：npm pack 产物完整性 + 从 tarball 安装并真实加载。
 # 与 e2e.sh 的区别：依赖全部来自 npm registry（真实分发路径），插件本体来自
 # pack 产物而非目录符号链接——验证 files 清单、lib 产物、native 依赖在消费者
-# 环境可用。用法：bash smoke/pack.sh
-set -u
+# 环境可用。用法：bash smoke/pack.sh（或 npm run smoke:pack）
+set -uo pipefail
+
+# npm ≥11.7 EALLOWSCRIPTS：npm script 链会把 allow-scripts 配置透传为
+# npm_config_allow_scripts 环境变量，嵌套的项目内 npm install 会直接报错。
+# 显式清空该变量再装（门控仍生效：装完检测 binding，缺失走 approve+rebuild 兜底）。
+npm_install() { env -u npm_config_allow_scripts npm install --no-audit --no-fund "$@"; }
 
 CBX="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(dirname "$CBX")"
@@ -31,21 +36,26 @@ trap cleanup EXIT
 echo "== 1. 构建并打包 =="
 for p in "$CBX" "$RALPH" "$GRAPH"; do
   if [ ! -d "$p" ]; then
-    echo "FAIL  依赖兄弟仓库缺失：$p（CI 需三仓库并列 checkout，见 ci.yml）"
+    echo "FAIL  依赖兄弟仓库缺失：$p（三仓库并列布局，见 README「发布（本机发布）」节）"
     exit 1
   fi
   # 新 checkout 无 lib/（gitignored）：先 install+build 再 pack
   if [ ! -e "$p/lib/index.js" ]; then
     echo "      $(basename "$p") 未构建，install+build"
-    (cd "$p" && npm install --no-audit --no-fund >/dev/null 2>&1 && npm run build >/dev/null 2>&1) \
+    (cd "$p" && npm_install >/dev/null 2>&1 && npm run build >/dev/null 2>&1) \
       || { echo "FAIL  $(basename "$p") 构建失败（$p）"; exit 1; }
   fi
-  (cd "$p" && npm pack --pack-destination "$WORK" >/dev/null 2>&1) \
+  # tarball 名从 npm pack --json 动态解析（曾硬编码 0.1.0，版本升到 0.2+ 后失效）
+  TGZ="$(cd "$p" && npm pack --pack-destination "$WORK" --json 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const a=JSON.parse(d);process.stdout.write(a&&a[0]&&a[0].filename?a[0].filename:'')}catch{process.exit(1)}})")" \
     || { echo "FAIL  $(basename "$p") 打包失败（$p）"; exit 1; }
+  [ -n "$TGZ" ] || { echo "FAIL  $(basename "$p") 打包无产物（$p）"; exit 1; }
+  case "$p" in
+    "$CBX")   CBX_TGZ="$WORK/$TGZ" ;;
+    "$RALPH") RALPH_TGZ="$WORK/$TGZ" ;;
+    "$GRAPH") GRAPH_TGZ="$WORK/$TGZ" ;;
+  esac
+  echo "      $(basename "$p") → $TGZ"
 done
-CBX_TGZ="$WORK/dsh-cbx-orch-0.1.0.tgz"
-RALPH_TGZ="$WORK/dsh-ralph-loop-0.1.0.tgz"
-GRAPH_TGZ="$WORK/dsh-state-graph-0.1.0.tgz"
 check "三个 tarball 生成" test -f "$CBX_TGZ" -a -f "$RALPH_TGZ" -a -f "$GRAPH_TGZ"
 
 echo "== 2. tarball 内容完整性 =="
@@ -89,7 +99,7 @@ cat > "$PROFILE_DIR/cordis.patch.yml" <<EOF
         - '$WS_WIN'
 EOF
 rm -rf "$PROFILE_DIR/node_modules" "$PROFILE_DIR/package-lock.json"
-if (cd "$PROFILE_DIR" && npm install --no-audit --no-fund 2>&1 | tail -2); then
+if (cd "$PROFILE_DIR" && npm_install 2>&1 | tail -2); then
   PASS=$((PASS+1)); echo "PASS  tarball 安装"
 else
   FAIL=$((FAIL+1)); echo "FAIL  tarball 安装"
@@ -102,8 +112,8 @@ if [ -d "$PROFILE_DIR/node_modules/better-sqlite3" ] \
   && [ ! -e "$PROFILE_DIR/node_modules/better-sqlite3/build/Release/better_sqlite3.node" ]; then
   echo "      better-sqlite3 构建被门控跳过，执行 approve+rebuild 兜底"
   (cd "$PROFILE_DIR" \
-    && { npm install-scripts approve better-sqlite3 >/dev/null 2>&1 || true; } \
-    && npm rebuild better-sqlite3 2>&1 | tail -1)
+    && { env -u npm_config_allow_scripts npm install-scripts approve better-sqlite3 >/dev/null 2>&1 || true; } \
+    && env -u npm_config_allow_scripts npm rebuild better-sqlite3 2>&1 | tail -1)
 fi
 check "better-sqlite3 native binding 存在" test -e "$PROFILE_DIR/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
 

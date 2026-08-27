@@ -12,7 +12,7 @@ const secretPattern = /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----|\b(?:AKIA|ASIA)[
 for (const entry of status.stdout.split("\0")) {
   if (!/^[ MADRCU?!]{2} /.test(entry)) continue;
   const path = entry.slice(3);
-  if (!/^(src|test|ui|\.github)\//.test(path)) continue;
+  if (!/^(src|test|ui|scripts|\.github)\//.test(path)) continue;
   try {
     if (secretPattern.test(readFileSync(path, "utf8"))) fail(`Potential credential detected in ${path}`);
   } catch (error) {

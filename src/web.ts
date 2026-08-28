@@ -6,7 +6,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { WebServer } from "@deepseek-ai/dsh-host-webserver";
 import {
   buildTimeline,
-  isAuthorized,
   parseCursors,
   readExecutorStatus,
   replayEvents,
@@ -45,12 +44,10 @@ import {
 } from "./idempotency.js";
 import { loadHealth } from "./executor-health.js";
 import {
-  AuthRateLimiter,
   HttpError,
   parseNumberField,
   readJsonBody,
 } from "./http-util.js";
-import { constantTimeEqual } from "./storage.js";
 import { WorkspacePolicy } from "./workspace-policy.js";
 
 /** Mount point for the cbx dashboard on the harness web server. */
@@ -119,7 +116,6 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
   webServer?: Context["webServer"];
   workspacePolicy?: WorkspacePolicy;
   workspaces?: readonly string[];
-  token?: string;
   isDisposed?: () => boolean;
 }): Promise<void> {
   const workspacePolicy = options.workspacePolicy
@@ -128,9 +124,7 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
   // and deduplication before any tailer or route is started.
   const workspaces = [...await workspacePolicy.listAllowedWorkspaces()];
   if (options.isDisposed?.()) return;
-  const token = options.token;
   const clients = new Set<SseClient>();
-  const authLimiter = new AuthRateLimiter();
 
   const broadcast = (wsIndex: number, event: Record<string, unknown>): void => {
     const seq = typeof event.seq === "number" ? event.seq : undefined;
@@ -245,49 +239,6 @@ export async function registerCbxWebRoutes(ctx: Context, options: {
       const pathname = url.pathname.startsWith(`${CBX_MOUNT}/`)
         ? url.pathname.slice(CBX_MOUNT.length)
         : url.pathname;
-
-      // Public shell + healthz + auth exchange stay open; data endpoints require the token.
-      const publicPath = pathname === "/" || pathname === "/healthz" || pathname === "/auth"
-        || pathname === "/style.css" || pathname === "/app.js";
-      if (!publicPath && !isAuthorized(req, token)) {
-        res.writeHead(401, {
-          "www-authenticate": "Bearer",
-          "content-type": "application/json; charset=utf-8",
-        });
-        res.end(JSON.stringify({ error: "unauthorized" }));
-        return;
-      }
-
-      if (pathname === "/auth" && req.method === "POST") {
-        // 登录交换：凭证只在此端点提交，验证通过才下发 HttpOnly cookie。
-        // 首页不再对任意访客回发 token（旧实现等于把 token 公开）。
-        const ip = req.socket.remoteAddress ?? "unknown";
-        if (!authLimiter.allow(ip)) {
-          json(res, { error: "尝试过于频繁，请稍后再试。" }, 429);
-          return;
-        }
-        if (!token) {
-          json(res, { error: "未配置 token，无需登录。" }, 400);
-          return;
-        }
-        const body = await readJsonBody(req);
-        const provided = typeof body.token === "string" ? body.token : "";
-        if (!provided || !constantTimeEqual(provided, token)) {
-          json(res, { error: "token 无效。" }, 401);
-          return;
-        }
-        // 登录成功清零该 IP 的限速计数：正常用户反复登录不消耗暴力猜测配额。
-        authLimiter.success(ip);
-        // HTTPS（直连加密或反代 x-forwarded-proto）下追加 Secure：明文 http 上加
-        // Secure 会导致 cookie 被浏览器拒收（loopback 部署是主要形态）。
-        const secureCookie =
-          (req.socket as { encrypted?: boolean }).encrypted === true ||
-          req.headers["x-forwarded-proto"] === "https";
-        res.setHeader("set-cookie",
-          `cbx_token=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=${CBX_MOUNT}; Max-Age=604800${secureCookie ? "; Secure" : ""}`);
-        json(res, { ok: true });
-        return;
-      }
       if (pathname === "/") {
         const uiDir = resolveUiDir();
         const html = await readFile(path.join(uiDir, "index.html"), "utf8");

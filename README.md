@@ -94,11 +94,10 @@ npm run release -- minor   # 先升 minor 版本再发布（patch / minor / majo
 | `cbx_cancel` | 取消任务并终止执行器进程树 |
 | `cbx_retry` | 重试失败任务 |
 | `cbx_approve` | 批准等待审批的任务 |
-| `cbx_result` / `cbx_artifact` / `cbx_artifacts` / `cbx_logs` | 读 result.json / 任意产物 / 产物列表 / agent.log 增量 |
+| `cbx_artifact` / `cbx_artifacts` / `cbx_logs` | 读任意产物（含 `result.json`：改动文件/handback/stages/测试摘要/基线/人工门）/ 产物列表 / agent.log 增量 |
 | `cbx_watch` | 轮询任务到终态，并**累计返回执行器处理消息（agent.log 尾部）与状态迁移**——让当前会话看到委派代理做了什么，而不只是最终结果 |
 | `cbx_health` | 队列深度、状态计数、失败/重试、死信（不含任务正文）、**全局治理快照**（`global` 块：并发上限/活跃数/调用预算/已用）。**默认只读**；`prune: true` 时才应用保留期清理 |
 | `cbx_clean` | forget/purge 任务（含 worktree 清理） |
-| `cbx_list_workspaces` | 列出已授权的工作区（不扫描任意 root 或子目录） |
 | `cbx_review_gate` | 对未提交改动跑独立审查 |
 
 > **执行器路由（能力感知 + 多因子决策）**：`cbx_run` / `/cbx-run` / Web 创建接口在创建任务前先探测本机已安装的编码 agent CLI（codebuddy/opencode/omp/cline/qwen），然后**按需求过滤 + 策略打分**选出最合适的一个。内置执行器声明 `capabilities`（autoApprove / planMode / sandbox / headless / maxTurnsSupport / streaming）与成本/速度档位（costTier / speedTier）：
@@ -120,9 +119,9 @@ npm run release -- minor   # 先升 minor 版本再发布（patch / minor / majo
 >
 > **委派处理消息流入当前会话**：执行器（外部编码 CLI）的处理过程——工具调用/推理/文件编辑的原始转录（agent.log）与状态迁移——现在会进入当前会话视图：① `cbx_watch` 轮询期间累计状态迁移 + agent.log 尾部，终态时连同最终状态一起返回（`include_log` / `max_log_chars` 可调，`since` 支持续读）；② 会话后台任务的完成通知（jobs-bridge 投递）自带 agent.log 尾部摘要（"处理消息（agent.log）"，截断到 8K 内，完整内容仍在磁盘），因此委派结束当前会话直接看到委派代理做了什么；③ `job_output` 运行期即可增量读到 agent.log 尾部。
 >
-> **统一的会话消息（`src/session-message.ts`）**：`cbx_run` / `cbx_continue` / `cbx_status` / `cbx_watch` 与会话后台任务桥的终态摘要，全部收敛到同一套富化消息，讲话一致、可行动：**状态 + 阶段人话说明**（如 `needs_fix（等待补充说明）`、`awaiting_approval（执行前等待审批）`）+ **执行器/路由决策** + **任务清单** + **产物目录指针（job dir）** + **处理消息（agent.log）**。每条消息按状态给出**下一步行动**（`下一步: 批准 cbx_approve <id>` / `按失败原因修复续跑 cbx_continue <id> <指令>` / `跟踪进度 cbx_watch <id>` / 完成时 `读结果 cbx_result <id>`），让当前会话（代理）一眼知道自己该调哪个工具。状态迁移行统一为 `[status / phase (attempt N) · executor]`（桥的实时进度带上执行器名）。
+> **统一的会话消息（`src/session-message.ts`）**：`cbx_run` / `cbx_continue` / `cbx_status` / `cbx_watch` 与会话后台任务桥的终态摘要，全部收敛到同一套富化消息，讲话一致、可行动：**状态 + 阶段人话说明**（如 `needs_fix（等待补充说明）`、`awaiting_approval（执行前等待审批）`）+ **执行器/路由决策** + **任务清单** + **产物目录指针（job dir）** + **处理消息（agent.log）**。每条消息按状态给出**下一步行动**（`下一步: 批准 cbx_approve <id>` / `按失败原因修复续跑 cbx_continue <id> <指令>` / `跟踪进度 cbx_watch <id>` / 完成时 `读结果（result.json）cbx_artifact <id>`），让当前会话（代理）一眼知道自己该调哪个工具。状态迁移行统一为 `[status / phase (attempt N) · executor]`（桥的实时进度带上执行器名）。
 >
-> **输出上限**：`cbx_result` / `cbx_artifact` 的文本输出截断到 64K 字符（保头尾并标注总长）；`cbx_status` / `cbx_cancel` / `cbx_approve` 等返回 state 的工具对超长字符串字段做深截断（8K）。完整内容仍在磁盘工件里，需要时用 `cbx_logs` 增量读取。
+> **输出上限**：`cbx_artifact`（含读 `result.json`）的文本输出截断到 64K 字符（保头尾并标注总长）；`cbx_status` / `cbx_cancel` / `cbx_approve` 等返回 state 的工具对超长字符串字段做深截断（8K）。完整内容仍在磁盘工件里，需要时用 `cbx_logs` 增量读取。
 
 ## 斜杠命令（`ctx.commands`）
 
@@ -141,7 +140,7 @@ npm run release -- minor   # 先升 minor 版本再发布（patch / minor / majo
 - `GET /cbx/api/jobs/<id>[/artifacts|/artifact/<name>|/timeline|/executor|/agent.log]`
 - `POST /cbx/api/jobs`（创建）、`/cbx/api/jobs/<id>/approve|cancel|retry|continue|forget|purge`、`/cbx/api/queue/pause|resume`
 
-数据端点鉴权用 `Authorization: Bearer <token>` 或 HttpOnly cookie `cbx_token`（HTTPS 下自动追加 `Secure`；**不接受 URL query token**——会泄漏进浏览器历史与代理日志）。首页、静态资源 `/cbx/style.css` 与 `/cbx/app.js`、`/cbx/healthz` 以及登录端点 `POST /cbx/auth`（body `{"token": "..."}`，验证通过才下发 cookie，每 IP 每分钟限 10 次、成功登录即清零计数）开放；其余数据端点（包括 `/cbx/api/metrics`）需要鉴权。`/cbx/healthz` 与 `/cbx/api/metrics` 均为只读（不触发保留期清理）。
+所有端点开放访问（信任 harness webServer 的同源边界，与 harness GUI 同端口）。如需把 webServer 暴露到非 loopback，应在反向代理或 webServer 层配置鉴权，cbx 不再提供独立 token 机制。
 
 ## 配置
 
@@ -167,8 +166,8 @@ npm run release -- minor   # 先升 minor 版本再发布（patch / minor / majo
       name: 'dsh-cbx-orch/web'
       config:
         web:
-          token: ''           # 非空 = 使用配置值；空/缺省 = 读取或生成 <首个工作区>/.cbx/web.token（生成时 0600），无免鉴权模式
-          workspaces: []      # ?workspace= 白名单；空 = 跟随 harness 工作区注册表（会话目录），注册表不可用/为空时回落进程 cwd
+
+          workspaces: []      # @deprecated 已废弃：仪表盘始终跟随 harness 注册表，不再读取独立 allowlist。保留仅为向后兼容旧 profile。
 ```
 
 > **`executors.envAllowlist`（可选硬化，支持工作区级覆盖）**：默认情况下，执行器/测试/审查子进程**完整继承宿主进程的 `process.env`**——这是 cbx 的有意设计：编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境里的 API 凭据才能工作，过滤会破坏认证。代价是"受损/不可信执行器能读取宿主全部凭据"。若你的执行器来源可受控但你想收窄暴露面，可设置白名单——此时只把这些变量加上 `PATH/HOME/TEMP` 等不可缺系统变量传给子进程，其余一律剔除。空/缺省即恢复完整继承，完全向后兼容。
@@ -180,11 +179,11 @@ npm run release -- minor   # 先升 minor 版本再发布（patch / minor / majo
 >
 > 工作区一旦显式配置即覆盖全局（工作区配置 `envAllowlist: []` 表示"显式只继承系统变量"，同样覆盖全局）；工作区未配置才回落到全局。工作区级配置经任务工作区解析；非任务调用按 `cwd` 向上定位最近含 `.cbx/` 的工作区，**隔离 worktree** 内还会按 `.cbx-worktrees` 布局反解到主工作区（`.<repo>.cbx-worktrees/<jobId>` → 主工作区）。对执行器/测试/审查/Git 全部子进程生效，文件修改最多 5s 后生效（短缓存）。
 
-core 的 `workspaces` 是 `cbx_*` 工具的工作区白名单：**空或缺省 = 默认工作区跟随目录委派**——无显式 `workspace` 参数时，以当前 agent 会话的工作目录（`session.header.cwd`，即目录委派时设定的目录）为默认工作区，回落 harness 进程 cwd；显式列表只授权其中精确的 workspace。路径通过 `realpath` canonicalize（Windows 下折叠路径大小写），越权、缺失路径或非目录都会拒绝。`cbx_list_workspaces` 只列出该白名单中的 workspace，不再扫描任意 root 或子目录。
+core 的 `workspaces` 是 `cbx_*` 工具的工作区白名单：**空或缺省 = 默认工作区跟随目录委派**——无显式 `workspace` 参数时，以当前 agent 会话的工作目录（`session.header.cwd`，即目录委派时设定的目录）为默认工作区，回落 harness 进程 cwd；显式列表只授权其中精确的 workspace。路径通过 `realpath` canonicalize（Windows 下折叠路径大小写），越权、缺失路径或非目录都会拒绝。
 
-Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlist，但使用相同的 `WorkspacePolicy` 语义（canonicalization、越权/不存在/非目录拒绝）。core 的 `workspaces` 与 Web 的 `web.workspaces` 是两个独立配置，不会自动共享配置值。
+Web 的 `web.workspaces` 已废弃（不再读取）；Web 的 `?workspace=` 选择直接跟随 harness 工作区注册表，与 core 的 `workspaces` 白名单脱钩。core 工具的工作区边界仍由 core 的 `workspaces` 控制，Web 仅展示注册表中用户实际打开的工作区。
 
-**Web 空配置的默认工作区来源（v0.1 起）**：`web.workspaces` 为空/缺省时，Web 层不再盲回落 `process.cwd()`，而是跟随 **harness 工作区注册表**（`ctx.workspaceRegistry`，即用户在 harness GUI 中实际打开过的目录；DMS 会话目录 `sessions/--<path>--` 由 harness 维护）。这保证了「在某个工作区会话里跑 `/cbx-run` 创建的任务，能在同一目录的仪表盘上看到」——Web 层本身没有会话上下文，注册表是 harness 侧对「用户工作区」的权威来源。注册表不可用或为空时（例如无 harness workspace 服务的瘦身 profile）回落进程 cwd，保持旧行为。
+**Web 工作区来源（始终跟随 harness 注册表）**：`web.workspaces` 已废弃（不再读取）；Web 层始终跟随 **harness 工作区注册表**（`ctx.workspaceRegistry`，即用户在 harness GUI 中实际打开过的目录；DMS 会话目录 `sessions/--<path>--` 由 harness 维护）。这保证了「在某个工作区会话里跑 `/cbx-run` 创建的任务，能在同一目录的仪表盘上看到」——Web 层本身没有会话上下文，注册表是 harness 侧对「用户工作区」的权威来源。注册表不可用或为空时（例如无 harness workspace 服务的瘦身 profile）回落进程 cwd，保持旧行为。
 
 ### ctx.settings 集成（可选，harness 设置界面统一管理插件默认）
 
@@ -193,8 +192,7 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 优先级：**工具参数 > 工作区 `.cbx.json` > settings > 插件 config（profile 配置）**。settings 是「插件默认」的运行时替代层，工作区级 `.cbx.json` 仍更具体、优先。
 
 范围刻意最小：
-- **不覆盖 `workspaces`**（安全白名单保持 profile 配置，不暴露给运行时设置面）；
-- **不覆盖 web token**（工作区级，见 `.cbx/web.token`）。
+- **不覆盖 `workspaces`**（安全白名单保持 profile 配置，不暴露给运行时设置面）。
 
 实现：动态 import `@deepseek-ai/dsh-settings`（optional peerDependency）——宿主未装 settings 服务时静默跳过，插件按纯 profile 配置运行，零行为变化。
 
@@ -240,19 +238,19 @@ Web 的 `web.workspaces` 继续作为 Web `?workspace=` 选择的独立 allowlis
 
 **事件一致性说明**：事件同时写 `events.ndjson`（展示/轮转镜像）与 SQLite `events` 表（**审计权威**）。SQLite 镜像写入失败时不让事件发布失败、也不重试——它会与 ndjson 暂时漂移，属主动降级。镜像失败累计计数经 `/cbx/api/metrics`（`healthz` 只读指标）的 `eventMirrorFailures` 暴露（进程内存态，重启归零），>0 时说明 SSE 回放可能与此 job 的 ndjson 不一致，值得排查。
 
-**审计权威与防篡改**：job 级事件（`logJobEvent` / 执行器调用事件）同时镜像进 SQLite `events` 表（带 `job_id` 列，schema v6）。**执行器（不可信子进程）只有文件系统权限、没有 SQLite 连接，无法写入 events 表**——因此 SQLite 是执行器无法篡改的审计权威；`events.ndjson` 降级为展示/轮转镜像，可被执行器改写。读取面（timeline / 崩溃根因 / 事件增量 / executor 命令展示）**优先读 SQLite**，镜像缺失时回退 ndjson。审计完整性的**展示面**：`cbx_status` 附 `__audit` 验证结果、`cbx_result`/`result.json` 附 `auditIntegrity`、`cbx_list` 与 Web 仪表盘展示 Audit 列（`篡改!` / `✓` / `—`）与详情面板审计状态、`cbx_health` 聚合 `audit.checked/tampered` 计数。验证口径：ndjson 必须是 SQLite 镜像的**连续尾部子序列**（每行逐字段一致，含 payload 内容）——头部缺失（轮转/保留期清理）不误报，改写任意行或删除中间行即判定篡改；ndjson 行数多于镜像（伪造追加）同样判定篡改。SQLite 侧按 COUNT 锚点 + 从尾部 5000 行一页分块回放比对（`src/storage/events.ts`）——事件再多（>5 万条）也能完整验证，不存在截断放弃。已知边界：旧任务（无 SQLite 镜像）无法验证；对抗性执行器若能同时掌握镜像内容（如读 jobDir 的 events.ndjson 但改不了 SQLite）只能伪造 ndjson 造成漂移被检测，无法污染权威。
+**审计权威与防篡改**：job 级事件（`logJobEvent` / 执行器调用事件）同时镜像进 SQLite `events` 表（带 `job_id` 列，schema v6）。**执行器（不可信子进程）只有文件系统权限、没有 SQLite 连接，无法写入 events 表**——因此 SQLite 是执行器无法篡改的审计权威；`events.ndjson` 降级为展示/轮转镜像，可被执行器改写。读取面（timeline / 崩溃根因 / 事件增量 / executor 命令展示）**优先读 SQLite**，镜像缺失时回退 ndjson。审计完整性的**展示面**：`cbx_status` 附 `__audit` 验证结果、`cbx_artifact`（读 `result.json`）附 `auditIntegrity`、`cbx_list` 与 Web 仪表盘展示 Audit 列（`篡改!` / `✓` / `—`）与详情面板审计状态、`cbx_health` 聚合 `audit.checked/tampered` 计数。验证口径：ndjson 必须是 SQLite 镜像的**连续尾部子序列**（每行逐字段一致，含 payload 内容）——头部缺失（轮转/保留期清理）不误报，改写任意行或删除中间行即判定篡改；ndjson 行数多于镜像（伪造追加）同样判定篡改。SQLite 侧按 COUNT 锚点 + 从尾部 5000 行一页分块回放比对（`src/storage/events.ts`）——事件再多（>5 万条）也能完整验证，不存在截断放弃。已知边界：旧任务（无 SQLite 镜像）无法验证；对抗性执行器若能同时掌握镜像内容（如读 jobDir 的 events.ndjson 但改不了 SQLite）只能伪造 ndjson 造成漂移被检测，无法污染权威。
 
 > **schema 升级注意**：state.sqlite schema 版本已到 **v6**（`jobs.updated_at` 索引 v5 + `events.job_id` v6）。升级自动迁移且幂等；**降级回旧版本会被拒绝运行**（"schema 版本高于当前 cbx"）。升级后旧任务（v6 前创建）无 SQLite 事件镜像，审计验证显示"无法验证"（`cbx_health` 不计入 `audit.checked`），新任务全量镜像。
 
 ## 安全说明
 
 - **环境变量继承**：执行器/测试命令的子进程完整继承宿主的 `process.env`（与终端直接运行一致）。这是有意设计——编码 CLI（codebuddy/opencode/omp/cline/qwen）依赖环境中的 API 凭据才能工作，因此不做变量过滤。可选硬化：插件 config 的 `executors.envAllowlist` 可收窄（见「配置」节）；日志落盘边界仍统一脱敏。
-- **Web token 文件的执行器可见性（已知暴露面）**：`<工作区>/.cbx/web.token` 以 `0600` 落盘，**但对执行器子进程并不可靠**——非隔离执行器 cwd=workspace，宿主 env 完整继承，拿到 token 即可读写该工作区全部 REST 端点的 job 产物。token 永久有效、无自动轮换。若工作区会运行不受信执行器，建议：① 优先配合 `isolated: true`（执行器在 worktree 内，看不到主工作区 `.cbx/`）；② 防内鬼时给 Web 面配显式 `web.token` 并定期人工轮换；③ 不要把 token 当多用户隔离机制——它只防"无凭据的路人"，不防"能读工作区文件的进程"。
+- **Web 信任边界**：仪表盘信任 harness webServer 的同源边界（与 harness GUI 同端口），不再写任何工作区级 token 文件、不提供独立鉴权。把 webServer 暴露到非 loopback 时，应在反向代理或 webServer 层配置鉴权；仍建议不受信执行器用 `isolated: true`（在 worktree 内，看不到主工作区 `.cbx/`）。
 - **落盘脱敏**：`agent.log` / `test.log` / `events.ndjson` 在写入边界对常见凭据形状（OpenAI/GitHub/Slack/Google/AWS key、私钥、Bearer token）做正则脱敏（流式跨 chunk 边界保留 64 字节重叠 + 首 chunk 延迟写，防 key 被切断漏网；SQLite 审计镜像与 ndjson 共用同一份脱敏 payload，凭据不进入权威库）；事件流与遥测 span 中的长字段同时做长度截断，敏感键名（token/password/secret/…）整体替换；`plugin-request.json`（内嵌完整 prompt）在插件宿主读取后立即删除，不留持久副本。
 - **测试命令防线**：黑名单在匹配前先归一化（剥引号/反斜杠/`${var}`/`%var%`），拦截 `r\m`、`r""m` 一类拼接绕过；覆盖 `rm -rf`/`del /s`/`find -exec`/`git clean`/`truncate`/`dd`/`shred`/首 token `eval`/PowerShell 全部 `-EncodedCommand` 缩写；创建时与**执行时各验一次**（context.json 是执行器可写文件）。仍属软防线——非隔离任务请运行在受控环境，敏感场景建议 `isolated: true`。
 - **进程终止安全**：跨进程 kill 前按 pid 归属校验（见「行为语义」）；Windows 树杀始终走 `taskkill /T /F`（不用会漏掉孙进程的 `child.kill`）；abort 后设硬死线，杀不死的子进程不再让任务永久挂起。
 - **路径安全**：jobId 全链路校验（字符集白名单 + 拒绝 `..`/Windows 设备名/尾点段），目录删除与 context 写入共用同一道门；未跟踪符号链接不被跟随。
-- **Web 鉴权**：`web.token` 非空时直接使用配置值；为空或缺省时，插件先从首个生效工作区（显式列表 / harness 注册表派生的第一项，见「配置」节）的 `.cbx/web.token` 读取非空值，文件不存在或为空则生成随机 token，并以 `0600` 权限写入该文件，后续未配置显式 token 的启动会复用它。未配置显式 token 时启动日志只打印 token 文件路径，不打印 token 值；浏览器提示从该文件或日志路径取得 token。**token 无法解析时拒绝挂载 Web 路由（fail-closed）**，绝不退化成无鉴权面。浏览器端首次请求数据端点收到 401，页面弹出 token 输入框，经 `POST /cbx/auth` 换取 HttpOnly cookie（SameSite=Strict，HTTPS 下加 Secure；token 不出现在页面源码或 URL）。`/healthz` 与 `/api/metrics` 均为只读，但只有 `/healthz` 公开，`/api/metrics` 仍需鉴权（均不触发保留期清理）。仪表盘带 CSP；SSE 有连接数与背压上限。
+- **Web 鉴权**：cbx 仪表盘不再提供独立 token 机制，信任 harness webServer 的同源边界（与 harness GUI 同端口）。如需把 webServer 暴露到非 loopback，应在反向代理或 webServer 层配置鉴权。仪表盘带 CSP；SSE 有连接数与背压上限。
 - **review stop-gate**：审查执行异常/超时/非零退出/无法解析 VERDICT 时默认 **fail-closed 拦截**（门禁的意义就是拦住行为异常的审查代理）；基础设施错误（如配置读取失败）仍放行以维持 hook 契约。需要旧行为配置 `reviewGate.failOpen: true`。
 - **执行器插件**：`executor` 指向工作区内的插件路径时，**默认强制白名单**（fail-closed）——未配置 `plugins.enforce` 或配置为 `true` 时，必须提供 `allowPaths`/`allowSha256`（路径/哈希白名单）之一，插件才被加载；否则创建即报错并给出配置指引。需要旧行为（无白名单也放行）时显式配置 `plugins.enforce=false`（逃生门，会持续告警并在事件流留 `plugin_policy_warning` 审计记录）。
 

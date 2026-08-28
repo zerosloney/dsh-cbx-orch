@@ -243,7 +243,7 @@ test("/cbx-web 显式 workspace 命中白名单并尝试在系统浏览器打开
   const spawned = [];
   const harness = fakeHarness({
     // cbxWeb.mounted=true：模拟仪表盘路由已真实挂载（新语义下 webPluginActive
-    // 读 mounted 而非服务存在——服务存在但路由未挂载（token fail-closed/轮询中）
+    // 读 mounted 而非服务存在——服务存在但路由未挂载（轮询中）
     // 时 /cbx-web 应给"未挂载"提示而非误导为可访问）。
     services: { webServer: { port: 3456, host: "127.0.0.1" }, cbxWeb: { mounted: true } },
     subprocess: {
@@ -268,8 +268,8 @@ test("/cbx-web 显式 workspace 命中白名单并尝试在系统浏览器打开
     const canonicalAllowed = await realpath(allowed);
     const url = `http://127.0.0.1:3456/cbx/?workspace=${encodeURIComponent(canonicalAllowed)}`;
     assert.ok(result.text.includes(url), `回复应包含实际端口的完整 URL：\n${result.text}`);
-    // cbx 插件激活：给出 token 提示而不是 headless 提示
-    assert.match(result.text, /Web token/);
+    // cbx 插件激活：开放访问提示（无需登录）而非 headless 提示
+    assert.match(result.text, /无需登录/);
     assert.equal(result.text.includes("未加载 cbx-orch-web"), false);
     // 已尝试通过 subprocess 打开浏览器：argv 末尾即完整 URL
     assert.equal(spawned.length, 1);

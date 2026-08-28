@@ -53,44 +53,7 @@ test("显式越权 workspace 在 cbx_list 下游前被拒绝且不创建 .cbx", 
   }
 });
 
-test("显式越权 root 在 cbx_list_workspaces 下游前被拒绝且不扫描子目录", async () => {
-  const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-policy-"));
-  const deniedRoot = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-policy-"));
-  const hiddenWorkspace = path.join(deniedRoot, "hidden");
-  try {
-    await mkdir(hiddenWorkspace);
-    await mkdir(path.join(hiddenWorkspace, ".cbx"));
-    const tools = registeredTools(new WorkspacePolicy([allowed]));
-    await assert.rejects(
-      () => tools.get("cbx_list_workspaces").execute({ root: deniedRoot }),
-      (error) => isCbxError(error, "E_INVALID_WORKSPACE"),
-    );
-    assert.equal(existsSync(path.join(deniedRoot, ".cbx")), false);
-  } finally {
-    await Promise.all([
-      rm(allowed, { recursive: true, force: true }),
-      rm(deniedRoot, { recursive: true, force: true }),
-    ]);
-  }
-});
 
-test("允许 workspace 的 list_workspaces 只返回授权目标，不隐式发现子目录", async () => {
-  const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-policy-"));
-  const child = path.join(allowed, "child");
-  try {
-    await mkdir(child);
-    await mkdir(path.join(child, ".cbx"));
-    const policy = new WorkspacePolicy([allowed]);
-    const tools = registeredTools(policy);
-    const result = await tools.get("cbx_list_workspaces").execute({ root: allowed });
-    assert.deepEqual(result.workspaces, [await policy.resolveWorkspace(allowed)]);
-    assert.deepEqual(result.jobs, [{ workspace: result.workspaces[0], jobs: [] }]);
-    assert.equal(result.workspaces.includes(child), false);
-  } finally {
-    await closeDatabaseConnections();
-    await rm(allowed, { recursive: true, force: true });
-  }
-});
 
 test("缺失或非目录 workspace 在 health 下游前被拒绝", async () => {
   const allowed = await mkdtemp(path.join(os.tmpdir(), "cbx-tools-policy-"));

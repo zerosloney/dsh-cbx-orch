@@ -78,38 +78,3 @@ export function parseNumberField(
   }
   return value;
 }
-
-/** 登录交换端点的每 IP 限速：内存计数，窗口 60s。防 token 暴力猜测。 */
-export class AuthRateLimiter {
-  private readonly hits = new Map<string, { count: number; resetAt: number }>();
-
-  constructor(
-    private readonly maxAttempts = 10,
-    private readonly windowMs = 60_000,
-  ) {}
-
-  /** 顺带清理过期条目：Map 无限增长（每个来源 IP 一条）会在长寿命进程里缓慢泄漏。 */
-  private evictExpired(now: number): void {
-    for (const [key, entry] of this.hits) {
-      if (entry.resetAt <= now) this.hits.delete(key);
-    }
-  }
-
-  /** 记一次尝试；返回 false 表示该 IP 在本窗口内已被限流。 */
-  allow(key: string): boolean {
-    const now = Date.now();
-    this.evictExpired(now);
-    const entry = this.hits.get(key);
-    if (!entry || entry.resetAt <= now) {
-      this.hits.set(key, { count: 1, resetAt: now + this.windowMs });
-      return true;
-    }
-    entry.count += 1;
-    return entry.count <= this.maxAttempts;
-  }
-
-  /** 登录成功后清零该 IP 的计数：正常用户反复登录不应消耗暴力猜测配额。 */
-  success(key: string): void {
-    this.hits.delete(key);
-  }
-}

@@ -936,21 +936,8 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
   }));
 
   tools.register(defineTool({
-    name: "cbx_result",
-    description: "Read a job's result.json: changed files, handback, stages, test/acceptance summary, baseline, human gate.",
-    parameters: {
-      job_id: { type: "string", required: true, description: "The cbx job id." },
-      workspace: { type: "string", description: "Project directory holding the job." },
-    },
-    output: { schema: { type: "string" }, render: (_a, v: string) => jsonContent(v) },
-    async execute(args, exec) {
-      return clampText(await readArtifact(await workspaceOf(args.workspace, exec), args.job_id, "result.json"));
-    },
-  }));
-
-  tools.register(defineTool({
     name: "cbx_artifact",
-    description: "Read a job artifact: handback.md, complete.patch, test.log, review.md, diff.patch, state.json, etc.",
+    description: "Read a job artifact by name: result.json (changed files, handback, stages, test/acceptance summary, baseline, human gate), handback.md, complete.patch, test.log, review.md, diff.patch, state.json, etc. This is the general replacement for the removed cbx_result tool — pass artifact=\"result.json\" to read the result.",
     parameters: {
       job_id: { type: "string", required: true, description: "The cbx job id." },
       artifact: { type: "string", required: true, description: "Artifact name, e.g. handback.md." },
@@ -1024,24 +1011,7 @@ export function registerCbxTools(ctx: Context, defaults: CbxDefaults): void {
     },
   }));
 
-  tools.register(defineTool({
-    name: "cbx_list_workspaces",
-    description: "List jobs in an explicitly authorized workspace; does not discover child directories.",
-    parameters: {
-      root: { type: "string", required: true, description: "Authorized workspace to list." },
-    },
-    output: jsonOutput(),
-    async execute(args, exec) {
-      const root = await workspaceOf(args.root, exec);
-      const roots = (await workspacePolicy.listAllowedWorkspaces(sessionCwdOf(exec)))
-        .filter((workspace) => workspace === root);
-      const jobs = [];
-      for (const ws of roots) {
-        jobs.push({ workspace: ws, jobs: await listJobs(ws) });
-      }
-      return toJson({ workspaces: roots, jobs });
-    },
-  }));
+
 
   tools.register(defineTool({
     name: "cbx_review_gate",

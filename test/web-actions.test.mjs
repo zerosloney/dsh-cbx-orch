@@ -10,8 +10,6 @@ import { resetExecutorProbeCache } from "../lib/executors/builtin.js";
 import { stopScheduler } from "../lib/queue-api.js";
 import { listQueue } from "../lib/queue-api.js";
 
-const TOKEN = "web-actions-test-token";
-
 function fakeContext() {
   let activeRoute;
   const cleanups = [];
@@ -145,7 +143,6 @@ async function setup() {
   server = fakeContext();
   await registerCbxWebRoutes(server.context, {
     workspacePolicy: new WorkspacePolicy([workspace]),
-    token: TOKEN,
   });
 }
 
@@ -171,7 +168,7 @@ after(async () => {
   }
 });
 
-const auth = () => ({ authorization: `Bearer ${TOKEN}` });
+const auth = () => ({});
 
 async function createJob(overrides = {}) {
   const response = await callRoute(

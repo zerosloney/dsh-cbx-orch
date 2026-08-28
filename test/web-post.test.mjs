@@ -10,7 +10,7 @@ import { WorkspacePolicy } from "../lib/workspace-policy.js";
 import { resetExecutorProbeCache } from "../lib/executors/builtin.js";
 import { stopScheduler } from "../lib/queue-api.js";
 
-const TOKEN = "web-post-test-token";
+
 
 function fakeContext() {
   let activeRoute;
@@ -138,7 +138,6 @@ async function withServer(callback) {
   try {
     await registerCbxWebRoutes(server.context, {
       workspacePolicy: new WorkspacePolicy([workspace]),
-      token: TOKEN,
     });
     return await callback({ root, workspace, server });
   } finally {
@@ -167,7 +166,7 @@ async function withServer(callback) {
 }
 
 function authHeaders() {
-  return { authorization: `Bearer ${TOKEN}` };
+  return {};
 }
 
 test("POST /api/jobs: 无 task 返回 400", async () => {
@@ -280,17 +279,6 @@ test("POST /api/jobs: 空 idempotency_key 返回 400", async () => {
     );
     assert.equal(response.statusCode, 400);
     assert.match(parseJson(response).error, /idempotency_key/);
-  });
-});
-
-test("POST /api/jobs: 无授权返回 401（数据端点需要 token）", async () => {
-  await withServer(async ({ workspace, server }) => {
-    const response = await callRoute(
-      server,
-      fakePostRequest(`/cbx/api/jobs?workspace=${encodeURIComponent(workspace)}`, { task: "t" }),
-      // 无 authorization header
-    );
-    assert.equal(response.statusCode, 401);
   });
 });
 

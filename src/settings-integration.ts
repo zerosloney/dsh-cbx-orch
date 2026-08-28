@@ -21,7 +21,7 @@ import { setGlobalLimits } from "./global-gate.js";
  * - **onChange 即时生效**：settings 变更时更新传入的 `defaults` 对象字段（工具在
  *   调用时读 defaults.*，改字段即时生效）与执行器环境白名单。
  * - **范围刻意最小**：不覆盖 workspaces（安全白名单保持 profile 配置，不暴露给
- *   运行时设置面）与 web token（工作区级，见 .cbx/web.token）。
+ *   运行时设置面）。
  */
 
 /** settings 覆盖的最小形状（与 CbxOrchestrator.Config 的可覆盖字段对齐）。 */

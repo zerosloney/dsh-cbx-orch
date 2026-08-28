@@ -86,49 +86,11 @@ function cardEnableFilter(){
   });
 }
 
-// 401 处理：数据端点需要 token 时弹一次性输入框，POST /auth 换 HttpOnly cookie 后重试原请求。
-var authInProgress=null;
-var authCooldownUntil=0;
-
-function ensureAuth(){
-  if(authInProgress)return authInProgress;
-  if(Date.now()<authCooldownUntil)return Promise.resolve(false);
-  authInProgress=new Promise(function(resolve){
-    var token=window.prompt('CBX 仪表盘需要访问令牌（见 <工作区>/.cbx/web.token 或 dsh 启动日志）：');
-    if(!token){authCooldownUntil=Date.now()+60000;authInProgress=null;resolve(false);return;}
-    fetch('auth',{method:'POST',headers:{'content-type':'application/json'},credentials:'same-origin',body:JSON.stringify({token:token})})
-      .then(function(res){
-        if(res.ok){
-          authInProgress=null;
-          loadWorkspaces();
-          resolve(true);
-        } else {
-          alert('令牌无效。');
-          authCooldownUntil=Date.now()+60000;
-          authInProgress=null;
-          resolve(false);
-        }
-      })
-      .catch(function(){
-        alert('登录请求失败。');
-        authCooldownUntil=Date.now()+60000;
-        authInProgress=null;
-        resolve(false);
-      });
-  });
-  return authInProgress;
-}
-
 function cbxFetch(url,opts){
   opts=opts||{};
   opts.headers=Object.assign({},opts.headers||{});
   opts.credentials='same-origin';
   return fetch(url,opts).then(function(res){
-    if(res.status===401){
-      return ensureAuth().then(function(ok){
-        return ok ? fetch(url,opts) : res;
-      });
-    }
     return res;
   });
 }

@@ -65,8 +65,7 @@ export async function listJobsWithAudit(
 
 /**
  * 扫描根目录下含 .cbx/ 的直接子目录（1 层深度，不递归），返回绝对路径列表。
- * 复用：CLI `cbx ws --workspaces-dir`、CLI `ui` 命令、MCP `cbx_list_workspaces`
- * 都走这一个入口，避免各入口各自实现"发现 workspace"。
+ * 复用：CLI `cbx ws --workspaces-dir`、CLI `ui` 命令都走这一个入口，避免各入口各自实现"发现 workspace"。
  */
 export async function discoverWorkspaces(
   root: string,

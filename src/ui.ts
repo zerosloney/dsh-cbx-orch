@@ -1,35 +1,11 @@
-import type { ServerResponse, IncomingMessage } from "node:http";
+import type { ServerResponse } from "node:http";
 import { open, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { jobDir, listJobs, listQueue, loadState } from "./core.js";
 import { captureAsync } from "./process-runner.js";
 import { parsePidRecordText } from "./pid-guard.js";
-import { constantTimeEqual, eventsAfterCursor, jobEventsAfterCursor, processAlive } from "./storage.js";
+import { eventsAfterCursor, jobEventsAfterCursor, processAlive } from "./storage.js";
 import { TERMINAL_STATUSES } from "./types.js";
-
-/** 校验 token; 未配置 token 时始终放行。常量时间比较避免时序侧信道。
- *  凭证只接受 Authorization Bearer header（curl/API 客户端）或 `cbx_token`
- *  HttpOnly cookie（浏览器同源自动携带，JS 不可读）——不接受 URL query token：
- *  它会进浏览器历史、代理与访问日志、Referer，形成持久的凭证泄漏面。 */
-export function isAuthorized(
-  req: IncomingMessage,
-  expectedToken: string | undefined,
-): boolean {
-  if (!expectedToken) return true;
-  const auth = req.headers["authorization"];
-  if (auth && auth.startsWith("Bearer "))
-    return constantTimeEqual(auth.slice(7), expectedToken);
-  // HttpOnly cookie：浏览器同源请求自动携带；值即 token 本身（loopback 场景下与 HTML 内嵌等价，但 JS/XSS 不可读）。
-  const cookie = req.headers.cookie;
-  if (cookie) {
-    for (const part of cookie.split(";")) {
-      const [name, value] = part.trim().split("=");
-      if (name === "cbx_token" && value)
-        return constantTimeEqual(decodeURIComponent(value), expectedToken);
-    }
-  }
-  return false;
-}
 
 export interface WorkspaceSummary {
   path: string;

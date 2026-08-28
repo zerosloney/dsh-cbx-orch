@@ -372,6 +372,7 @@ export function registerCbxCommands(service: CbxCommandContext): void {
     },
   });
 
+
   commands.register({
     name: "cbx-queue",
     description: "Inspect the cbx queue, or pause/resume it.",
@@ -429,13 +430,10 @@ export function registerCbxCommands(service: CbxCommandContext): void {
         }
         if (!webActive) {
           lines.push(
-            "提示：cbx web 路由尚未挂载——可能是 headless profile 未加载 cbx-orch-web 插件，或 webServer 就绪较慢/挂载被拒（token fail-closed 等）。请用含 web 插件的配置（如 dsh --profile web）启动，或查看插件日志中的挂载失败原因。",
+            "提示：cbx web 路由尚未挂载——可能是 headless profile 未加载 cbx-orch-web 插件，或 webServer 就绪较慢。请用含 web 插件的配置（如 dsh --profile web）启动，或查看插件日志中的挂载失败原因。",
           );
         } else {
-          const tokenFile = path.join(ws, ".cbx", "web.token");
-          lines.push(
-            `提示：首次访问需输入 Web token（${existsSync(tokenFile) ? `见 ${tokenFile}` : "需在配置中设置 web.token"}）。`,
-          );
+          lines.push("提示：仪表盘已挂载，开放访问，无需登录。");
         }
         return ok(lines.join("\n"));
       } catch (error) {

@@ -36,18 +36,6 @@
       name: 'dsh-cbx-orch/web'
       config:
         web:
-          # Bearer token for data endpoints. Empty/missing reuses a non-empty
-          # token from the first workspace's .cbx/web.token, or generates one
-          # there with mode 0600. No unauthenticated mode; resolution failure
-          # leaves the web routes unmounted (fail-closed).
-          token: ''
-          # Separate Web allowlist for ?workspace= selection. Uses the same
-          # WorkspacePolicy canonicalization and rejects unauthorized, missing,
-          # or non-directory targets; it is not automatically shared with the
-          # core cbx-orch workspaces setting. Empty = follow the harness
-          # workspace registry (ctx.workspaceRegistry): the dashboard shows the
-          # directories the user actually opens as workspaces in the harness
-          # GUI (so jobs created by /cbx-run in a delegated session directory
-          # appear on the dashboard); falls back to the process cwd when the
-          # registry is unavailable or empty.
+          # @deprecated 已废弃：仪表盘始终跟随 harness 工作区注册表，不再读取该
+          # 独立 allowlist。保留仅为向后兼容旧 profile，新部署请勿设置。
           workspaces: []

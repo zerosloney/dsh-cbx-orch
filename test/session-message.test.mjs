@@ -24,7 +24,7 @@ test("phaseExplanation: 状态+阶段 → 人话", () => {
 test("nextActionHint: 可行动命令", () => {
   assert.deepEqual(nextActionHint("awaiting_approval", "before_run", "j1"), ["批准：cbx_approve j1", "取消：cbx_cancel j1"]);
   assert.deepEqual(nextActionHint("needs_fix", "awaiting_clarification", "j1"), ["补充说明后续跑：cbx_continue j1 <说明>"]);
-  assert.deepEqual(nextActionHint("done", "done", "j1"), ["读结果 / 产物：cbx_result j1"]);
+  assert.deepEqual(nextActionHint("done", "done", "j1"), ["读结果（result.json）/ 产物：cbx_artifact j1"]);
   assert.deepEqual(nextActionHint("running", "executing", "j1")[0], "跟踪进度：cbx_watch j1");
 });
 
@@ -71,7 +71,7 @@ test("buildSessionMessage: 完成态带下一步行读产物", () => {
   assert.match(text, /executor: qwen/);
   assert.match(text, /changed:  3 个文件/);
   assert.match(text, /review:   PASS/);
-  assert.match(text, /下一步:.*cbx_result j9/);
+  assert.match(text, /下一步:.*cbx_artifact j9/);
 });
 
 test("routeNote: 路由决策一行摘要（自动路由/显式指定/缺省）", () => {

@@ -109,9 +109,9 @@ export function nextActionHint(status?: string, phase?: string, jobId?: string):
     case "review_failed":
       return [`读 review.md 后继续：${cmd("cbx_continue")}`];
     case "done":
-      return [`读结果 / 产物：${cmd("cbx_result")}`];
+      return [`读结果（result.json）/ 产物：${cmd("cbx_artifact")}`];
     case "failed":
-      return [`读失败详情：${cmd("cbx_result")} / ${"cbx_logs"}`, `可重试：${cmd("cbx_retry")}`];
+      return [`读失败详情：${cmd("cbx_artifact")} / ${"cbx_logs"}`, `可重试：${cmd("cbx_retry")}`];
     case "running":
     case "queued":
       return [`跟踪进度：${cmd("cbx_watch")}`, "或会话 job_output / job_wait"];

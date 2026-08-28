@@ -9,8 +9,6 @@ import { registerCbxWebRoutes } from "../lib/web.js";
 import { resolveWebWorkspaceList } from "../lib/web-plugin.js";
 import { WorkspacePolicy } from "../lib/workspace-policy.js";
 
-const TOKEN = "web-workspace-test-token";
-
 function fakeContext() {
   let activeRoute;
   const cleanups = [];
@@ -102,7 +100,7 @@ async function openSse(server) {
   assert.ok(server.route, "路由应已完成异步注册");
   const response = fakeResponse();
   server.route.handler(
-    fakeRequest("/cbx/events", { authorization: `Bearer ${TOKEN}` }),
+    fakeRequest("/cbx/events"),
     response,
   );
   await waitFor(
@@ -128,7 +126,7 @@ async function callRoute(server, url) {
   assert.ok(server.route, "路由应已完成异步注册");
   const response = fakeResponse();
   server.route.handler(
-    fakeRequest(url, { authorization: `Bearer ${TOKEN}` }),
+    fakeRequest(url),
     response,
   );
   await response.done;
@@ -218,7 +216,7 @@ test("Web 注册是 async：完成前不假定 /cbx 路由已就绪，effect dis
 
     const registration = registerCbxWebRoutes(server.context, {
       workspacePolicy: delayedPolicy,
-      token: TOKEN,
+
     });
     assert.equal(server.route, undefined);
     release();
@@ -239,7 +237,7 @@ test("默认 workspace 使用 canonical 首项，显式相对别名命中第二�
     const secondAlias = path.relative(process.cwd(), second) || ".";
     await registerCbxWebRoutes(server.context, {
       workspacePolicy: new WorkspacePolicy([firstAlias, second]),
-      token: TOKEN,
+
     });
 
     const defaultResponse = await callRoute(server, queueUrl());
@@ -257,7 +255,7 @@ test("聚合 events/workspaces 端点拒绝任何 workspace query", async () => 
   await withWorkspaces(async ({ workspaces, server }) => {
     await registerCbxWebRoutes(server.context, {
       workspacePolicy: new WorkspacePolicy(workspaces),
-      token: TOKEN,
+
     });
 
     for (const pathname of ["/cbx/events", "/cbx/api/workspaces"]) {
@@ -274,7 +272,7 @@ test("SSE workspace identity 替换后关闭连接且不广播新目标事件", 
     const moved = path.join(root, "workspace-0-moved");
     await registerCbxWebRoutes(server.context, {
       workspacePolicy: new WorkspacePolicy([allowed]),
-      token: TOKEN,
+
     });
     const response = await openSse(server);
 
@@ -315,7 +313,7 @@ test("SSE events 文件暂不存在时 guard 不会断开，创建后仍可收�
     const [allowed] = workspaces;
     await registerCbxWebRoutes(server.context, {
       workspacePolicy: new WorkspacePolicy([allowed]),
-      token: TOKEN,
+
     });
     const response = await openSse(server);
     await new Promise((resolve) => setTimeout(resolve, 700));
@@ -340,7 +338,7 @@ test("默认 workspace 每次请求重新 canonicalize，替换为越权 symlink
     const moved = path.join(root, "workspace-0-moved");
     await registerCbxWebRoutes(server.context, {
       workspacePolicy: new WorkspacePolicy([allowed]),
-      token: TOKEN,
+
     });
 
     await rename(allowed, moved);
@@ -377,7 +375,7 @@ test("显式越权、缺失、非目录和空 workspace 均返回 4xx，不回�
     await writeFile(file, "fixture", "utf8");
     await registerCbxWebRoutes(server.context, {
       workspacePolicy: new WorkspacePolicy([allowed]),
-      token: TOKEN,
+
     });
 
     for (const [label, url] of [

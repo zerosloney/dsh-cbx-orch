@@ -144,206 +144,62 @@ npm run release -- minor   # 先升 minor 版本再发布（patch / minor / majo
 
 ## 治理能力使用教程
 
-`dsh-cbx-orch` 不是一个新 IDE，而是一套**执行治理层**。你在 harness GUI 里跟模型对话的方式不变；一旦模型决定"跑一段代码"，它走的 `cbx_run` / `/cbx-run` 会被这个插件接管，经过一系列可配置的**闸口**（审批、审查、预算、审计、工作区边界）。
+`dsh-cbx-orch` 不是新 IDE，而是 Harness 里的**执行治理层**。你跟模型对话的方式不变；模型决定"跑一段代码"时，`cbx_run` / `/cbx-run` 会被这个插件接管，经过一系列可配置的**闸口**。
 
-下面把治理能力拆成 7 个**可开可关的闸**，每个闸说明：它在防什么、怎么开、给一个最小例子。
+| # | 闸 | 防什么 | 怎么开 | 最小例子 |
+|---|----|--------|--------|---------|
+| 1 | 执行前审批 | agent 想直接跑涉及写文件/跑命令的操作时，先让你点头 | `approval_before_run: true`（`/cbx-run` 默认停审批） | 任务停在 awaiting_approval → `cbx_approve <job_id>` |
+| 2 | 审查门 | 主任务跑完后，第二个审查 agent 没过就拦下，不标完成 | `.cbx.json` 加 `"review": true` 或 `cbx_run(review=true)` | 跑完出 `review.md`，过则 done，不过 needs_fix |
+| 3a | 单任务预算 | 任务失控循环烧光模型配额 | `.cbx.json` 加 `"cost": { "maxExecutorInvocations": 20 }` | 触达后 `needs_fix / cost_limit`，调高上限 `cbx_continue` |
+| 3b | 全局治理 | 多工作区并发烧量 / 全机器累计预算无上限 | 插件 config/settings 加 `governance.maxGlobalConcurrent` / `maxGlobalInvocations` | `cbx_health` / 仪表盘实时看用量 |
+| 4 | 策略漂移 | 跑起来后偷偷改 `.cbx.json` 安全字段松规则 | 任务创建时自动算指纹，spawn 时比对 | 想加预算？改 `.cbx.json` 后 `cbx_continue` 刷新指纹续跑 |
+| 5 | 审计+脱敏 | 执行器改 `events.ndjson` 伪造事件；日志泄漏密钥 | `.cbx.json` 加 `"audit": { "failOnTamper": true }` | 篡改直接拦下 `audit_tamper`，需人工定位 |
+| 6 | 工作区边界 | agent 越权访问/修改你没授权的目录 | profile config 加 `workspaces` 白名单 | 空数组 = 自动跟随 session cwd；越权直接拒 |
+| 7 | 隔离+防火墙 | agent 改坏主工作区；跑 `rm -rf` 等破坏命令 | `isolated: true`（自动 worktree）；测试命令防火墙自动生效 | 脏仓库需 `carryDirty: true`；`rm -rf` 等自动拦 |
 
-### 闸 1：执行前人工审批（`before_run`）
+### 治理全路径
 
-**防什么：** agent 想直接执行涉及写文件、装依赖、跑命令的操作时，先让你点头。
-
-**怎么开：**
-- 工具/命令里加 `approval_before_run: true`（`/cbx-run` 默认就会停在审批）
-- Web 仪表盘看到 `awaiting_approval` 的任务后批准
-
-**最小例子：**
 ```
-/cbx-run 重构 src/foo.ts 并跑测试
-→ 任务停在 awaiting_approval（仪表盘可见）
-→ cbx_approve <job_id>
-→ 继续执行
-```
-
-### 闸 2：审查门（review gate）——默认 fail-closed
-
-**防什么：** 主任务跑完后，再用**第二个独立的审查 agent** 复审改动，没过就拦下来不让标"完成"。
-
-**怎么开：**
-```json
-{ "review": true }
-```
-或单次任务：`cbx_run(review=true, ...)`
-
-**逃生门（谨慎）：**
-```json
-{ "reviewGate": { "failOpen": true } }
-```
-审查挂了也放行。**默认 false**；改它会触发策略指纹漂移保护（见闸 4）。
-
-### 闸 3：成本闸——两道
-
-#### 3a. 单任务执行预算
-
-**防什么：** 某个任务失控循环、无效重试，把模型配额烧光。
-
-**怎么开：**
-```json
-{ "cost": { "maxExecutorInvocations": 20 } }
-```
-或单次：`cbx_run(max_executor_invocations=20, ...)`
-
-**触发了会怎样：** 任务落 `needs_fix / cost_limit`，带上 human gate。调高上限后 `cbx_continue` 续跑。
-
-#### 3b. 跨工作区全局治理
-
-**防什么：** 多工作区并发烧量；全机器累计预算硬上限。
-
-**怎么开（插件 config 或 settings）：**
-```json
-{
-  "governance": {
-    "maxGlobalConcurrent": 4,
-    "maxGlobalInvocations": 200
-  }
-}
+cbx_run(approval_before_run=true, review=true, isolated=true)
+   │
+   ├─[6] workspace 校验 → 否：拒绝
+   ├─[1] before_run 审批 → 否：cancel
+   ├─[3a] per-job 预算 / [7a] worktree / [7b] 防火墙
+   ├─ 每次 spawn：[4] policy drift / [3a] budget / [3b] global gates
+   ├─[2] review gate（fail-closed）
+   ├─[5] audit integrity
+   └─ done / failed / needs_fix(cost_limit|policy_drift|audit_tamper)
 ```
 
-| 字段 | 含义 | 缺省 |
-|------|------|------|
-| `maxGlobalConcurrent` | 所有工作区同时 `running` 的总数上限（≥1 正整数） | 不限制 |
-| `maxGlobalInvocations` | 进程级执行器调用总预算（≥1；stage/review/manager/gate 全角色累计） | 不限制 |
+### 常见 human gate 速查
 
-**运行时改：** 这两个值是 harness `ctx.settings` 里 `cbx.governance` 的字段，**改完即时生效**（不需要重启）。`cbx_health` / Web 仪表盘能看到当前用量。
+| 状态 | 解法 |
+|------|------|
+| `awaiting_approval` | `cbx_approve` / `cbx_cancel` |
+| `needs_fix / cost_limit` | 调高 `cost.maxExecutorInvocations` 或 `governance.maxGlobalInvocations` → `cbx_continue` |
+| `needs_fix / policy_drift` | 确认配置 → `cbx_continue` 刷新指纹 / 或新建任务 |
+| `needs_fix / audit_tamper` | 检查执行器/产物，定位后再 `cbx_continue` |
+| 审查 `FAIL` | 读 `review.md` → 改完 `cbx_continue` |
+| 任务一直 `queued` | 等其他任务完成 / 调高 `governance.maxGlobalConcurrent` |
 
-### 闸 4：策略漂移保护
+### 安全自检清单
 
-**防什么：** 任务跑起来后，你偷偷去改 `.cbx.json` 的安全字段（cost/plugins/reviewGate/audit/executors），想让规则松一点——插件在**执行器调用时**直接拒绝。
-
-**怎么生效：** 任务创建那一刻，插件给 `cost / plugins / reviewGate / audit / executors` 算一个安全指纹；执行器每次要 spawn 时比对当前 `.cbx.json`，不一致就报 `policy_drift`，转到 human gate。
-
-**正确用法：**
-- 想给一个 `cost_limit` 任务加预算？先调高 `.cbx.json` 的 `cost.maxExecutorInvocations`，再 `cbx_continue`——`continue` 会刷新指纹并继续。
-- 想真改策略？**新建一个任务**，不要改运行中的。
-
-### 闸 5：审计完整性 + 日志脱敏
-
-**防什么：**
-- 执行器事后偷偷改 `events.ndjson`（追加/删除伪造事件）会被检测——插件用 SQLite 镜像做权威对账。
-- 落到日志的 OpenAI/GitHub/AWS key、私钥、Bearer token 等，自动正则脱敏。
-
-**怎么配：**
-```json
-{ "audit": { "failOnTamper": true } }
-```
-- `true`（推荐）：篡改直接拦下任务（`needs_fix / audit_tamper`），需要人工介入。
-- `false`（不推荐）：只在 `result.json` 里打个 `tampered` 标记，任务照常 `done`——纯向后兼容。
-
-### 闸 6：工作区边界
-
-**防什么：** agent 想"顺便"看一眼/改你没授权的目录。
-
-**怎么配（profile config，**不能被运行时 settings 改**）：**
-```json
-{
-  "workspaces": [
-    "C:/work/project-a",
-    "C:/work/project-b"
-  ]
-}
-```
-- **空数组 / 不配 = 自动跟随**目录委派：以当前 agent 会话的工作目录（`session.header.cwd`）为默认工作区，回落 harness 进程 cwd。
-- 路径会 `realpath` canonicalize（Windows 下折叠大小写）。
-- 越权、非目录、缺失路径 → 拒绝，并提示"允许的工作区列表 + 配置位置"。
-
-### 闸 7：隔离 + 测试命令防火墙
-
-**隔离（worktree）** 防 agent 改坏主工作区：
-```json
-{ "isolated": true }
-```
-- 干净仓库：直接成功。
-- 脏仓库：不带 `carryDirty=true` 会先报错；带 `carryDirty=true` 会把当前未提交改动带进隔离 worktree。
-- 非 Git 仓库：`isolated=true` 直接拒。
-
-**测试命令防火墙** 防 agent 跑 `rm -rf` / `truncate` / `dd` / `git clean -fdx` 等破坏性命令：
-- **自动拦截，无需配置**。覆盖 `rm -rf`、`del /s`、`find -exec`、`git clean`、`truncate`、`dd`、`shred`、`eval`、`PowerShell -EncodedCommand` 等；匹配前先归一化（剥引号/反斜杠/`${var}`/`%var%`）防绕过。创建时与执行时各验一次。
+- [ ] `workspaces` 白名单明确
+- [ ] `audit.failOnTamper: true`（生产）
+- [ ] `governance.maxGlobalInvocations` 有硬上限
+- [ ] `cost.maxExecutorInvocations` 有合理 per-job 上限
+- [ ] `reviewGate.failOpen: false`（除非你清楚为什么）
+- [ ] 会读 `agent.log` / `events.ndjson` / `review.md` / `result.json`
 
 ---
 
-### 一条任务从提交到完成的"治理全路径"
+### 位置
 
 ```
-cbx_run(task="...", review=true, isolated=true, approval_before_run=true)
-   │
-   ├─[闸 6] workspace 校验：cwd 在白名单？
-   │         └─ 否 → 拒绝（4xx），提示允许列表
-   │
-   ├─[闸 1] before_run 审批：你/仪表盘批准？
-   │         └─ 否 → cancel / 过期
-   │
-   ├─[闸 3a] per-job 成本闸：未达上限？
-   ├─[闸 7a] isolation：worktree 准备好了？
-   ├─[闸 7b] test cmd 防火墙：合法？
-   │
-   ├─[执行器跑] 每次 spawn：
-   │     ├─[闸 4] policy drift：.cbx.json 未改？
-   │     ├─[闸 3a] invocation budget 没用完？
-   │     └─[闸 3b] global gates：并发/预算未满？
-   │
-   ├─[闸 2] review gate（若 review=true）：
-   │         └─ fail-closed；failOpen 才放行
-   │
-   ├─[闸 5] audit integrity：
-   │         └─ failOnTamper=true 时篡改直接拦截
-   │
-   └─ done / failed / needs_fix / cost_limit / policy_drift / audit_tamper
+[ Harness GUI ] → [ cbx_* 工具 / /cbx-* ] → [ dsh-cbx-orch 治理引擎 ] → [ 执行器 ] → [ worktree / SQLite 审计 ]
 ```
 
----
-
-### 出问题了怎么办（常见 human gate 速查）
-
-| 状态 | 原因 | 解法 |
-|------|------|------|
-| `awaiting_approval`（before_run） | 闸 1 在等 | `cbx_approve` / 仪表盘批准 / `cbx_cancel` |
-| `needs_fix / cost_limit` | 闸 3a/3b 预算耗尽 | 调高 `cost.maxExecutorInvocations` 或 `governance.maxGlobalInvocations`，再 `cbx_continue` |
-| `needs_fix / policy_drift` | 闸 4：运行中改了 `.cbx.json` | 确认配置意图 → `cbx_continue` 刷新指纹 / 或新建任务 |
-| `needs_fix / audit_tamper` | 闸 5：执行器篡改日志 | 检查执行器进程/产物，定位异常后再 `cbx_continue` |
-| `needs_fix` + 审查 `FAIL` | 闸 2：审查门没过 | 读 `review.md`，改完再 `cbx_continue` 重跑 |
-| 任务一直 `queued` | 闸 3b 全局并发已满 | 等其他任务完成 / 调高 `governance.maxGlobalConcurrent` |
-
----
-
-### 安全自检清单（部署/上线前过一遍）
-
-- [ ] `workspaces` 白名单明确（不要空着让它跟 cwd，除非你就是"单一 dev 目录"）
-- [ ] `audit.failOnTamper` 设为 `true`（生产环境）
-- [ ] `governance.maxGlobalInvocations` 设了一个硬上限（防全机器跑空配额）
-- [ ] `cost.maxExecutorInvocations` 给了一个合理的 per-job 上限
-- [ ] `reviewGate.failOpen` 保持 `false`（除非你清楚为什么）
-- [ ] 你知道怎么读 `agent.log` / `events.ndjson` / `review.md` / `result.json`——它们是治理事实的来源
-
----
-
-### 一张图记住它的位置
-
-```
-[ 你在 Harness GUI 里跟模型说话 ]
-              │
-              ▼
-[ cbx_* 工具 / /cbx-* 斜杠命令 ]   ← 入口
-              │
-              ▼
-[ dsh-cbx-orch ：治理引擎 ]           ← 上面七道闸全在这里
-              │
-              ▼
-[ codebuddy / opencode / omp / cline / qwen ]   ← 执行器子进程
-              │
-              ▼
-[ Git worktree（隔离） / SQLite 镜像（审计） ]
-```
-
-看实时状态：浏览器开 Web 仪表盘（开放访问，信任 harness 同源边界），或 `cbx_status` / `cbx_health` / `cbx_watch`。
+看状态：Web 仪表盘（开放访问，信任 harness 同源边界）或 `cbx_status` / `cbx_health` / `cbx_watch`。
 
 ## 配置
 

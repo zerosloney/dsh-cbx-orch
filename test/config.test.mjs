@@ -16,6 +16,7 @@ test("CbxOrchestrator.Config: 空配置使用部署默认值", () => {
     workspaces: [],
     executors: { envAllowlist: [] },
     governance: {},
+    dbIdleTimeoutMs: 60000,
   });
 });
 
@@ -28,6 +29,7 @@ test("CbxOrchestrator.Config: 部分配置补齐默认值", () => {
     workspaces: [],
     executors: { envAllowlist: [] },
     governance: {},
+    dbIdleTimeoutMs: 60000,
   });
 });
 
@@ -44,6 +46,7 @@ test("CbxOrchestrator.Config: 完整配置保持覆盖语义", () => {
     workspaces: [],
     executors: { envAllowlist: [] },
     governance: {},
+    dbIdleTimeoutMs: 60000,
   });
 });
 
@@ -57,6 +60,7 @@ test("CbxOrchestrator.Config: 显式 workspace 列表保持覆盖语义", () => 
     workspaces,
     executors: { envAllowlist: [] },
     governance: {},
+    dbIdleTimeoutMs: 60000,
   });
 });
 
@@ -69,6 +73,7 @@ test("CbxOrchestrator.Config: executors.envAllowlist 覆盖各自定义", () => 
     workspaces: [],
     executors: { envAllowlist: ["MY_TOKEN"] },
     governance: {},
+    dbIdleTimeoutMs: 60000,
   });
 });
 

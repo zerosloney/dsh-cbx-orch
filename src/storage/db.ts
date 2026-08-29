@@ -12,11 +12,79 @@ import { now, isMissing } from "./io.js";
 import { assertJobId } from "../validation.js";
 
 export type CbxDatabase = Database.Database;
+/**
+ * 连接缓存条目封装：在原「裸 Promise 缓存」之上补充空闲回收所需的最后访问时间与
+ * 待触发定时器。背景——DSH 常驻进程加载本插件后，原实现会让 better-sqlite3 连接
+ * （WAL 模式，持久持有 state.sqlite/-wal/-shm 三件套句柄）在整个进程生命周期内不释放，
+ * 导致用户无法删除 .cbx 目录（Windows 要求目录内所有文件当前无进程打开）。加空闲回收后，
+ * 连接超过 IDLE_TIMEOUT_MS 无访问即关闭，释放 WAL 句柄；下次访问经 database() 自动重建。
+ */
+/**
+ * 连接空闲回收超时（毫秒）。进程级设置，所有工作区共用，由插件 Config
+ * （dbIdleTimeoutMs）经 setIdleTimeoutMs 注入；缺省 60s。值越小越易释放 .cbx
+ * 句柄（利于删除目录），但过短会在高频访问时反复开关连接、丧失 WAL prepare 缓存收益。
+ */
+let idleTimeoutMs = 60_000;
+
+/** 由插件 Config（dbIdleTimeoutMs）注入连接空闲回收超时；运行时替换即生效。 */
+export function setIdleTimeoutMs(ms: number): void {
+  if (Number.isFinite(ms) && ms >= 1000) idleTimeoutMs = Math.floor(ms);
+}
+
+interface CachedConnection {
+  promise: Promise<CbxDatabase>;
+  lastAccess: number;
+  idleTimer: ReturnType<typeof setTimeout> | undefined;
+}
+
+function touch(cache: Map<string, CachedConnection>, key: string): void {
+  const entry = cache.get(key);
+  if (!entry) return;
+  entry.lastAccess = Date.now();
+  if (entry.idleTimer !== undefined) {
+    clearTimeout(entry.idleTimer);
+    entry.idleTimer = undefined;
+  }
+}
+
+function scheduleIdleClose(
+  cache: Map<string, CachedConnection>,
+  key: string,
+  entry: CachedConnection | undefined,
+): void {
+  if (!entry || entry.idleTimer !== undefined) return;
+  // unref：空闲定时器不阻止 DSH 进程退出；dispose 时仍会显式 closeDatabaseConnections。
+  entry.idleTimer = setTimeout(() => {
+    const current = cache.get(key);
+    if (!current || current !== entry) return; // 已被替换或移除
+    const idleMs = Date.now() - current.lastAccess;
+    if (idleMs < idleTimeoutMs) {
+      // 定时器排队期间又被访问过，重新排期而非关闭。
+      current.idleTimer = undefined;
+      scheduleIdleClose(cache, key, current);
+      return;
+    }
+    cache.delete(key);
+    current.idleTimer = undefined;
+    // 连接已从缓存移除，下次 database() 会重新创建；此处仅释放句柄。
+    current.promise
+      .then((db) => {
+        try {
+          db.close();
+        } catch {
+          /* 已关闭 */
+        }
+      })
+      .catch(() => undefined);
+  }, idleTimeoutMs);
+  entry.idleTimer.unref();
+}
+
 // intentional-simple: Promise 缓存保证同 workspace 并发只创建一次连接；创建失败时 reject，
-// 不缓存坏 promise，允许下次调用重试。
-const databases = new Map<string, Promise<CbxDatabase>>();
+// 不缓存坏 promise，允许下次调用重试。缓存值封装为 CachedConnection 以支持空闲回收。
+const databases = new Map<string, CachedConnection>();
 // 只读连接：WAL 模式下可安全并发读，不与写连接争抢 prepare/transaction 锁。
-const readonlyDatabases = new Map<string, Promise<CbxDatabase>>();
+const readonlyDatabases = new Map<string, CachedConnection>();
 const SCHEMA_VERSION = 6;
 function databaseFile(workspace: string): string {
   return path.join(workspace, ".cbx", "state.sqlite");
@@ -122,9 +190,9 @@ function connectionKey(resolved: string): string {
 export async function database(workspaceInput: string): Promise<CbxDatabase> {
   const workspace = path.resolve(workspaceInput);
   const key = connectionKey(workspace);
-  let promise = databases.get(key);
-  if (!promise) {
-    promise = (async (): Promise<CbxDatabase> => {
+  let entry = databases.get(key);
+  if (!entry) {
+    const promise = (async (): Promise<CbxDatabase> => {
       await mkdir(path.join(workspace, ".cbx"), { recursive: true });
       const db = new Database(databaseFile(workspace));
       db.pragma("journal_mode = WAL");
@@ -133,10 +201,17 @@ export async function database(workspaceInput: string): Promise<CbxDatabase> {
       await importLegacyData(workspace, db);
       return db;
     })();
-    databases.set(key, promise);
+    entry = { promise, lastAccess: Date.now(), idleTimer: undefined };
+    databases.set(key, entry);
   }
+  touch(databases, key);
   try {
-    return await promise;
+    const db = await entry.promise;
+    touch(databases, key);
+    // 连接建立后启用空闲回收：长时间无访问即关闭，释放 WAL 句柄，
+    // 避免 DSH 常驻进程长期占用 .cbx 目录导致无法删除。
+    scheduleIdleClose(databases, key, databases.get(key));
+    return db;
   } catch (error) {
     // 创建失败时不缓存坏 promise，允许后续调用重试。
     databases.delete(key);
@@ -156,9 +231,9 @@ export async function databaseReadonly(workspaceInput: string): Promise<CbxDatab
     return database(workspace);
   }
   const key = connectionKey(workspace);
-  let promise = readonlyDatabases.get(key);
-  if (!promise) {
-    promise = (async (): Promise<CbxDatabase> => {
+  let entry = readonlyDatabases.get(key);
+  if (!entry) {
+    const promise = (async (): Promise<CbxDatabase> => {
       const db = new Database(file, { readonly: true });
       db.pragma("busy_timeout = 5000");
       // schema 尚未初始化时（如测试场景或首次访问）回落到读写连接；
@@ -175,10 +250,15 @@ export async function databaseReadonly(workspaceInput: string): Promise<CbxDatab
       }
       return db;
     })();
-    readonlyDatabases.set(key, promise);
+    entry = { promise, lastAccess: Date.now(), idleTimer: undefined };
+    readonlyDatabases.set(key, entry);
   }
+  touch(readonlyDatabases, key);
   try {
-    return await promise;
+    const db = await entry.promise;
+    touch(readonlyDatabases, key);
+    scheduleIdleClose(readonlyDatabases, key, readonlyDatabases.get(key));
+    return db;
   } catch (error) {
     readonlyDatabases.delete(key);
     throw error;
@@ -191,10 +271,16 @@ export async function databaseReadonly(workspaceInput: string): Promise<CbxDatab
  *  避免每次重载泄漏一套 fd/WAL 句柄。 */
 export async function closeDatabaseConnections(): Promise<void> {
   for (;;) {
-    const pending = [...databases.values(), ...readonlyDatabases.values()];
+    const entries = [...databases.values(), ...readonlyDatabases.values()];
     databases.clear();
     readonlyDatabases.clear();
-    if (pending.length === 0) return;
+    if (entries.length === 0) return;
+    // 取消所有待触发的空闲回收定时器，避免它们在缓存清空后访问已关闭连接。
+    const pending: Array<Promise<CbxDatabase>> = [];
+    for (const entry of entries) {
+      if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer);
+      pending.push(entry.promise);
+    }
     const opened = await Promise.all(
       pending.map((p) => p.catch(() => undefined)),
     );

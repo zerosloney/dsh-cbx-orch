@@ -2,7 +2,7 @@ import { Context, Service } from "@deepseek-ai/cordis";
 import z from "@deepseek-ai/schemastery";
 import { setProcessSpawnProvider } from "./process-runner.js";
 import { createSubprocessProvider, setExecutorEnvAllowlist } from "./subprocess-adapter.js";
-import { closeDatabaseConnections } from "./storage.js";
+import { closeDatabaseConnections, setIdleTimeoutMs } from "./storage.js";
 import { flushJobEventMirrors } from "./state.js";
 import { resetHealthStore } from "./executor-health.js";
 import { disposeObservability } from "./observability.js";
@@ -49,6 +49,9 @@ export interface Config {
     /** 进程级执行器调用预算：所有工作区累计调用硬上限。缺省 = 不限制。 */
     maxGlobalInvocations?: number;
   };
+  /** SQLite 连接空闲回收超时（毫秒）：超过该时长无访问即关闭连接、释放 .cbx 的 WAL 句柄，
+   *  使目录可被删除。进程级设置，所有工作区共用；缺省 60000。刻意不进 .cbx.json（见 governance）。 */
+  dbIdleTimeoutMs?: number;
 }
 
 /**
@@ -73,6 +76,7 @@ export default class CbxOrchestrator extends Service {
       maxGlobalConcurrent: z.number().min(1),
       maxGlobalInvocations: z.number().min(1),
     }),
+    dbIdleTimeoutMs: z.number().min(1000).default(60000),
   });
 
   constructor(ctx: Context, config: Config) {
@@ -97,6 +101,8 @@ export default class CbxOrchestrator extends Service {
     // 进程级全局治理（governance.maxGlobalConcurrent / maxGlobalInvocations）：
     // 应用到进程级闸（队列派发与执行器调用都会读取）。settings 集成可运行时替换。
     setGlobalLimits(config.governance ?? {});
+    // 进程级 SQLite 连接空闲回收超时：注入 db.ts，使 .cbx 目录在停止操作后可被删除。
+    setIdleTimeoutMs(config.dbIdleTimeoutMs ?? 60_000);
     registerCbxTools(ctx, defaults);
     registerCbxCommands({ ctx, defaults });
     // ctx.settings 集成（可选）：settings 服务存在时把插件默认配置暴露为用户设置
